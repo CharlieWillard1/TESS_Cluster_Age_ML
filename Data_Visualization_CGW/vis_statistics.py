@@ -6,7 +6,13 @@ from scipy.stats import gaussian_kde
 
 def draw_half_violin(ax, pos, data, side='left', color='steelblue', alpha=0.7, width=0.35):
     """Draw one half of a violin using KDE, untruncated (tails extend naturally)."""
-    if len(data) < 2:
+    if len(data) == 0:
+        return
+    if len(data) == 1:
+        ax.hlines(data[0], pos - width * 0.8, pos + width * 0.8, colors=color,
+                  linewidth=1.5, alpha=alpha)
+        ax.text(pos, data[0], f'n=1: {data[0]:.3g}', ha='center', va='bottom',
+                fontsize=7, color=color, alpha=min(alpha + 0.15, 1.0))
         return
     if np.all(data == data[0]):
         ax.hlines(data[0], pos - width * 0.8, pos + width * 0.8, colors=color,
@@ -14,7 +20,7 @@ def draw_half_violin(ax, pos, data, side='left', color='steelblue', alpha=0.7, w
         ax.text(pos, data[0], f'all={data[0]:.3g}', ha='center', va='bottom',
                 fontsize=7, color=color, alpha=min(alpha + 0.15, 1.0))
         return
-    kde = gaussian_kde(data)
+    kde = gaussian_kde(data, bw_method=0.5)
     data_range = data.max() - data.min() if data.max() != data.min() else 1.0
     y_grid = np.linspace(data.min() - 0.5 * data_range, data.max() + 0.5 * data_range, 300)
     density = kde(y_grid)
@@ -32,7 +38,13 @@ def draw_half_violin_h(ax, pos, data, side='bottom', color='steelblue', alpha=0.
     """Draw one half of a horizontal violin using KDE, untruncated.
     'bottom' half goes below pos, 'top' half goes above pos.
     """
-    if len(data) < 2:
+    if len(data) == 0:
+        return
+    if len(data) == 1:
+        ax.vlines(data[0], pos - width * 0.8, pos + width * 0.8, colors=color,
+                  linewidth=1.5, alpha=alpha)
+        ax.text(data[0], pos, f'n=1: {data[0]:.3g}', ha='left', va='center',
+                fontsize=7, color=color, alpha=min(alpha + 0.15, 1.0))
         return
     if np.all(data == data[0]):
         ax.vlines(data[0], pos - width * 0.8, pos + width * 0.8, colors=color,
@@ -40,7 +52,7 @@ def draw_half_violin_h(ax, pos, data, side='bottom', color='steelblue', alpha=0.
         ax.text(data[0], pos, f'all={data[0]:.3g}', ha='left', va='center',
                 fontsize=7, color=color, alpha=min(alpha + 0.15, 1.0))
         return
-    kde = gaussian_kde(data)
+    kde = gaussian_kde(data, bw_method=0.5)
     data_range = data.max() - data.min() if data.max() != data.min() else 1.0
     x_grid = np.linspace(data.min() - 0.5 * data_range, data.max() + 0.5 * data_range, 300)
     density = kde(x_grid)
@@ -127,7 +139,7 @@ def plot_cluster_statistics(master_table, name, statistics_list, max_n_sectors=6
     plt.show()
 
 
-def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=None):
+def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=None, x_lim=None, sort_by='n_sectors'):
     """
     Compare all clusters for a given n_sectors and statistic.
     Each cluster gets a horizontal split violin: bottom half = full distribution,
@@ -152,8 +164,13 @@ def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=No
 
     max_nsectors_per_cluster = master_table.groupby('name')['n_sectors'].max()
 
+    if sort_by == 'n_sectors':
+        sort_vals = max_nsectors_per_cluster
+    else:
+        sort_vals = master_table.groupby('name')[sort_by].first()
+
     cluster_names = sorted(subset['name'].unique(),
-                           key=lambda c: max_nsectors_per_cluster.get(c, 0))
+                           key=lambda c: sort_vals.get(c, 0))
 
     if max_clusters is not None and len(cluster_names) > max_clusters:
         cluster_names = list(np.random.choice(cluster_names, max_clusters, replace=False))
@@ -195,6 +212,9 @@ def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=No
     for c in cadences:
         legend_handles.append(mpatches.Patch(color=cadence_color_map[c], alpha=0.7, label=f'cadence={c}'))
     ax.legend(handles=legend_handles, title='cadence (top)', loc='upper right')
+
+    if x_lim is not None:
+        ax.set_xlim(x_lim)
 
     fig.tight_layout()
     plt.show()
