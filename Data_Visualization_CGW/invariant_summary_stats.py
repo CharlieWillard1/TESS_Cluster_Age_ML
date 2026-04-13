@@ -7,9 +7,9 @@ LC_BASE = '/astro/users/cgwill/TESS_Cluster_Age_ML/light_curves'
 
 
 def _slug(name):
-    """Canonical key for matching: lowercase, strip all spaces and hyphens."""
+    """Canonical key for matching: lowercase, strip spaces, hyphens, and brackets."""
     s = name.decode() if isinstance(name, bytes) else name
-    return s.lower().replace(' ', '').replace('-', '')
+    return s.lower().replace(' ', '').replace('-', '').replace('[', '').replace(']', '')
 
 
 def get_lc_path(master_table, name):
@@ -35,17 +35,82 @@ def get_lc_path(master_table, name):
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Flux normalization
+# Step 1: Cadence resampling (on raw flux, before normalization)
+# ---------------------------------------------------------------------------
+
+def resample_lc(t, f, err_f, cadence_bin_min=30.0):
+    """
+    Downsample a raw lightcurve to a common cadence by block-averaging
+    groups of N consecutive points.
+
+    Resampling is performed on raw flux before normalization. Groups that
+    contain an internal time gap (diff > 1.5 × native cadence) are discarded
+    entirely so that no averaging occurs across gaps.
+
+    TESS cadences are 3.33, 10, and 30 min — integer multiples of 3 — so the
+    decimation factor N is always 1, 3, or 9. An assertion enforces this.
+
+    Parameters
+    ----------
+    t, f, err_f : np.ndarray
+        Time (days), raw flux, and raw flux uncertainty. Must be finite and
+        time-sorted before calling.
+    cadence_bin_min : float
+        Target cadence in minutes. Default 30.
+
+    Returns
+    -------
+    t_out, f_out, err_f_out : np.ndarray
+        Resampled arrays. Returned unchanged if N <= 1.
+    """
+    if len(t) < 2:
+        return t.copy(), f.copy(), err_f.copy()
+
+    native_cadence_min = np.nanmedian(np.diff(t)) * 1440.0
+    N = round(cadence_bin_min / native_cadence_min)
+
+    if N <= 1:
+        return t.copy(), f.copy(), err_f.copy()
+
+    assert N == 1 or N % 3 == 0, (
+        f"Unexpected decimation factor N={N} for native cadence {native_cadence_min:.2f} min "
+        f"and target {cadence_bin_min:.1f} min. Expected N in {{1, 3, 9}} (TESS cadences are "
+        f"3.33, 10, 30 min)."
+    )
+
+    dt = np.diff(t)
+    gap_threshold = 1.5 * (native_cadence_min / 1440.0)
+
+    t_out, f_out, err_out = [], [], []
+    n_discarded = 0
+
+    for i in range(0, len(t) - N + 1, N):
+        if np.any(dt[i:i + N - 1] > gap_threshold):
+            n_discarded += 1
+            continue
+        t_out.append(np.mean(t[i:i + N]))
+        f_out.append(np.mean(f[i:i + N]))
+        err_out.append(np.sqrt(np.sum(err_f[i:i + N] ** 2)) / N)
+
+    n_out = len(t_out)
+    if n_out < 2:
+        return t.copy(), f.copy(), err_f.copy()
+
+    return np.array(t_out), np.array(f_out), np.array(err_out)
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Flux normalization
 # ---------------------------------------------------------------------------
 
 def normalize_flux(t, f, err_f):
     """
-    Normalize a lightcurve to zero-median relative flux.
+    Normalize a lightcurve to relative flux centered on 1.
 
     Drops all points where t, f, or err_f is non-finite, then computes a
     single global median and transforms:
 
-        x_i     = f_i / median(f) - 1
+        x_i     = f_i / median(f)
         err_x_i = err_f_i / median(f)
 
     Parameters
@@ -67,95 +132,19 @@ def normalize_flux(t, f, err_f):
     f = np.asarray(f, dtype=float)
     err_f = np.asarray(err_f, dtype=float)
 
-    n_in = len(t)
     mask = np.isfinite(t) & np.isfinite(f) & np.isfinite(err_f)
     t, f, err_f = t[mask], f[mask], err_f[mask]
-    n_clean = len(t)
-    print(f"  [normalize_flux] input points: {n_in}  |  after NaN/inf mask: {n_clean}  "
-          f"({n_in - n_clean} dropped)")
 
-    if n_clean < 2:
+    if len(f) < 2:
         raise ValueError("Fewer than 2 finite points after masking NaNs/infs.")
 
     med = np.median(f)
-    print(f"  [normalize_flux] median flux: {med:.6g}  |  "
-          f"baseline: {t.min():.4f} – {t.max():.4f} days  "
-          f"({t.max() - t.min():.2f} day span)")
-
     if med == 0 or not np.isfinite(med):
         raise ValueError(f"Median flux is {med}; cannot normalize.")
 
-    x = f / med - 1.0 #REMOVE THE MINUS ONE
+    x = f / med
     err_x = err_f / med
-    print(f"  [normalize_flux] normalized flux range: [{x.min():.4f}, {x.max():.4f}]  |  "
-          f"median err_x: {np.median(err_x):.4e}")
-
     return t, x, err_x
-
-
-# ---------------------------------------------------------------------------
-# Step 2: Cadence rebinning
-# ---------------------------------------------------------------------------
-
-def rebin_lc(t, x, err_x, cadence_bin_min=30.0):
-    """
-    Rebin a normalized lightcurve onto a fixed cadence grid using
-    inverse-variance weighted means.
-
-    Bins with no data are omitted entirely; the function never interpolates
-    across gaps. If the native cadence is already coarser than
-    ``cadence_bin_min``, the inputs are returned unchanged.
-
-    Parameters
-    ----------
-    t, x, err_x : np.ndarray
-        Time (days), normalized flux, and normalized flux uncertainty.
-    cadence_bin_min : float
-        Target bin width in minutes. Default 30.
-
-    Returns
-    -------
-    x_binned, err_x_binned : np.ndarray
-        Rebinned flux and uncertainty arrays (length = number of non-empty bins).
-    """
-    cadence_bin_days = cadence_bin_min / 1440.0
-
-    if len(t) < 2:
-        print(f"  [rebin_lc] fewer than 2 points — returning input unchanged")
-        return x.copy(), err_x.copy()
-
-    native_cadence_min = np.nanmedian(np.diff(t)) * 1440.0
-    print(f"  [rebin_lc] native cadence: {native_cadence_min:.2f} min  |  "
-          f"target cadence: {cadence_bin_min:.1f} min")
-
-    if native_cadence_min >= cadence_bin_min:
-        print(f"  [rebin_lc] native cadence >= target — returning input unchanged "
-              f"({len(x)} points)")
-        return x.copy(), err_x.copy()
-
-    bins = np.arange(t.min(), t.max() + cadence_bin_days, cadence_bin_days)
-    bin_idx = np.digitize(t, bins)
-
-    x_binned, sigma_binned = [], []
-    for b in range(1, len(bins) + 1):
-        mask = bin_idx == b
-        if not mask.any():
-            continue
-        w = 1.0 / err_x[mask] ** 2
-        w_sum = w.sum()
-        x_binned.append((w * x[mask]).sum() / w_sum)
-        sigma_binned.append(1.0 / np.sqrt(w_sum))
-
-    if len(x_binned) < 2:
-        print(f"  [rebin_lc] binning produced < 2 bins — returning input unchanged")
-        return x.copy(), err_x.copy()
-
-    n_bins = len(x_binned)
-    n_empty = len(bins) - n_bins
-    print(f"  [rebin_lc] {len(t)} points → {n_bins} bins  "
-          f"({n_empty} empty bins omitted, coverage {100*n_bins/len(bins):.1f}%)")
-
-    return np.array(x_binned), np.array(sigma_binned)
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +153,12 @@ def rebin_lc(t, x, err_x, cadence_bin_min=30.0):
 
 def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
     """
-    Compute noise-corrected variability statistics on a rebinned lightcurve.
+    Compute noise-corrected variability statistics on a resampled lightcurve.
 
     Parameters
     ----------
     x_binned, err_x_binned : np.ndarray
-        Rebinned normalized flux and uncertainty.
+        Resampled normalized flux and uncertainty.
     sigma_clip_thresh : float or None
         If given, iteratively sigma-clip outliers at this threshold (up to
         5 iterations) before computing statistics.
@@ -180,10 +169,10 @@ def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
         intrinsic_std   : noise-corrected standard deviation
         intrinsic_rms   : noise-corrected RMS
         intrinsic_mad   : noise-corrected MAD (Gaussian-equivalent sigma)
-        n_bins          : number of bins used after clipping
+        n_bins          : number of points used after clipping
         sigma_phot      : sqrt(mean photon noise variance)
         sigma_obs       : observed standard deviation (before noise correction)
-        rms_obs         : observed RMS (before noise correction)
+        rms_obs         : observed RMS around 1 (before noise correction)
         sigma_mad_obs   : observed MAD scaled to Gaussian sigma (1.4826 * MAD)
     """
     x = x_binned.copy()
@@ -200,10 +189,6 @@ def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
             if keep.sum() == len(x):
                 break
             x, sx = x[keep], sx[keep]
-        print(f"  [_compute_stats] sigma-clip ({sigma_clip_thresh}σ): "
-              f"{n_before} → {len(x)} bins  ({n_before - len(x)} clipped)")
-    else:
-        print(f"  [_compute_stats] no sigma-clipping applied")
 
     N = len(x)
     sigma_phot2 = np.mean(sx ** 2)
@@ -213,7 +198,7 @@ def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
     sigma_obs  = np.sqrt(sigma_obs2)
     intrinsic_std = np.sqrt(max(0.0, sigma_obs2 - sigma_phot2))
 
-    rms_obs2 = np.mean(x ** 2)
+    rms_obs2 = np.mean((x - 1.0) ** 2)
     rms_obs  = np.sqrt(rms_obs2)
     intrinsic_rms = np.sqrt(max(0.0, rms_obs2 - sigma_phot2))
 
@@ -221,14 +206,16 @@ def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
     sigma_mad_obs = 1.4826 * mad_obs
     intrinsic_mad = np.sqrt(max(0.0, sigma_mad_obs ** 2 - sigma_phot2))
 
-    print(f"  [_compute_stats] n_bins={N}  |  "
-          f"sigma_phot={sigma_phot:.4e}  |  "
-          f"sigma_obs={sigma_obs:.4e}  |  "
-          f"rms_obs={rms_obs:.4e}  |  "
-          f"sigma_mad_obs={sigma_mad_obs:.4e}")
-    print(f"  [_compute_stats] intrinsic_std={intrinsic_std:.4e}  |  "
-          f"intrinsic_rms={intrinsic_rms:.4e}  |  "
-          f"intrinsic_mad={intrinsic_mad:.4e}")
+    for stat_name, val in [('sigma_phot', sigma_phot), ('sigma_obs', sigma_obs),
+                            ('rms_obs', rms_obs), ('sigma_mad_obs', sigma_mad_obs),
+                            ('intrinsic_std', intrinsic_std), ('intrinsic_rms', intrinsic_rms),
+                            ('intrinsic_mad', intrinsic_mad)]:
+        if not np.isfinite(val):
+            print(f"  WARNING [_compute_stats] {stat_name}=NaN/inf  |  "
+                  f"N={N}  sigma_phot2={sigma_phot2:.4e}  sigma_obs2={sigma_obs2:.4e}  "
+                  f"rms_obs2={rms_obs2:.4e}  sigma_mad_obs2={sigma_mad_obs**2:.4e}  "
+                  f"x: min={x.min():.4e} max={x.max():.4e} mean={x.mean():.4e}  "
+                  f"sx: min={sx.min():.4e} max={sx.max():.4e}")
 
     return {
         'intrinsic_std':  intrinsic_std,
@@ -255,16 +242,15 @@ def compute_variability_metrics(t, f, err_f,
 
     Pipeline
     --------
-    1. normalize_flux  — zero-mean relative flux via global median
-    2. rebin_lc        — inverse-variance weighted rebinning to common cadence
+    1. resample_lc     — block-average raw flux to common cadence (before normalization)
+    2. normalize_flux  — relative flux via global median (x = f/median, centered on 1)
     3. _compute_stats  — noise-corrected STD, RMS, MAD
 
     Corrections applied
     -------------------
-    - Flux normalization: relative flux x_i = f_i/median(f) - 1
-    - Cadence: all lightcurves rebinned to ``cadence_bin_min`` minutes before
-      computing statistics, so metrics are comparable across different native
-      cadences.
+    - Cadence: raw flux resampled to ``cadence_bin_min`` minutes before
+      normalization, so metrics are comparable across different native cadences.
+    - Flux normalization: relative flux x_i = f_i/median(f)
     - Photometric noise: mean measurement variance subtracted in quadrature.
 
     NOT corrected
@@ -278,9 +264,9 @@ def compute_variability_metrics(t, f, err_f,
     t, f, err_f : array-like
         Time (days), raw flux, and raw flux uncertainty.
     cadence_bin_min : float
-        Target binning cadence in minutes. Default 30.
+        Target resampling cadence in minutes. Default 30.
     sigma_clip_thresh : float or None
-        Sigma-clipping threshold applied after rebinning. None = no clipping.
+        Sigma-clipping threshold applied after resampling. None = no clipping.
 
     Returns
     -------
@@ -288,18 +274,19 @@ def compute_variability_metrics(t, f, err_f,
         All keys from ``_compute_stats`` plus ``cadence_bin_min``.
         Returns None if normalization fails (e.g. all-NaN input).
     """
-    print(f"[compute_variability_metrics] cadence_bin_min={cadence_bin_min} min  |  "
-          f"sigma_clip_thresh={sigma_clip_thresh}  |  "
-          f"n_input={len(np.asarray(t))}")
+    t = np.asarray(t, dtype=float)
+    f = np.asarray(f, dtype=float)
+    err_f = np.asarray(err_f, dtype=float)
+
+    t, f, err_f = resample_lc(t, f, err_f, cadence_bin_min)
+
     try:
         t_norm, x, err_x = normalize_flux(t, f, err_f)
     except ValueError as e:
-        print(f"  [compute_variability_metrics] normalize_flux failed: {e}")
+        print(f"  WARNING [compute_variability_metrics] normalize_flux failed: {e}")
         return None
 
-    x_binned, err_x_binned = rebin_lc(t_norm, x, err_x, cadence_bin_min)
-
-    result = _compute_stats(x_binned, err_x_binned, sigma_clip_thresh)
+    result = _compute_stats(x, err_x, sigma_clip_thresh)
     result['cadence_bin_min'] = cadence_bin_min
     return result
 
@@ -313,17 +300,14 @@ def add_variability_metrics(master_table, cadence_bin_min=30.0,
     """
     Add full-baseline variability metric columns to master_table in-place.
 
-    For each row, loads all sectors listed in the 'sectors' column, concatenates
-    them into a single lightcurve without per-sector normalization, then calls
-    ``compute_variability_metrics``.
+    For each row, loads all sectors listed in the 'sectors' column. Each sector
+    is resampled to the common cadence on raw flux, then normalized individually
+    to remove inter-sector flux offsets. Normalized sectors are concatenated and
+    variability statistics are computed over the full baseline.
 
     Adds columns: ``intrinsic_std``, ``intrinsic_rms``, ``intrinsic_mad``,
     ``n_bins_used``. Rows whose lightcurve file cannot be found or that fail
     for any other reason are left as NaN.
-
-    Note: no per-sector flux offset correction is applied before stitching.
-    Inter-sector flux offsets will inflate variability estimates for
-    multi-sector lightcurves.
 
     Parameters
     ----------
@@ -353,11 +337,9 @@ def add_variability_metrics(master_table, cadence_bin_min=30.0,
         try:
             path = get_lc_path(master_table, name)
         except FileNotFoundError:
-            print(f"  [add_variability_metrics] {name_str}: LC file not found — skipping")
+            print(f"  WARNING [add_variability_metrics] {name_str}: LC file not found — skipping")
             n_missing += len(group)
             continue
-
-        print(f"  [add_variability_metrics] {name_str}: {len(group)} row(s)  |  {path}")
 
         try:
             with astropy_fits.open(path) as hdul:
@@ -374,17 +356,29 @@ def add_variability_metrics(master_table, cadence_bin_min=30.0,
                             flux = np.asarray(data['flux'],     dtype=float)
                             ferr = np.asarray(data['flux_err'], dtype=float)
 
+                            mask = (np.isfinite(time) &
+                                    np.isfinite(flux) &
+                                    np.isfinite(ferr))
+                            time, flux, ferr = time[mask], flux[mask], ferr[mask]
+                            if len(time) < 2:
+                                print(f"  WARNING [{name_str}] row {idx} sector {s}: "
+                                      f"too few finite points — skipping sector")
+                                continue
+
+                            time, flux, ferr = resample_lc(time, flux, ferr, cadence_bin_min)
                             try:
                                 t_s, x_s, err_x_s = normalize_flux(time, flux, ferr)
                             except ValueError as e:
-                                print(f"    row {idx} sector {s}: normalize_flux failed — {e}")
+                                print(f"  WARNING [{name_str}] row {idx} sector {s}: "
+                                      f"normalize_flux failed — {e}")
                                 continue
                             all_t.append(t_s)
                             all_x.append(x_s)
                             all_err_x.append(err_x_s)
 
                         if not all_t:
-                            print(f"    row {idx}: no valid data in any sector — skipping")
+                            print(f"  WARNING [{name_str}] row {idx}: "
+                                  f"no valid data in any sector — skipping")
                             n_failed += 1
                             continue
 
@@ -395,31 +389,26 @@ def add_variability_metrics(master_table, cadence_bin_min=30.0,
                         sort_idx = np.argsort(t)
                         t, x, err_x = t[sort_idx], x[sort_idx], err_x[sort_idx]
 
-                        print(f"    row {idx}: sectors={list(sectors)}  |  "
-                              f"total points={len(t)}  |  "
-                              f"baseline={t.min():.3f}–{t.max():.3f} days")
-
-                        x_binned, err_x_binned = rebin_lc(t, x, err_x, cadence_bin_min)
-                        result = _compute_stats(x_binned, err_x_binned, sigma_clip_thresh)
+                        result = _compute_stats(x, err_x, sigma_clip_thresh)
                         result['cadence_bin_min'] = cadence_bin_min
 
-                        if result is None:
-                            print(f"    row {idx}: _compute_stats returned None — skipping")
-                            n_failed += 1
-                            continue
-
-                        intrinsic_std_vals[idx] = result['intrinsic_std']
-                        intrinsic_rms_vals[idx] = result['intrinsic_rms']
-                        intrinsic_mad_vals[idx] = result['intrinsic_mad']
-                        n_bins_vals[idx]        = result['n_bins']
+                        for key, arr in [('intrinsic_std', intrinsic_std_vals),
+                                         ('intrinsic_rms', intrinsic_rms_vals),
+                                         ('intrinsic_mad', intrinsic_mad_vals)]:
+                            val = result[key]
+                            if not np.isfinite(val):
+                                print(f"  WARNING [{name_str}] row {idx} "
+                                      f"sectors={list(sectors)}: {key}=NaN/inf")
+                            arr[idx] = val
+                        n_bins_vals[idx] = result['n_bins']
                         n_ok += 1
 
                     except Exception as e:
-                        print(f"    row {idx}: unexpected error — {e}")
+                        print(f"  WARNING [{name_str}] row {idx}: unexpected error — {e}")
                         n_failed += 1
 
         except Exception as e:
-            print(f"  [add_variability_metrics] {name_str}: failed to open FITS — {e}")
+            print(f"  WARNING [{name_str}]: failed to open FITS — {e}")
             n_failed += len(group)
 
     print(f"[add_variability_metrics] done  |  "

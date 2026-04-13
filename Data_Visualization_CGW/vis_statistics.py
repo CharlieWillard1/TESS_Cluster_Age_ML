@@ -139,12 +139,31 @@ def plot_cluster_statistics(master_table, name, statistics_list, max_n_sectors=6
     plt.show()
 
 
-def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=None, x_lim=None, sort_by='n_sectors'):
+def _draw_per_cadence_h(ax, pos, cluster_mask, subset, column,
+                        cadences, cadence_color_map, side, alpha=0.7):
+    """Draw per-cadence half-violins for one column on one side of a row."""
+    for cadence in cadences:
+        vals = subset.loc[
+            cluster_mask & (subset['cadence'] == cadence), column
+        ].dropna().values
+        if len(vals) == 0:
+            continue
+        draw_half_violin_h(ax, pos=pos, data=vals, side=side,
+                           color=cadence_color_map[cadence], alpha=alpha)
+
+
+def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=None,
+                             x_lim=None, sort_by='n_sectors', comparison_column=None,
+                             debug=False):
     """
     Compare all clusters for a given n_sectors and statistic.
-    Each cluster gets a horizontal split violin: bottom half = full distribution,
-    top half = overlapping per-cadence distributions.
-    Clusters are sorted by their max n_sectors across all data.
+
+    Default mode: each cluster gets a horizontal split violin where
+    bottom = full distribution of ``statistic``, top = per-cadence distributions.
+
+    With ``comparison_column``: bottom = per-cadence distributions of ``statistic``,
+    top = per-cadence distributions of ``comparison_column``. Useful for directly
+    comparing e.g. 'std' vs 'intrinsic_std' across clusters.
 
     Parameters
     ----------
@@ -152,11 +171,19 @@ def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=No
     n_sectors : int
         The n_sectors value to filter on.
     statistic : str
-        The column name to plot on the x-axis.
+        The column name to plot on the x-axis (bottom half).
     max_clusters : int or None
         If set, randomly sample this many clusters (useful for readability).
+    x_lim : tuple or None
+    sort_by : str
+    comparison_column : str or None
+        If given, plot per-cadence violins of this column on the top half
+        instead of the default all-data violin.
     """
-    subset = master_table[master_table['n_sectors'] == n_sectors][['name', 'cadence', statistic]].dropna()
+    cols = ['name', 'cadence', statistic]
+    if comparison_column is not None:
+        cols.append(comparison_column)
+    subset = master_table[master_table['n_sectors'] == n_sectors][cols].dropna(subset=[statistic])
 
     if subset.empty:
         print(f"No data found for n_sectors={n_sectors}.")
@@ -185,19 +212,32 @@ def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=No
 
     for i, cluster in enumerate(cluster_names):
         cluster_mask = subset['name'] == cluster
-        all_vals = subset.loc[cluster_mask, statistic].values
 
-        draw_half_violin_h(ax, pos=i, data=all_vals, side='bottom',
-                           color='steelblue', alpha=0.85)
+        if debug:
+            cluster_str = cluster.decode() if isinstance(cluster, bytes) else cluster
+            for cadence in cadences:
+                cad_mask = cluster_mask & (subset['cadence'] == cadence)
+                vals = subset.loc[cad_mask, statistic].dropna().values
+                print(f"  [{cluster_str}] cadence={cadence}  n={len(vals)}  "
+                      f"{statistic}={vals}")
+                if comparison_column is not None:
+                    cmp_vals = subset.loc[cad_mask, comparison_column].dropna().values
+                    print(f"  [{cluster_str}] cadence={cadence}  n={len(cmp_vals)}  "
+                          f"{comparison_column}={cmp_vals}")
 
-        for cadence in cadences:
-            cad_vals = subset.loc[
-                cluster_mask & (subset['cadence'] == cadence), statistic
-            ].values
-            if len(cad_vals) < 2:
-                continue
-            draw_half_violin_h(ax, pos=i, data=cad_vals, side='top',
-                               color=cadence_color_map[cadence], alpha=0.5)
+        if comparison_column is None:
+            # Default: bottom = all data, top = per-cadence
+            all_vals = subset.loc[cluster_mask, statistic].dropna().values
+            draw_half_violin_h(ax, pos=i, data=all_vals, side='bottom',
+                               color='steelblue', alpha=0.85)
+            _draw_per_cadence_h(ax, i, cluster_mask, subset, statistic,
+                                cadences, cadence_color_map, side='top', alpha=0.5)
+        else:
+            # Comparison: bottom = statistic per-cadence, top = comparison_column per-cadence
+            _draw_per_cadence_h(ax, i, cluster_mask, subset, statistic,
+                                cadences, cadence_color_map, side='bottom', alpha=0.85)
+            _draw_per_cadence_h(ax, i, cluster_mask, subset, comparison_column,
+                                cadences, cadence_color_map, side='top', alpha=0.5)
 
         ax.axhline(y=i, color='gray', linewidth=0.5, linestyle='--', alpha=0.3)
 
@@ -205,13 +245,20 @@ def plot_clusters_comparison(master_table, n_sectors, statistic, max_clusters=No
                    for c in cluster_names]
     ax.set_yticks(range(n_clusters))
     ax.set_yticklabels(yticklabels)
-    ax.set_xlabel(statistic)
-    ax.set_title(f'{statistic} by cluster  (n_sectors={n_sectors})')
+    ax.set_xlabel(statistic if comparison_column is None else f'{statistic}  /  {comparison_column}')
 
-    legend_handles = [mpatches.Patch(color='steelblue', alpha=0.85, label='All (bottom)')]
-    for c in cadences:
-        legend_handles.append(mpatches.Patch(color=cadence_color_map[c], alpha=0.7, label=f'cadence={c}'))
-    ax.legend(handles=legend_handles, title='cadence (top)', loc='upper right')
+    if comparison_column is None:
+        ax.set_title(f'{statistic} by cluster  (n_sectors={n_sectors})')
+        legend_handles = [mpatches.Patch(color='steelblue', alpha=0.85, label='All (bottom)')]
+        for c in cadences:
+            legend_handles.append(mpatches.Patch(color=cadence_color_map[c], alpha=0.7, label=f'cadence={c}'))
+        ax.legend(handles=legend_handles, title='cadence (top)', loc='upper right')
+    else:
+        ax.set_title(f'{statistic} (bottom)  vs  {comparison_column} (top)  —  n_sectors={n_sectors}')
+        legend_handles = []
+        for c in cadences:
+            legend_handles.append(mpatches.Patch(color=cadence_color_map[c], alpha=0.7, label=f'cadence={c}'))
+        ax.legend(handles=legend_handles, loc='upper right')
 
     if x_lim is not None:
         ax.set_xlim(x_lim)
