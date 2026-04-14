@@ -67,7 +67,7 @@ def resample_lc(t, f, err_f, cadence_bin_min=30.0):
         return t.copy(), f.copy(), err_f.copy()
 
     native_cadence_min = np.nanmedian(np.diff(t)) * 1440.0
-    N = round(cadence_bin_min / native_cadence_min)
+    N = int(round(cadence_bin_min / native_cadence_min))
 
     if N <= 1:
         return t.copy(), f.copy(), err_f.copy()
@@ -413,7 +413,7 @@ def add_variability_metrics(master_table, cadence_bin_min=30.0,
 
     print(f"[add_variability_metrics] done  |  "
           f"ok={n_ok}  missing={n_missing}  failed={n_failed}")
-
+ 
     master_table['intrinsic_std'] = intrinsic_std_vals
     master_table['intrinsic_rms'] = intrinsic_rms_vals
     master_table['intrinsic_mad'] = intrinsic_mad_vals
