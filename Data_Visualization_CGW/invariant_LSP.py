@@ -166,6 +166,48 @@ def build_lc_for_row(row, master_table, cadence_bin_min=30.0):
 
 
 # ---------------------------------------------------------------------------
+# Noise-floor helper
+# ---------------------------------------------------------------------------
+
+def _compute_noise_floor(t, err_x, freqs, n_realizations=100, seed=None):
+    """
+    Estimate the frequency-dependent LSP noise floor via Monte Carlo Gaussian
+    noise realizations.
+
+    For each realization a pure-noise lightcurve is constructed by drawing
+    ``y_noise ~ Normal(0, err_x)`` at the original timestamps, then the
+    weighted LSP is computed on the same frequency grid used for the real data.
+    The noise floor is defined as the median power across all realizations at
+    each frequency.
+
+    Parameters
+    ----------
+    t : ndarray
+        Observation times (days).
+    err_x : ndarray
+        Per-point flux uncertainties (same shape as ``t``).
+    freqs : ndarray
+        Frequency grid (1/day) — must match the grid used for the real LSP.
+    n_realizations : int
+        Number of Gaussian noise draws. Default 100.
+    seed : int or None
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    ndarray, shape (len(freqs),)
+        Median LSP power at each frequency across all realizations.
+    """
+    rng = np.random.default_rng(seed)
+    powers = np.empty((n_realizations, len(freqs)))
+    for i in range(n_realizations):
+        y_noise = rng.normal(0.0, err_x)
+        ls_noise = LombScargle(t, y_noise, err_x, normalization='standard')
+        powers[i] = ls_noise.power(freqs)
+    return np.median(powers, axis=0)
+
+
+# ---------------------------------------------------------------------------
 # Band-power helper
 # ---------------------------------------------------------------------------
 
@@ -269,7 +311,8 @@ def compute_lsp(t, x, err_x, P_min=0.1, P_max=10.0, alpha=5, fap_level=0.01,
 
 def add_invariant_LSP_stats(table, P_min=0.1, P_max=10.0, alpha=5,
                              cadence_bin_min=30.0, fap_level=0.01,
-                             T_effective=True):
+                             T_effective=True, compute_noise_floor=False,
+                             n_noise_realizations=100):
     """
     Add invariant Lomb-Scargle periodogram statistics to the master table
     in-place.
@@ -279,6 +322,7 @@ def add_invariant_LSP_stats(table, P_min=0.1, P_max=10.0, alpha=5,
       2. Computes the LSP on a frequency grid from ``ls_bins`` with
          ``P_min``–``P_max`` days (``P_max`` is capped to T/2 per row).
       3. Stores the full frequency grid and power array, plus scalar summaries.
+      4. Estimates the frequency-dependent noise floor via ``_compute_noise_floor``.
 
     Rows whose FITS file is missing or that fail for any other reason are
     left as NaN / None.
@@ -303,6 +347,13 @@ def add_invariant_LSP_stats(table, P_min=0.1, P_max=10.0, alpha=5,
         rather than the wall-clock span max(t)-min(t).  This prevents df from
         being artificially fine for multi-sector LCs whose gaps inflate the
         apparent span.
+    compute_noise_floor : bool
+        If True, estimate the frequency-dependent noise floor via
+        ``_compute_noise_floor`` and add the ``LSP_noise_floor`` column.
+        Default False.
+    n_noise_realizations : int
+        Number of Gaussian noise draws when ``compute_noise_floor=True``.
+        Default 100.
 
     Returns
     -------
@@ -321,13 +372,16 @@ def add_invariant_LSP_stats(table, P_min=0.1, P_max=10.0, alpha=5,
     LSP_SumPow_7_4          float64            sum of power in 4–7 day band
     LSP_SumPow_4_1          float64            sum of power in 1–4 day band
     LSP_SumPow_1_p5         float64            sum of power in 0.5–1 day band
+    LSP_noise_floor         object (ndarray)   median noise-only LSP power per frequency
+                                               (only added when compute_noise_floor=True)
     """
     n_rows = len(table)
     n_clusters = table['name'].nunique()
+    noise_info = f"  n_noise={n_noise_realizations}" if compute_noise_floor else ""
     print(f"[add_invariant_LSP_stats] processing {n_rows} rows across "
           f"{n_clusters} clusters  |  P=[{P_min}, {P_max}] days  "
           f"alpha={alpha}  cadence={cadence_bin_min} min  FAP={fap_level}  "
-          f"T_effective={T_effective}")
+          f"T_effective={T_effective}{noise_info}")
 
     # Pre-allocate output Series keyed by the table's own index labels so that
     # label-based assignment (idx from iterrows) works correctly on subsets
@@ -335,6 +389,8 @@ def add_invariant_LSP_stats(table, P_min=0.1, P_max=10.0, alpha=5,
     idx = table.index
     lsp_freq  = pd.Series([None] * n_rows, index=idx, dtype=object)
     lsp_power = pd.Series([None] * n_rows, index=idx, dtype=object)
+    if compute_noise_floor:
+        lsp_noise_floor = pd.Series([None] * n_rows, index=idx, dtype=object)
     max_power           = pd.Series(np.nan, index=idx, dtype=float)
     freq_at_max_power   = pd.Series(np.nan, index=idx, dtype=float)
     period_at_max_power = pd.Series(np.nan, index=idx, dtype=float)
@@ -368,6 +424,11 @@ def add_invariant_LSP_stats(table, P_min=0.1, P_max=10.0, alpha=5,
 
                 lsp_freq[label]  = result['freqs']
                 lsp_power[label] = result['power']
+                if compute_noise_floor:
+                    lsp_noise_floor[label] = _compute_noise_floor(
+                        t, err_x, result['freqs'],
+                        n_realizations=n_noise_realizations,
+                    )
                 max_power[label]           = result['max_power']
                 freq_at_max_power[label]   = result['freq_at_max_power']
                 period_at_max_power[label] = result['period_at_max_power']
@@ -392,6 +453,8 @@ def add_invariant_LSP_stats(table, P_min=0.1, P_max=10.0, alpha=5,
 
     table['LSP_freq']                = lsp_freq
     table['LSP_power']               = lsp_power
+    if compute_noise_floor:
+        table['LSP_noise_floor']     = lsp_noise_floor
     table['LSP_max_power']           = max_power
     table['LSP_freq_at_max_power']   = freq_at_max_power
     table['LSP_period_at_max_power'] = period_at_max_power

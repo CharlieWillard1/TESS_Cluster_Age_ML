@@ -223,8 +223,17 @@ def plot_cluster_lsp(master_table, name, max_num_pgs=10,
             label = f'{sectors_label} | {row["cadence"]:.0f} min | df={df:.2e} day⁻¹'
             ax.plot(freqs, power, lw=1.5, alpha=0.7, color=color, label=label)
 
+            raw_noise = row.get('LSP_noise_floor') if hasattr(row, 'get') else row['LSP_noise_floor']
+            if raw_noise is not None:
+                nf_freqs = np.asarray(row['LSP_freq'])
+                nf = np.asarray(raw_noise)
+                if x_lim is not None:
+                    nf_mask = (nf_freqs >= x_lim[0]) & (nf_freqs <= x_lim[1])
+                    nf_freqs, nf = nf_freqs[nf_mask], nf[nf_mask]
+                ax.plot(nf_freqs, nf, lw=1.0, alpha=0.6, color=color, linestyle='--')
+
             if np.isfinite(fap):
-                ax.axhline(fap, color=color, lw=1.0, linestyle='--', alpha=0.6)
+                ax.axhline(fap, color=color, lw=1.0, linestyle=':', alpha=0.6)
 
         ax.set_yscale(yscale)
         if y_lim is not None:

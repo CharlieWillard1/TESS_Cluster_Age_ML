@@ -1,0 +1,104 @@
+I am analyzing unevenly sampled light curves (e.g., TESS sectors) using a weighted Lomb–Scargle periodogram (GLS) via:
+
+    LombScargle(t, y, dy)
+
+My goal is to identify which parts of the frequency spectrum are:
+1) dominated by measurement noise,
+2) part of a broad physical continuum (e.g., stochastic variability or many unresolved oscillators),
+3) or true coherent oscillations (narrow peaks).
+
+I will follow this procedure:
+
+STEP 1 — Compute the LSP
+- Use a linear frequency grid (not period-spaced)
+- Ensure correct binning using baseline T and samples_per_peak
+- Compute power spectrum: P(f)
+
+STEP 2 — Estimate measurement-noise floor
+- Keep timestamps t fixed
+- Generate many (e.g., 100–1000) noise-only light curves:
+      y_noise ~ Normal(0, dy)
+- For each realization, compute LSP
+- At each frequency, compute:
+      median(P_noise) → noise floor
+      95th / 99th percentile → noise envelope
+
+Interpretation:
+- This gives the frequency-dependent contribution of measurement noise only
+- Typically flat-ish (white noise), possibly slightly structured due to sampling
+
+STEP 3 — Compute sampling/window function
+- Use same timestamps t
+- Compute LSP of a trivial signal (e.g., constant or delta-like)
+- This reveals frequencies where sampling/gaps introduce structure
+
+Interpretation:
+- If features in real LSP align with window function → likely aliasing/sampling artifacts
+
+STEP 4 — Fit continuum background (Vaughan-style)
+- Work in log-log space:
+      x = log10(f)
+      y = log10(P)
+- Mask strong peaks (e.g., remove top ~10% power or use iterative clipping)
+- Fit a linear model:
+      log P_fit = a * log f + b
+- Convert back:
+      P_fit(f) = 10^(log P_fit)
+
+Interpretation:
+- This models the broad-band continuum (not just measurement noise)
+- Includes stochastic variability, unresolved oscillators, etc.
+
+STEP 5 — Compute excess above continuum
+- Define:
+      R(f) = P(f) / P_fit(f)
+
+Interpretation:
+- R ~ 1 → consistent with background
+- R >> 1 → candidate signal
+
+STEP 6 — Define significance thresholds (Vaughan 2005)
+- For each frequency:
+      P_99_local(f) ≈ 4.6 * P_fit(f)
+  (based on exponential statistics)
+
+Optional global correction:
+- Estimate number of independent frequencies:
+      N_eff ≈ (f_max - f_min) * T
+- Then:
+      z = -ln(alpha / N_eff)
+      P_threshold = z * P_fit
+
+STEP 7 — Classify features
+
+For each frequency region:
+
+- Measurement-noise dominated:
+      P_real ≈ noise floor from Step 2
+
+- Window/sampling dominated:
+      structure matches window function from Step 3
+
+- Continuum-dominated (physical background):
+      P_real >> measurement noise
+      broad (not narrow peaks)
+      captured by P_fit
+
+- Coherent oscillations:
+      narrow peaks
+      significantly above P_fit (R >> threshold)
+      stable across sectors / subsets
+
+STEP 8 — Optional validation
+- Check consistency across individual sectors
+- Phase-fold light curve at candidate periods
+- Use injection–recovery if needed
+
+SUMMARY:
+- Measurement noise → from dy simulations
+- Continuum → from power-law fit in log-log space
+- Peaks → identified via excess above continuum
+
+This separates:
+    noise vs continuum vs true oscillations
+in a physically meaningful way.
