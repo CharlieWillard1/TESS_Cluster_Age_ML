@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits as astropy_fits
 
-from invariant_summary_stats import LC_BASE, _slug, get_lc_path, resample_lc
+from extract_LC_LSP import LC_BASE, _slug, get_lc_path, resample_lc
 
 
 def plot_cluster_lcs(master_table, name, x_zoom=None, plot_errors=False,
