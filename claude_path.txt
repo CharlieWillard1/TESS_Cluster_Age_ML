@@ -1,0 +1,1 @@
+export PATH="/astro/users/cgwill/.npm-global/bin:$PATH"

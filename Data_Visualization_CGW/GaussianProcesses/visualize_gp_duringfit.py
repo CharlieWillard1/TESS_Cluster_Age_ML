@@ -54,6 +54,74 @@ def _get_component_contribution(theta, component_idx, x, y, yerr):
     return mu_j
 
 
+def plot_initial_lsp(freq, power, peaks, masked_windows, white_noise_info):
+    """
+    Show the initial LSP (period domain) before any fitting, with:
+      - white-noise threshold as a dashed horizontal line
+      - found significant peaks marked with vertical lines
+      - masked harmonic regions shaded in translucent red
+
+    Parameters
+    ----------
+    freq : array
+        Frequency array from the LSP.
+    power : array
+        LSP power array.
+    peaks : list of dicts
+        [{freq, period, power}, ...] — the significant peaks that will be seeded.
+    masked_windows : list of (f_lo, f_hi) tuples
+        Frequency intervals that were suppressed during peak search.
+    white_noise_info : dict
+        Must contain 'white_noise_power_threshold'.
+    """
+    freq   = np.asarray(freq)
+    power  = np.asarray(power)
+    period = 1.0 / freq
+    threshold = white_noise_info["white_noise_power_threshold"]
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    sort_idx = np.argsort(period)
+    ax.plot(period[sort_idx], power[sort_idx], color='steelblue', lw=0.9, alpha=0.9)
+
+    ax.axhline(threshold, color='tomato', lw=1.5, ls='--',
+               label=f"WN threshold = {threshold:.4f}")
+
+    # Shade masked harmonic windows (in period space)
+    p_min_data = period.min()
+    p_max_data = period.max()
+    added_label = False
+    for f_lo, f_hi in masked_windows:
+        # frequency window [f_lo, f_hi] → period window [1/f_hi, 1/f_lo]
+        p_lo = 1.0 / f_hi if f_hi > 0 else p_max_data
+        p_hi = 1.0 / f_lo if f_lo > 0 else p_max_data
+        # Clip to the plotted range
+        p_lo = max(p_lo, p_min_data)
+        p_hi = min(p_hi, p_max_data)
+        if p_lo >= p_hi:
+            continue
+        label = "Masked regions" if not added_label else None
+        ax.axvspan(p_lo, p_hi, color='tomato', alpha=0.12, lw=0, label=label)
+        added_label = True
+
+    # Mark the found peaks
+    colors_peaks = plt.cm.plasma(np.linspace(0.15, 0.85, max(len(peaks), 1)))
+    for i, (peak, c) in enumerate(zip(peaks, colors_peaks)):
+        ax.axvline(
+            peak["period"], color=c, lw=1.3, ls=':',
+            label=f"Peak {i+1}: {peak['period']:.3f} d (power={peak['power']:.4f})",
+        )
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Period (days)")
+    ax.set_ylabel("LSP power")
+    ax.set_title("Initial LSP — significant peaks and masked regions")
+    ax.legend(fontsize=8, loc='upper right')
+
+    fig.tight_layout()
+    plt.show()
+
+
 def plot_before_fit(x, y, yerr, lsp_dict, white_noise_info, component_idx, max_days=30):
     """
     2-panel diagnostic plot before fitting component_idx.
@@ -153,4 +221,111 @@ def plot_after_fit(x, y, yerr, all_accepted_fits, component_idx, max_days=30):
     axes[-1].set_xlabel("Time (days)")
     fig.suptitle(f"After Component {component_idx} Fit", fontsize=13)
     fig.tight_layout()
+    plt.show()
+
+
+def plot_fit_summary(
+    x,
+    y,
+    yerr,
+    fits,
+    component_idx,
+    resid,
+    resid_lsp,
+    white_noise_info,
+    bic,
+    max_days=30,
+):
+    """
+    Combined diagnostic figure after fitting component_idx components.
+
+    Rows 1..component_idx: component breakdown (same layout as plot_after_fit).
+    Bottom row (2 panels): residual flux vs time + residual LSP vs period.
+    BIC is shown in the figure title.
+    """
+    n_comp_rows = component_idx
+    n_rows = n_comp_rows + 1  # +1 for residual LSP row
+
+    fig = plt.figure(figsize=(12, 3.5 * n_rows))
+    # Use gridspec so the last row can be split into 2 columns
+    import matplotlib.gridspec as gridspec
+    gs = gridspec.GridSpec(n_rows, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+    mask = x <= max_days
+    final_fit = fits[-1]
+    theta_final = np.asarray(final_fit["theta"])
+
+    # ── Component rows (span both columns) ──────────────────────────────────
+    mu_full = _get_full_gp_mean(final_fit, x, y)
+
+    ax0 = fig.add_subplot(gs[0, :])
+    ax0.errorbar(
+        x[mask], np.asarray(y)[mask], yerr=np.asarray(yerr)[mask],
+        fmt='.', color='steelblue', alpha=0.4, ms=3, elinewidth=0.5, label='Data'
+    )
+    ax0.plot(
+        x[mask], mu_full[mask],
+        color='tomato', lw=1.5, label=f'GP mean ({component_idx} components)'
+    )
+    ax0.set_ylabel("Flux")
+    ax0.set_title(
+        f"Full GP fit ({component_idx} components) | BIC = {bic:.1f}",
+        fontsize=11,
+    )
+    ax0.legend(fontsize=8)
+
+    for j in range(2, n_comp_rows + 1):
+        prev_fit = fits[j - 2]
+        mu_prev = _get_full_gp_mean(prev_fit, x, y)
+        y_resid_j = np.asarray(y) - mu_prev
+
+        mu_j = _get_component_contribution(theta_final, j, x, y, yerr)
+
+        ax_j = fig.add_subplot(gs[j - 1, :])
+        ax_j.errorbar(
+            x[mask], y_resid_j[mask], yerr=np.asarray(yerr)[mask],
+            fmt='.', color='steelblue', alpha=0.4, ms=3, elinewidth=0.5,
+            label=f'Residual after {j-1} comp.'
+        )
+        ax_j.plot(x[mask], mu_j[mask], color='tomato', lw=1.5, label=f'Component {j}')
+        ax_j.set_ylabel("Flux")
+        ax_j.set_title(f"Component {j} isolated", fontsize=10)
+        ax_j.legend(fontsize=8)
+
+    # ── Bottom row: residual flux (left) + residual LSP (right) ─────────────
+    ax_resid = fig.add_subplot(gs[n_rows - 1, 0])
+    ax_resid.errorbar(
+        x[mask], np.asarray(resid)[mask], yerr=np.asarray(yerr)[mask],
+        fmt='.', color='gray', alpha=0.5, ms=3, elinewidth=0.5,
+    )
+    ax_resid.axhline(0, color='k', lw=0.8, ls='--')
+    ax_resid.set_xlabel("Time (days)")
+    ax_resid.set_ylabel("Residual flux")
+    ax_resid.set_title("Residuals (first 30 days)", fontsize=10)
+
+    ax_lsp = fig.add_subplot(gs[n_rows - 1, 1])
+    freq    = np.asarray(resid_lsp["freq"])
+    power   = np.asarray(resid_lsp["power"])
+    period  = 1.0 / freq
+    threshold = white_noise_info["white_noise_power_threshold"]
+    sort_idx = np.argsort(period)
+    ax_lsp.plot(period[sort_idx], power[sort_idx], color='steelblue', lw=0.8, alpha=0.85)
+    ax_lsp.axhline(
+        threshold, color='tomato', lw=1.5, ls='--',
+        label=f"WN threshold = {threshold:.4f}",
+    )
+    ax_lsp.axvline(
+        resid_lsp["best_period"], color='orange', lw=1.2, ls=':',
+        label=f"Peak = {resid_lsp['best_period']:.3f} d",
+    )
+    ax_lsp.set_xscale("log")
+    ax_lsp.set_xlabel("Period (days)")
+    ax_lsp.set_ylabel("LSP power")
+    ax_lsp.set_title("Residual LSP", fontsize=10)
+    ax_lsp.legend(fontsize=8)
+
+    fig.suptitle(
+        f"GP Fit Summary — {component_idx} component(s)",
+        fontsize=13, y=1.01,
+    )
     plt.show()

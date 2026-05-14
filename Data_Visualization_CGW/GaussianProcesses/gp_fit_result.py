@@ -19,6 +19,9 @@ class GPFitResult:
         all_accepted_fits,
         residual_lsps,
         white_noise_info,
+        all_fits=None,
+        all_residual_lsps=None,
+        peaks=None,
     ):
         self.t = t
         self.x = x
@@ -32,6 +35,11 @@ class GPFitResult:
         self.all_accepted_fits = all_accepted_fits
         self.residual_lsps = residual_lsps
         self.white_noise_info = white_noise_info
+        # All attempted fits (may differ from all_accepted_fits if BIC stopped early)
+        self.all_fits = all_fits if all_fits is not None else all_accepted_fits
+        self.all_residual_lsps = all_residual_lsps if all_residual_lsps is not None else residual_lsps
+        # Initial LSP peak list [{freq, period, power}, ...] sorted by power desc
+        self.peaks = peaks if peaks is not None else []
 
     @property
     def n_components(self):
@@ -158,6 +166,45 @@ class GPFitResult:
 
         return {"freq": freq, "power": power}
 
+    def kspace_compare_allfits(self, freq_min=0.1, freq_max=10.0, n_freq=1000):
+        """
+        Compute analytic PSD for every attempted m-component model in all_fits.
+
+        Returns a list of dicts (one per fit) with keys:
+            n_components, bic, periods, freq, power
+
+        Pass the result to visualize_gp_afterfit.plot_kspace_compare_allfits
+        to overlay them all in a single figure.
+        """
+        from GP_Fit import unpack_theta  # deferred
+
+        freq  = np.linspace(freq_min, freq_max, n_freq)
+        omega = 2.0 * np.pi * freq
+
+        entries = []
+        for fit in self.all_fits:
+            m = fit["n_components"]
+            comps, _ = unpack_theta(fit["theta"], m)
+
+            power = np.zeros(n_freq)
+            for comp in comps:
+                sigma  = float(comp["sigma"])
+                omega0 = float(comp["omega"])
+                Q      = float(comp["Q"])
+                numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
+                denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
+                power += numer / denom
+
+            entries.append({
+                "n_components": m,
+                "bic": float(fit["bic"]),
+                "periods": [float(c["period"]) for c in comps],
+                "freq": freq,
+                "power": power,
+            })
+
+        return entries
+
     def to_dict(self):
         """Reconstruct the legacy dict return for backward compatibility."""
         return {
@@ -173,15 +220,46 @@ class GPFitResult:
             "gp_mean":           self.gp_mean,
             "gp_std":            self.gp_std,
             "residual":          self.residual,
+            "all_fits":          self.all_fits,
+            "all_residual_lsps": self.all_residual_lsps,
+            "peaks":             self.peaks,
         }
+
+    def __getstate__(self):
+        # Strip gp objects before pickling — theta is sufficient to rebuild them.
+        state = self.__dict__.copy()
+        def _slim(fit):
+            return {k: v for k, v in fit.items() if k != "gp"}
+        state["final_fit"] = _slim(state["final_fit"])
+        state["all_accepted_fits"] = [_slim(f) for f in state["all_accepted_fits"]]
+        state["all_fits"] = [_slim(f) for f in state["all_fits"]]
+        return state
+
+    def __setstate__(self, state):
+        from GP_Fit import build_multi_sho_gp
+        import jax.numpy as jnp
+        self.__dict__.update(state)
+        def _rebuild(fit):
+            gp = build_multi_sho_gp(
+                jnp.asarray(fit["theta"]),
+                jnp.asarray(self.x),
+                jnp.asarray(self.yerr),
+                fit["n_components"],
+            )
+            return {**fit, "gp": gp}
+        self.final_fit = _rebuild(self.final_fit)
+        self.all_accepted_fits = [_rebuild(f) for f in self.all_accepted_fits]
+        self.all_fits = [_rebuild(f) for f in self.all_fits]
 
     def __repr__(self):
         period_str = ", ".join(f"{p:.3f}" for p in self.periods)
+        n_attempted = len(self.all_fits)
+        best_bic_str = f"BIC={self.bic:.1f}"
         return (
             f"GPFitResult("
-            f"n_components={self.n_components}, "
-            f"periods=[{period_str}] days, "
-            f"BIC={self.bic:.1f}, "
-            f"loglike={self.log_likelihood:.1f}"
+            f"best={self.n_components} components [{period_str}] d, "
+            f"{best_bic_str}, "
+            f"loglike={self.log_likelihood:.1f}, "
+            f"n_attempted={n_attempted}"
             f")"
         )
