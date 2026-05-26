@@ -125,6 +125,128 @@ def compute_variability_metrics(t, f, err_f, cadence_bin_min=30.0, sigma_clip_th
 
 
 # ---------------------------------------------------------------------------
+# Gap-aware variability statistics
+# ---------------------------------------------------------------------------
+
+def von_neumann_ratio_gap_aware(time, flux, max_gap=None):
+    """
+    Gap-aware inverted von Neumann ratio.
+    Uses only adjacent pairs with dt <= max_gap (default 2.5 * median cadence).
+    Returns 1/eta so that higher values indicate more variability.
+    """
+    time = np.asarray(time)
+    flux = np.asarray(flux)
+
+    good = np.isfinite(time) & np.isfinite(flux)
+    time = time[good]
+    flux = flux[good]
+
+    if len(flux) < 3:
+        return np.nan
+
+    order = np.argsort(time)
+    time = time[order]
+    flux = flux[order]
+
+    dt = np.diff(time)
+    df = np.diff(flux)
+
+    if max_gap is None:
+        max_gap = 2.5 * np.nanmedian(dt)
+
+    use = dt <= max_gap
+
+    if np.sum(use) < 2:
+        return np.nan
+
+    var = np.nanvar(flux, ddof=1)
+
+    if var <= 0 or not np.isfinite(var):
+        return np.nan
+
+    eta = np.mean(df[use] ** 2) / var
+
+    if eta <= 0 or not np.isfinite(eta):
+        return np.nan
+
+    return 1.0 / eta
+
+
+def J_stetson_gap_aware(time, mag, mag_err, pair_threshold=None):
+    """
+    Single-band, gap-aware Stetson-J-like variability statistic.
+    
+    This follows the standard Stetson J form using normalized residual
+    products P_ij = delta_i delta_j, but adapts the pairing scheme for
+    single-band, unevenly sampled light curves. Adjacent observations are
+    paired only if their separation is <= pair_threshold; by default this is
+    2.5 times the median cadence. Each point is used in at most one pair.
+    Unpaired points contribute a downweighted self-term, P_i = delta_i^2 - 1,
+    with weight 0.25.
+    
+    This is therefore not the original multi-band Stetson J exactly, but a
+    gap-aware single-band variant.
+    """
+    time = np.asarray(time)
+    mag = np.asarray(mag)
+    mag_err = np.asarray(mag_err)
+
+    good = (
+        np.isfinite(time)
+        & np.isfinite(mag)
+        & np.isfinite(mag_err)
+        & (mag_err > 0)
+    )
+
+    time = time[good]
+    mag = mag[good]
+    mag_err = mag_err[good]
+
+    n = len(time)
+
+    if n < 3:
+        return np.nan
+
+    order = np.argsort(time)
+    time = time[order]
+    mag = mag[order]
+    mag_err = mag_err[order]
+
+    dt = np.diff(time)
+
+    if pair_threshold is None:
+        pair_threshold = 2.5 * np.nanmedian(dt)
+
+    mean_mag = np.average(mag, weights=1 / mag_err ** 2)
+    delta = np.sqrt(n / (n - 1)) * (mag - mean_mag) / mag_err
+
+    P = []
+    w = []
+    used = np.zeros(n, dtype=bool)
+
+    for i in range(n - 1):
+        if used[i] or used[i + 1]:
+            continue
+        if time[i + 1] - time[i] <= pair_threshold:
+            P.append(delta[i] * delta[i + 1])
+            w.append(1.0)
+            used[i] = True
+            used[i + 1] = True
+
+    for i in np.where(~used)[0]:
+        P.append(delta[i] ** 2 - 1.0)
+        w.append(0.25)
+
+    P = np.asarray(P)
+    w = np.asarray(w)
+
+    if len(P) == 0:
+        return np.nan
+
+    return np.sum(w * np.sign(P) * np.sqrt(np.abs(P))) / np.sum(w)
+
+
+# ---------------------------------------------------------------------------
 # Function 3 — add variability metrics to master table
 # ---------------------------------------------------------------------------
 
@@ -148,23 +270,28 @@ def add_variability_metrics(table, sigma_clip_thresh=None):
 
     New columns
     -----------
-    intrinsic_std  float64   noise-corrected standard deviation
-    intrinsic_rms  float64   noise-corrected RMS around 1
-    intrinsic_mad  float64   noise-corrected MAD (Gaussian-equivalent sigma)
-    n_bins_used    float64   number of points used after sigma-clipping
+    intrinsic_std       float64   noise-corrected standard deviation
+    intrinsic_rms       float64   noise-corrected RMS around 1
+    intrinsic_mad       float64   noise-corrected MAD (Gaussian-equivalent sigma)
+    n_bins_used         float64   number of points used after sigma-clipping
+    vn_ratio_gap_aware  float64   gap-aware inverted von Neumann ratio (1/eta)
+    stetson_j_gap_aware float64   gap-aware Stetson J statistic
     """
     n_rows = len(table)
     print(f"[add_variability_metrics] processing {n_rows} rows")
 
     idx = table.index
-    intrinsic_std_vals = pd.Series(np.nan, index=idx, dtype=float)
-    intrinsic_rms_vals = pd.Series(np.nan, index=idx, dtype=float)
-    intrinsic_mad_vals = pd.Series(np.nan, index=idx, dtype=float)
-    n_bins_vals        = pd.Series(np.nan, index=idx, dtype=float)
+    intrinsic_std_vals      = pd.Series(np.nan, index=idx, dtype=float)
+    intrinsic_rms_vals      = pd.Series(np.nan, index=idx, dtype=float)
+    intrinsic_mad_vals      = pd.Series(np.nan, index=idx, dtype=float)
+    n_bins_vals             = pd.Series(np.nan, index=idx, dtype=float)
+    vn_ratio_gap_aware_vals = pd.Series(np.nan, index=idx, dtype=float)
+    stetson_j_gap_aware_vals = pd.Series(np.nan, index=idx, dtype=float)
 
     n_ok, n_skipped, n_failed = 0, 0, 0
 
     for label, row in table.iterrows():
+        t     = row.get('LC_t')
         x     = row.get('LC_x')
         err_x = row.get('LC_err_x')
 
@@ -178,6 +305,11 @@ def add_variability_metrics(table, sigma_clip_thresh=None):
             intrinsic_rms_vals[label] = result['intrinsic_rms']
             intrinsic_mad_vals[label] = result['intrinsic_mad']
             n_bins_vals[label]        = result['n_bins']
+
+            if t is not None:
+                vn_ratio_gap_aware_vals[label]  = von_neumann_ratio_gap_aware(t, x)
+                stetson_j_gap_aware_vals[label] = J_stetson_gap_aware(t, x, err_x)
+
             n_ok += 1
 
         except Exception as e:
@@ -187,8 +319,10 @@ def add_variability_metrics(table, sigma_clip_thresh=None):
 
     print(f"[add_variability_metrics] done  |  ok={n_ok}  skipped={n_skipped}  failed={n_failed}")
 
-    table['intrinsic_std'] = intrinsic_std_vals
-    table['intrinsic_rms'] = intrinsic_rms_vals
-    table['intrinsic_mad'] = intrinsic_mad_vals
-    table['n_bins_used']   = n_bins_vals
+    table['intrinsic_std']       = intrinsic_std_vals
+    table['intrinsic_rms']       = intrinsic_rms_vals
+    table['intrinsic_mad']       = intrinsic_mad_vals
+    table['n_bins_used']         = n_bins_vals
+    table['vn_ratio_gap_aware']  = vn_ratio_gap_aware_vals
+    table['stetson_j_gap_aware'] = stetson_j_gap_aware_vals
     return table

@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import jax
 
 
 # ============================================================
@@ -121,170 +122,237 @@ def plot_gp_fit(results, table_rows=None, plot_all_ncomponent_fits=False):
 
     fig.tight_layout()
     plt.show()
+    plt.close(fig)
+
+
+def _cluster_color_map(table_rows):
+    """
+    One tab10 color per unique cluster name.  Returns None when there is only
+    one cluster (caller falls back to matplotlib's default color cycle).
+    """
+    if not table_rows:
+        return None
+    names = []
+    for row in table_rows:
+        name = row["name"] if row is not None else None
+        if isinstance(name, bytes):
+            name = name.decode()
+        names.append(name)
+    unique = list(dict.fromkeys(n for n in names if n is not None))
+    if len(unique) <= 1:
+        return None
+    palette = {n: plt.cm.tab10(i % 10) for i, n in enumerate(unique)}
+    return [palette.get(n) for n in names]
+
+
+def _analytic_psd(fit, freq_min, freq_max, n_freq):
+    """Analytic SHO kernel PSD for a single fit dict."""
+    from GP_Fit import unpack_theta
+    import jax.numpy as jnp
+    freq  = np.linspace(freq_min, freq_max, n_freq)
+    omega = 2.0 * np.pi * freq
+    comps, _ = unpack_theta(jnp.asarray(fit["theta"]), fit["n_components"])
+    power = np.zeros(n_freq)
+    for comp in comps:
+        sigma  = float(comp["sigma"])
+        omega0 = float(comp["omega"])
+        Q      = float(comp["Q"])
+        numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
+        denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
+        power += numer / denom
+    return freq, power
+
+
+def _realized_psd(fit, res, n_uniform, subtract_mean, window):
+    """FFT power spectrum of the posterior mean for a specific fit dict."""
+    import jax.numpy as jnp
+    x_uniform = np.linspace(0.0, float(res.x.max()), n_uniform)
+    cond_gp = fit["gp"].condition(jnp.asarray(res.y), jnp.asarray(x_uniform)).gp
+    gp_u = np.array(cond_gp.mean)
+    if subtract_mean:
+        gp_u -= np.nanmean(gp_u)
+    dt = x_uniform[1] - x_uniform[0]
+    fft_input = gp_u * np.hanning(n_uniform) if window else gp_u
+    pwr  = np.abs(np.fft.rfft(fft_input)) ** 2
+    freq = np.fft.rfftfreq(n_uniform, d=dt)
+    return freq[1:], pwr[1:]   # skip DC
+
+
+def _fits_to_plot(res, plot_components, base_label):
+    """
+    Return list of (fit_dict, linestyle, legend_label) for the kspace panels.
+
+    plot_components options
+    -----------------------
+    'best' : BIC-optimal model only, solid line.
+    'max'  : highest-m model only, solid line.
+    'main' : best (solid) + max (dashed), same color.  Single entry if best==max.
+    'all'  : best (solid) + every other m (dashed), same color, labeled by m.
+    """
+    best_m  = res.n_components
+    max_fit = max(res.all_fits, key=lambda f: f["n_components"])
+    max_m   = max_fit["n_components"]
+
+    # Each tuple: (fit_dict, linestyle, legend_label, color_override)
+    # color_override=None → caller uses the per-result cluster/cycle color.
+
+    if plot_components == 'best':
+        return [(res.final_fit, '-', base_label, None)]
+
+    if plot_components == 'max':
+        return [(max_fit, '-', base_label, None)]
+
+    if plot_components == 'main':
+        if best_m == max_m:
+            return [(res.final_fit, '-', base_label, None)]
+        return [
+            (res.final_fit, '-',  f"{base_label}  m={best_m} (best)", None),
+            (max_fit,       '--', f"{base_label}  m={max_m} (max)",   None),
+        ]
+
+    if plot_components == 'all':
+        fits_sorted = sorted(res.all_fits, key=lambda f: f["n_components"])
+        n = len(fits_sorted)
+        out = []
+        for idx, fit in enumerate(fits_sorted):
+            m     = fit["n_components"]
+            ls    = '-' if m == best_m else '--'
+            lbl   = f"{base_label}  m={m}" if m == best_m else f"m={m}"
+            color = plt.cm.tab10(idx % 10)
+            out.append((fit, ls, lbl, color))
+        return out
+
+    raise ValueError(
+        f"plot_components must be 'best', 'max', 'main', or 'all', got {plot_components!r}"
+    )
 
 
 def plot_kspace(results, table_rows=None, log_y=False,
                 n_uniform=4096, subtract_mean=True, window=True,
-                plot_all_ncomponent_fits=False,
-                period_lim=(0.1, 50.0)):
+                plot_components='main',
+                plot_realized_gp=False,
+                period_lim=(1/24, 10.0)):
     """
-    3-row × 2-col frequency content figure for one or more GPFitResult objects.
-
-    All results are overlaid within each panel.
+    Single-column frequency-content figure for one or more GPFitResult objects.
 
     Rows
     ----
-    0 : LSP of the real data (with white-noise threshold as a dashed line)
-    1 : kspace_realized — FFT of the GP posterior mean (data-dependent)
-    2 : kspace_true     — analytic prior PSD of the GP kernel
+    0            : LSP of the real data (white-noise threshold as dashed line)
+    1 (optional) : kspace_realized — FFT of GP posterior mean (plot_realized_gp=True)
+    1 or 2       : kspace_true — analytic prior PSD of the GP kernel
 
-    Columns
-    -------
-    0 : Frequency domain  (linear x, xlim [0.1, 10] day⁻¹)
-    1 : Period domain     (log x,    xlim [0.1, 10] days)
+    Each panel shows frequency on the bottom x-axis (log scale) and period
+    on the top x-axis (derived via 1/f).
+
+    When table_rows spans more than one unique cluster name, each cluster gets
+    a distinct tab10 color; within a cluster, linestyle distinguishes models.
 
     Parameters
     ----------
     results : GPFitResult or list of GPFitResult
     table_rows : table row or list of table rows, optional
     log_y : bool
-        If True, use log scale on all y-axes (default False = linear).
+        Log scale on all y-axes (default False).
     n_uniform : int
-        Grid points for kspace_realized (passed through).
+        Grid points for kspace_realized.
     subtract_mean, window : bool
         Passed through to kspace_realized.
-    plot_all_ncomponent_fits : bool
-        If True, overlay lower-m fits from result.all_fits as dashed same-color lines
-        on rows 1 (realized kspace) and 2 (true kspace). Row 0 is unaffected.
+    plot_components : {'best', 'max', 'main', 'all'}
+        Which component models to overlay on the kspace panels.
+        'best' — BIC-optimal model, solid (default).
+        'max'  — highest-m model, solid.
+        'main' — best (solid) + max (dashed), same color.
+        'all'  — best (solid) + every attempted m (dashed), same color.
+        The LSP panel always shows one line per result.
+    plot_realized_gp : bool
+        Include the realized (FFT of GP posterior mean) row (default False).
+    period_lim : (float, float)
+        Period range in days.
     """
-    from GP_Fit import residual_lsp_peak  # deferred to avoid circular import
+    from GP_Fit import residual_lsp_peak
 
     results, table_rows = _to_list(results, table_rows)
 
     period_min, period_max = period_lim
-    freq_lim = (1.0 / period_max, 1.0 / period_min)
-    # Scale analytic PSD samples with log-frequency span so resolution stays constant per decade
+    freq_lim    = (1.0 / period_max, 1.0 / period_min)
     n_freq_true = max(2000, int(2000 * np.log10(freq_lim[1] / freq_lim[0])))
 
-    if plot_all_ncomponent_fits:
-        max_m = max(len(res.all_fits) for res in results)
-        m_colors = {m: plt.cm.tab10(m % 10) for m in range(1, max_m + 1)}
+    color_map = _cluster_color_map(table_rows)  # None → matplotlib default cycle
 
-    row_titles = [
-        "Observed-data Lomb–Scargle periodogram",
-        "FFT power of GP posterior mean on uniform grid",
-        "Analytic PSD of fitted GP kernel",
-    ]
+    row_keys = ["lsp", "realized", "true"] if plot_realized_gp else ["lsp", "true"]
+    titles = {
+        "lsp":      "Observed-data Lomb–Scargle periodogram",
+        "realized": "FFT power of GP posterior mean on uniform grid",
+        "true":     "Analytic PSD of fitted GP kernel",
+    }
     fft_ylabel = (
         r"Hann-windowed FFT power $|\mathrm{FFT}(w\!\cdot\!\mu_{\rm GP})|^2$ [$y^2$]"
         if window else
         r"Raw FFT power $|\mathrm{FFT}(\mu_{\rm GP})|^2$ [$y^2$]"
     )
-    y_labels = [
-        "Lomb–Scargle power [dimensionless]",
-        fft_ylabel,
-        r"GP kernel PSD [$y^2\,\mathrm{day}$]",
-    ]
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12), squeeze=False)
+    ylabels = {
+        "lsp":      "Lomb–Scargle power [dimensionless]",
+        "realized": fft_ylabel,
+        "true":     r"GP kernel PSD [$y^2\,\mathrm{day}$]",
+    }
+
+    n_rows = len(row_keys)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 * n_rows), squeeze=False)
+    axes = axes[:, 0]
     fig.suptitle(r"GP Model Frequency Content  ($y$ = relative flux)", fontsize=13)
 
+    for ax in axes:
+        sec = ax.secondary_xaxis('top', functions=(lambda f: 1.0 / f, lambda p: 1.0 / p))
+        sec.set_xlabel("Period [days]")
+
     for i, res in enumerate(results):
-        label = _label(table_rows[i] if table_rows else None, i)
+        base_label   = _label(table_rows[i] if table_rows else None, i)
+        preset_color = color_map[i] if color_map is not None else None
 
-        # ── Row 0: LSP of real data ──────────────────────────────────────────
-        lsp = residual_lsp_peak(res.t, res.y, flux_err=res.yerr)
-        lsp_freq  = np.asarray(lsp["freq"])
-        lsp_power = np.asarray(lsp["power"])
-        lsp_period = 1.0 / lsp_freq
-        threshold  = res.white_noise_info["white_noise_power_threshold"]
-
-        line, = axes[0, 0].plot(lsp_freq, lsp_power, lw=0.8, alpha=0.85, label=label)
+        # ── LSP (one line per result) ─────────────────────────────────────────
+        ax_lsp    = axes[row_keys.index("lsp")]
+        lsp       = residual_lsp_peak(res.t, res.y, flux_err=res.yerr,
+                                      min_period=period_min, max_period=period_max)
+        threshold = res.white_noise_info["white_noise_power_threshold"]
+        kw = dict(lw=0.8, alpha=0.85, label=base_label)
+        if preset_color is not None:
+            kw["color"] = preset_color
+        line, = ax_lsp.plot(np.asarray(lsp["freq"]), np.asarray(lsp["power"]), **kw)
         c = line.get_color()
-        axes[0, 0].axhline(threshold, color=c, lw=1.0, ls='--', alpha=0.5)
+        ax_lsp.axhline(threshold, color=c, lw=1.0, ls='--', alpha=0.5)
 
-        sort_p = np.argsort(lsp_period)
-        axes[0, 1].plot(lsp_period[sort_p], lsp_power[sort_p],
-                        lw=0.8, alpha=0.85, color=c, label=label)
-        axes[0, 1].axhline(threshold, color=c, lw=1.0, ls='--', alpha=0.5)
+        # ── Kspace panels — iterate over fits selected by plot_components ─────
+        fits_spec = _fits_to_plot(res, plot_components, base_label)
 
-        # ── Row 1: realized kspace ───────────────────────────────────────────
-        kr = res.kspace_realized(n_uniform=n_uniform,
-                                 subtract_mean=subtract_mean, window=window)
-        kr_freq  = kr["freq"][1:]          # skip DC
-        kr_power = kr["power"][1:]
-        kr_period = 1.0 / kr_freq
+        if plot_realized_gp:
+            ax_kr = axes[row_keys.index("realized")]
+            for fit, ls, lbl, col in fits_spec:
+                freq_r, pwr_r = _realized_psd(fit, res, n_uniform, subtract_mean, window)
+                ax_kr.plot(freq_r, pwr_r, color=col if col is not None else c,
+                           ls=ls, lw=0.8, alpha=0.85, label=lbl)
 
-        axes[1, 0].plot(kr_freq, kr_power, color=c, lw=0.8, alpha=0.85, label=label)
-        sort_p = np.argsort(kr_period)
-        axes[1, 1].plot(kr_period[sort_p], kr_power[sort_p],
-                        color=c, lw=0.8, alpha=0.85, label=label)
+        ax_kt = axes[row_keys.index("true")]
+        for fit, ls, lbl, col in fits_spec:
+            freq_t, pwr_t = _analytic_psd(fit, freq_lim[0], freq_lim[1], n_freq_true)
+            ax_kt.plot(freq_t, pwr_t, color=col if col is not None else c,
+                       ls=ls, lw=0.8, alpha=0.85, label=lbl)
 
-        if plot_all_ncomponent_fits:
-            import jax.numpy as jnp
-            x_uniform = np.linspace(0.0, float(res.x.max()), n_uniform)
-            for fit in res.all_fits:
-                m = fit["n_components"]
-                if m == res.n_components:
-                    continue
-                cond_gp = fit["gp"].condition(jnp.asarray(res.y),
-                                              jnp.asarray(x_uniform)).gp
-                gp_u = np.array(cond_gp.mean)  # np.array() ensures a writable copy
-                if subtract_mean:
-                    gp_u -= np.nanmean(gp_u)
-                dt = x_uniform[1] - x_uniform[0]
-                fft_input = gp_u * np.hanning(n_uniform) if window else gp_u
-                pwr = np.abs(np.fft.rfft(fft_input)) ** 2
-                freq = np.fft.rfftfreq(n_uniform, d=dt)
-                freq, pwr = freq[1:], pwr[1:]   # skip DC
-                per = 1.0 / freq
-                sort_p2 = np.argsort(per)
-                mc = m_colors[m]
-                axes[1, 0].plot(freq, pwr, color=mc, lw=0.8, ls='--', alpha=0.7,
-                                label=f"m={m}")
-                axes[1, 1].plot(per[sort_p2], pwr[sort_p2], color=mc, lw=0.8,
-                                ls='--', alpha=0.7, label=f"m={m}")
-
-        # ── Row 2: analytic (true) kspace ────────────────────────────────────
-        kt = res.kspace_true(freq_min=freq_lim[0], freq_max=freq_lim[1], n_freq=n_freq_true)
-        kt_period = 1.0 / kt["freq"]
-
-        axes[2, 0].plot(kt["freq"], kt["power"], color=c, lw=0.8, alpha=0.85, label=label)
-        sort_p = np.argsort(kt_period)
-        axes[2, 1].plot(kt_period[sort_p], kt["power"][sort_p],
-                        color=c, lw=0.8, alpha=0.85, label=label)
-
-        if plot_all_ncomponent_fits:
-            entries = res.kspace_compare_allfits(freq_min=freq_lim[0], freq_max=freq_lim[1], n_freq=n_freq_true)
-            for entry in entries:
-                m = entry["n_components"]
-                if m == res.n_components:
-                    continue
-                mc = m_colors[m]
-                freq_e = entry["freq"]
-                pwr_e  = entry["power"]
-                per_e  = 1.0 / freq_e
-                sort_p2 = np.argsort(per_e)
-                axes[2, 0].plot(freq_e, pwr_e, color=mc, lw=0.8, ls='--', alpha=0.7,
-                                label=f"m={m}")
-                axes[2, 1].plot(per_e[sort_p2], pwr_e[sort_p2], color=mc, lw=0.8,
-                                ls='--', alpha=0.7, label=f"m={m}")
-
-    # ── Axis formatting ──────────────────────────────────────────────────────
-    for row in range(3):
-        axes[row, 0].set_xlabel("Frequency [1/day]")
-        axes[row, 1].set_xlabel("Period [days]")
-        for col in range(2):
-            ax = axes[row, col]
-            ax.set_xlim(*(freq_lim if col == 0 else period_lim))
-            ax.set_xscale("log")
-            ax.set_ylabel(y_labels[row])
-            ax.set_title(f"{row_titles[row]} — {'period' if col else 'frequency'} domain")
-            ax.legend(fontsize=8)
-            if log_y:
-                ax.set_yscale("log")
+    # ── Axis formatting ───────────────────────────────────────────────────────
+    for row_idx, key in enumerate(row_keys):
+        ax = axes[row_idx]
+        ax.set_xlim(*freq_lim)
+        ax.set_xscale("log")
+        ax.set_xlabel("Frequency [1/day]")
+        ax.set_ylabel(ylabels[key])
+        ax.set_title(titles[key])
+        ax.legend(fontsize=8)
+        if log_y:
+            ax.set_yscale("log")
 
     fig.tight_layout()
     plt.show()
+    plt.close(fig)
+    jax.clear_caches()
 
 
 def plot_summary_stats(table, cluster_name=None, stats=None, seed=None):
@@ -437,9 +505,10 @@ def plot_summary_stats(table, cluster_name=None, stats=None, seed=None):
     axes[0, 0].legend(fontsize=7, loc="best")
     fig.tight_layout()
     plt.show()
+    plt.close(fig)
 
 
-def plot_kspace_compare_allfits(result, freq_min=0.1, freq_max=10.0, log_y=False):
+def plot_kspace_compare_allfits(result, freq_min=0.1, freq_max=24.0, log_y=False):
     """
     Overlay analytic PSD for every attempted m-component model in result.all_fits.
 
@@ -498,3 +567,4 @@ def plot_kspace_compare_allfits(result, freq_min=0.1, freq_max=10.0, log_y=False
 
     fig.tight_layout()
     plt.show()
+    plt.close(fig)

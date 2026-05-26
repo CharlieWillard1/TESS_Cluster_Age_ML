@@ -1,0 +1,74 @@
+
+
+
+I am about to undertake a bit of a pipeline refactor combining a bunch of the functions in the Data_Visualization_CGW folder.
+this is a large enough refactor I want to construct all the files from scratch again into the new GenerteTable_CGW folder which is curently empty, this preserves the old code in a working state.
+
+I want to construct the data table with information on the light curves of spatial integrated stellar clusters from the bottom up with the following attributes:
+
+# Row metadata info
+name                  # cluster name from TESS_Cluster_Age_ML/data/Wainer2023_Table1_MW.txt, Wainer2023_Table2_SMC.txt,Wainer2023_Table3_LMC.txt
+age                   # cluster log10(age) from  TESS_Cluster_Age_ML/data/Wainer2023_Table1_MW.txt, Wainer2023_Table2_SMC.txt,Wainer2023_Table3_LMC.txt
+origin(MW,SMC,LMC)    # described by location of the clusters in the 3 files defined above
+
+# Linear Combo Information
+sectors               # which sectors of LC data that this row uses fro its LC/summary stats
+n_sectors             # number of sectors in the above list 
+
+# Continuos information
+LC_t, LC_flux, LC_flux_err, # As defined in extract_LC_LSP.py
+LSP_freq, LSP_power,        # As defined in extract_LC_LSP.py
+GP_freq, GP_PSD             # As calculated in GaussianProcesses folder
+
+# Summary Statistics
+std       # as calculated in invariant_summary_stats.py
+rms       # as calculated in invariant_summary_stats.py
+mad       # as calculated in invariant_summary_stats.py
+VonNuemanRatio     # as calculated in invariant_summary_stats.py
+Stetson-J          # as calculated in invariant_summary_stats.py
+GP_PSD_binned            #tuple I will unpack later of type (amplitude list, frequnecy_list), the exact # of bins will be specified in the function used to generate 
+GP_PSD_bin_ratios        #tuple I will unpack later of type (ratio_list, frequnecy_mid_list), where each point in the previous list is taken as a ratio to its neighbor going left to right.
+GP_PSD_high_low_ratio    #first half vs second half bins ratios of type (rati
+
+
+
+
+Step 1 is to write a function which will construct the 'base_table' which will replace the need for the 'master_table.fits' file as an input. to read the wainer tables and generate the name, age, origin columns. 
+
+Step 2 is to look at the LC file for each cluster and extract the total number of sectors. 
+For the 'sectors' column, this is where we duplicate each cluster into many rows, where each row is a unique linear combination of different sectors. the function in random_sector_combos should help with this. Example Call:
+
+combo_summary_dict, full_combo_list = make_distinct_sector_combinations(
+    10,
+    f_max=0.5,
+    seed=0,
+    shuffle=True,
+    include_full=True,
+)
+where each value of full_combo_list is a unique row where 'name' is the cluster name for all the corresponding rows and the 'sectors' column is full_combo_list[i] an the 'n_sectors' column is  len(full_combo_list[i]). 
+
+The one caveat is that not all LC's have the same cadence (median dt). So run make_distinct_sector_combinations on each group of sectors with the same cadence individualy. ie. no linear combo should have multiple sectors of the same value. 
+
+Parsing the LC data is nontrivial and connecting the files to the names in the table, so take a look at the extract_LC_LSP python file for how to do this. 
+
+Step 2.5 is to populate the LC_t, LC_flux, LC_flux_err columns, since you already were using the LC info in the last step you should simply write these columns at the same time. again the extract_LC_LSP python file already does this so look at it.
+
+step 2.75: the extract_LC_LSP python file aslo computes the LSP at the same time, so also populat the LSP_freq, LSP_power columns at that stage.
+
+step 3: add the summary stats columns. code already exists within the invariant_summary_stats.py file.
+
+step 4: add the GP information. (see GaussianProcess folder). 
+
+For the GP information, as it is expensive, we are going to want to have a seperate 'GP_fit_data' saved file which saves all the raw info (eg. all the GP componenets/objects if nessisary) so we dont have to run GP part again. Or just svae the output object into the table (in addition to the summary stats columns.
+
+note that currently the GP code recalcules the LSP a lot, for the new GP folder have it accept the table with the LSP info already saved to simplify things. (eg. lsp_unification_plan.md)
+
+
+step 5: a jupyter notebook which calls step 1-4.
+
+step 6: move all the visualization functions over as well, making sure I can call them with the new table. I believe it should already work in most cases. the GP visualization may not work with the table as an input currently? so may need a refactor there.
+
+
+Before starting give me the full final file structure you expect to create. I suspect the noptebook file and 3 folders with the python functions (The tablegenerator+LC/LSP/summary stat functions in one folder, the visualization code for that stuff in another, and all the GP+GP_vis code in another folder).
+
+I exc

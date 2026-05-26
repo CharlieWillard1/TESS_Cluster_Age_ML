@@ -5,30 +5,12 @@ import numpy as np
 # Internal helpers
 # ============================================================
 
-def _resolve_bins(bins, period_lim):
-    """
-    Return (freq_edges ascending, period_edges ascending) from a bins spec.
-
-    bins=None  → 3 equal log-spaced bins within period_lim
-    bins=int   → that many equal log-spaced bins within period_lim
-    bins=array → explicit period-space edges in days (sorted ascending);
-                 period_lim is ignored — the bin edges define the range.
-    """
-    period_min, period_max = period_lim
-    if bins is None:
-        period_edges = np.logspace(np.log10(period_min), np.log10(period_max), 4)
-    elif isinstance(bins, int):
-        period_edges = np.logspace(np.log10(period_min), np.log10(period_max), bins + 1)
-    else:
-        period_edges = np.sort(np.asarray(bins, dtype=float))
-
-    # Convert to frequency space (invert + reverse so freq is ascending)
-    freq_edges = np.sort(1.0 / period_edges)
-    return freq_edges, period_edges
-
-
 def _add_stats_columns(table, stats_list, prefix):
-    """Add {prefix}_{key} columns to an astropy Table or pandas DataFrame."""
+    """Add {prefix}_{key} columns to an astropy Table or pandas DataFrame.
+
+    Scalar values → one column.  List/array values → one column per element
+    named {prefix}_{key}_{i}, so the table stays RF-flat.
+    """
     if not stats_list:
         return table
 
@@ -36,12 +18,20 @@ def _add_stats_columns(table, stats_list, prefix):
     is_pandas = hasattr(table, "iloc")
 
     for key in keys:
-        col_name = f"{prefix}_{key}"
-        values = np.array([s[key] for s in stats_list])
-        if is_pandas:
-            table = table.copy()
-            table[col_name] = values
+        first = stats_list[0][key]
+        if isinstance(first, (list, np.ndarray)):
+            n = len(first)
+            for i in range(n):
+                col_name = f"{prefix}_{key}_{i}"
+                values = np.array([s[key][i] for s in stats_list])
+                if is_pandas:
+                    table = table.copy()
+                table[col_name] = values
         else:
+            col_name = f"{prefix}_{key}"
+            values = np.array([s[key] for s in stats_list])
+            if is_pandas:
+                table = table.copy()
             table[col_name] = values
 
     return table
@@ -51,231 +41,173 @@ def _add_stats_columns(table, stats_list, prefix):
 # Public: spectral stats workhorse
 # ============================================================
 
-def compute_spectral_stats(freq, power, bins=None, period_lim=(0.5, 10.0)):
+def compute_spectral_stats(freq, power, freq_lim, n_bins=10, eps=1e-20):
     """
-    Compute spectral summary statistics from a frequency-power spectrum.
+    Compute RF-ready spectral features from an integrated PSD.
 
-    All integrals use d(log10 f) so that raw-amplitude and shape statistics
-    are consistent with each other and directly comparable between spectra
-    with different frequency-axis units (e.g. LSP vs GP PSD).
+    Integrates power over linear frequency (np.trapezoid) in each of n_bins
+    log-spaced frequency bins, then log-transforms each result.
 
     Parameters
     ----------
     freq : array-like
         Frequencies in 1/day, monotonically increasing, all positive.
     power : array-like
-        Power values corresponding to freq.
-    bins : None, int, or array-like
-        Frequency band specification (in period space, days):
-        - None  : 3 equal log-spaced bins within period_lim
-        - int   : that many equal log-spaced bins within period_lim
-        - array : explicit period-space bin edges, e.g. [0.5, 1, 2, 5, 10];
-                  the analysis range is derived from the edges — period_lim ignored.
-        band_power_0 is always the lowest-frequency (longest-period) bin.
-    period_lim : (float, float)
-        Period range in days when bins is None or int; ignored when bins is an array.
+        Power spectral density at each freq.
+    freq_lim : (float, float)
+        (f_min, f_max) in 1/day.
+    n_bins : int
+        Number of log-spaced frequency bins.
+    eps : float
+        Floor added before log10 to avoid log(0).
 
     Returns
     -------
-    dict with scalar values:
-
-    Raw amplitude (depend on the absolute power scale):
-        peak_freq         : frequency of highest-power peak (1/day)
-        peak_period       : corresponding period (days)
-        peak_amplitude    : power at that peak
-        total_power       : ∫ P d(log10 f) over period_lim
-        band_power_0…_N   : ∫ P d(log10 f) per band, band_power_0 = longest periods
-
-    Normalised shape (dimensionless, comparable across LSP and GP PSD):
-        band_frac_0…_N         : band_power_j / total_power
-        spectral_centroid_logfreq : ∫ log10(f)·P d(log10 f) / total_power
-        spectral_width_logfreq    : sqrt(∫ (log10 f − centroid)²·P d(log10 f) / total_power)
-        power_entropy          : −∫ p·log(p) d(log10 f), p = P/total_power
-        peak_to_continuum      : peak_amplitude / median(power in range)
+    dict with keys:
+        bin_edges          : list of n_bins+1 log-spaced freq edges (1/day)
+        bin_centers        : list of n_bins geometric-mean bin centres (1/day)
+        log_band_powers    : list of n_bins log10(P_i + eps)
+                             P_i = ∫ S(f) df over bin i; index 0 = lowest freq
+        log_low_high_ratio : scalar log10(P_low / P_high), split at middle bin
+        log_band_ratios    : list of n_bins-1 log10(P_i / P_{i+1})
     """
     freq = np.asarray(freq, dtype=float)
     power = np.asarray(power, dtype=float)
 
-    freq_edges, _ = _resolve_bins(bins, period_lim)
-    freq_min = freq_edges[0]
-    freq_max = freq_edges[-1]
-    n_bins = len(freq_edges) - 1
+    f_min, f_max = freq_lim
+    edges = np.logspace(np.log10(f_min), np.log10(f_max), n_bins + 1)
+    centers = np.sqrt(edges[:-1] * edges[1:])  # geometric mean
 
-    mask = (freq >= freq_min) & (freq <= freq_max) & (freq > 0)
+    nan = float("nan")
+
+    mask = (freq >= f_min) & (freq <= f_max) & (freq > 0)
     freq_r = freq[mask]
     power_r = power[mask]
 
-    nan = float("nan")
-    stats = {}
-
     if len(freq_r) < 2:
-        print(f"  [NaN] freq_r has {len(freq_r)} point(s) in period_lim — "
-              f"all stats set to NaN  (freq_min={freq_min:.4f}, freq_max={freq_max:.4f})")
-        stats["peak_freq"] = nan
-        stats["peak_period"] = nan
-        stats["peak_amplitude"] = nan
-        stats["total_power"] = nan
-        for j in range(n_bins):
-            stats[f"band_power_{j}"] = nan
-            stats[f"band_frac_{j}"] = nan
-        stats["spectral_centroid_logfreq"] = nan
-        stats["spectral_width_logfreq"] = nan
-        stats["power_entropy"] = nan
-        stats["peak_to_continuum"] = nan
-        return stats
+        print(f"  [NaN] freq_r has {len(freq_r)} point(s) in freq_lim — "
+              f"all stats set to NaN  (f_min={f_min:.4f}, f_max={f_max:.4f})")
+        return {
+            "bin_edges":          list(edges),
+            "bin_centers":        list(centers),
+            "log_band_powers":    [nan] * n_bins,
+            "log_low_high_ratio": nan,
+            "log_band_ratios":    [nan] * (n_bins - 1),
+        }
 
-    nan_power = np.sum(np.isnan(power_r))
-    if nan_power:
-        print(f"  [NaN] input power array has {nan_power} NaN value(s) "
-              f"within period_lim — downstream stats may be NaN")
-
-    log_f = np.log10(freq_r)
-
-    # ── Peak ────────────────────────────────────────────────────────────────
-    peak_idx = int(np.argmax(power_r))
-    stats["peak_freq"] = float(freq_r[peak_idx])
-    stats["peak_period"] = float(1.0 / freq_r[peak_idx])
-    stats["peak_amplitude"] = float(power_r[peak_idx])
-
-    # ── Total power ∫ P d(log10 f) — raw amplitude measure ──────────────────
-    total_power = float(np.trapezoid(power_r, log_f))
-    stats["total_power"] = total_power
-    if np.isnan(total_power):
-        print(f"  [NaN] total_power is NaN — check for NaN/inf in power array")
-    elif total_power <= 0:
-        print(f"  [NaN] total_power={total_power:.4g} <= 0 — "
-              f"band_frac and shape stats will be NaN")
-
-    # ── Band powers: ∫ P d(log10 f) per band; band_frac = band / total ──────
+    # ── Per-bin integrated power: P_i = ∫ S(f) df over [f_lo, f_hi] ─────────
+    bin_powers = np.full(n_bins, nan)
     for j in range(n_bins):
-        f_lo, f_hi = freq_edges[j], freq_edges[j + 1]
+        f_lo, f_hi = edges[j], edges[j + 1]
         band_mask = (freq_r >= f_lo) & (freq_r <= f_hi)
-        n_pts = band_mask.sum()
+        n_pts = int(band_mask.sum())
         if n_pts >= 2:
-            bp = float(np.trapezoid(power_r[band_mask], log_f[band_mask]))
-            stats[f"band_power_{j}"] = bp
-            stats[f"band_frac_{j}"] = bp / total_power if total_power > 0 else nan
-            if np.isnan(bp):
-                print(f"  [NaN] band_power_{j} is NaN despite {n_pts} points "
-                      f"(f=[{f_lo:.4f}, {f_hi:.4f}]) — check for NaN in power")
+            bin_powers[j] = float(np.trapezoid(power_r[band_mask], freq_r[band_mask]))
         else:
-            print(f"  [NaN] band_power_{j} / band_frac_{j}: only {n_pts} point(s) "
-                  f"in freq band [{f_lo:.4f}, {f_hi:.4f}] 1/day "
-                  f"(periods [{1/f_hi:.2f}, {1/f_lo:.2f}] d)")
-            stats[f"band_power_{j}"] = nan
-            stats[f"band_frac_{j}"] = nan
+            print(f"  [NaN] bin {j}: {n_pts} point(s) in "
+                  f"[{f_lo:.4f}, {f_hi:.4f}] 1/day — set to NaN")
 
-    # ── Spectral moments: weighted integrals over d(log10 f) ────────────────
-    if total_power > 0:
-        centroid = float(np.trapezoid(log_f * power_r, log_f) / total_power)
-        width = float(np.sqrt(
-            np.trapezoid((log_f - centroid) ** 2 * power_r, log_f) / total_power
-        ))
-        if np.isnan(centroid):
-            print(f"  [NaN] spectral_centroid_logfreq is NaN")
-        if np.isnan(width):
-            print(f"  [NaN] spectral_width_logfreq is NaN "
-                  f"(variance integrand may be negative due to NaN power values)")
+    log_band_powers = [
+        float(np.log10(max(p, 0.0) + eps)) if np.isfinite(p) else nan
+        for p in bin_powers
+    ]
+
+    # ── Low / high ratio ─────────────────────────────────────────────────────
+    mid = n_bins // 2
+    p_low = np.nansum(bin_powers[:mid])
+    p_high = np.nansum(bin_powers[mid:])
+    if p_low > 0 and p_high > 0:
+        log_low_high_ratio = float(np.log10(p_low / p_high))
     else:
-        print(f"  [NaN] spectral_centroid_logfreq / spectral_width_logfreq: "
-              f"total_power={total_power:.4g} <= 0")
-        centroid = nan
-        width = nan
-    stats["spectral_centroid_logfreq"] = centroid
-    stats["spectral_width_logfreq"] = width
+        print(f"  [NaN] log_low_high_ratio: p_low={p_low:.3g}, p_high={p_high:.3g}")
+        log_low_high_ratio = nan
 
-    # ── Spectral entropy: −∫ p·log(p) d(log10 f), p = P/total_power ─────────
-    # p is a density (integrates to 1 over d(log f)), so this is differential entropy.
-    if total_power > 0:
-        p_density = power_r / total_power
-        integrand = np.where(p_density > 0, -p_density * np.log(p_density), 0.0)
-        stats["power_entropy"] = float(np.trapezoid(integrand, log_f))
-        if np.isnan(stats["power_entropy"]):
-            print(f"  [NaN] power_entropy is NaN — check for NaN in power array")
-    else:
-        print(f"  [NaN] power_entropy: total_power={total_power:.4g} <= 0")
-        stats["power_entropy"] = nan
+    # ── Adjacent-bin ratios: log10(P_i / P_{i+1}), i = 0 … n_bins-2 ─────────
+    log_band_ratios = []
+    for i in range(n_bins - 1):
+        p_i, p_j = bin_powers[i], bin_powers[i + 1]
+        if np.isfinite(p_i) and np.isfinite(p_j) and p_i > 0 and p_j > 0:
+            log_band_ratios.append(float(np.log10(p_i / p_j)))
+        else:
+            log_band_ratios.append(nan)
 
-    # ── Peak-to-continuum ────────────────────────────────────────────────────
-    continuum = float(np.median(power_r))
-    if continuum <= 0:
-        print(f"  [NaN] peak_to_continuum: median power={continuum:.4g} <= 0")
-    stats["peak_to_continuum"] = (
-        stats["peak_amplitude"] / continuum if continuum > 0 else nan
-    )
-
-    return stats
+    return {
+        "bin_edges":          list(edges),
+        "bin_centers":        list(centers),
+        "log_band_powers":    log_band_powers,
+        "log_low_high_ratio": log_low_high_ratio,
+        "log_band_ratios":    log_band_ratios,
+    }
 
 
 # ============================================================
 # Public: main entry point
 # ============================================================
 
-def add_gp_summary_stats(subset_table, results, bins=None, period_lim=(0.5, 10.0)):
+def add_gp_summary_stats(
+    subset_table,
+    results,
+    freq_lim=(1 / 10.0, 24.0),
+    n_bins=10,
+    include_lsp=False,
+    eps=1e-20,
+):
     """
-    Add spectral summary statistics to subset_table for each GP fit result.
+    Add GP PSD spectral band features to subset_table.
 
-    Computes stats on two spectra per row:
-      1. Data LSP (recomputed from raw light curve)
-      2. Analytic GP kernel PSD (kspace_true)
-
-    New columns are added with 'lsp_' and 'gp_kspace_' prefixes respectively.
+    Computes log-integrated-power features from the analytic GP kernel PSD
+    (kspace_true) for each result. LSP features are optionally included.
 
     Parameters
     ----------
     subset_table : astropy Table or pandas DataFrame
     results : list of GPFitResult (same order/length as subset_table rows)
-    bins : None, int, or array-like
-        Band specification passed to compute_spectral_stats.
-        None → 3 default bins. int → that many log-spaced bins.
-        array → period-space bin edges in days; period_lim is ignored.
-    period_lim : (float, float)
-        Period range in days when bins is None or int; ignored when bins is an array.
+    freq_lim : (float, float)
+        (f_min, f_max) in 1/day. Default: (0.1, 24) → 10 d down to 1 hr.
+    n_bins : int
+        Number of log-spaced frequency bins.
+    include_lsp : bool
+        If True, also compute the same features for the data LSP.
+    eps : float
+        Floor for log10 to avoid log(0).
 
     Returns
     -------
-    subset_table with new columns added.
+    subset_table with new columns added (prefix 'gp_kspace', optionally 'lsp').
     """
-    from GP_Fit import residual_lsp_peak
+    f_min, f_max = freq_lim
 
-    freq_edges, period_edges = _resolve_bins(bins, period_lim)
-    freq_min = freq_edges[0]
-    freq_max = freq_edges[-1]
-    period_min = period_edges[0]
-    period_max = period_edges[-1]
-    n_bins = len(freq_edges) - 1
-
-    lsp_stats_list = []
     gp_stats_list = []
+    lsp_stats_list = [] if include_lsp else None
 
     for res in results:
-        # ── LSP: recompute from raw data (full spectrum not stored in GPFitResult)
-        lsp = residual_lsp_peak(
-            res.t, res.y,
-            flux_err=res.yerr,
-            min_period=period_min,
-            max_period=period_max,
-        )
-        lsp_stats_list.append(
-            compute_spectral_stats(lsp["freq"], lsp["power"], bins=bins, period_lim=period_lim)
-        )
-
-        # ── Analytic GP kspace (kspace_true) ──────────────────────────────────
-        kt = res.kspace_true(freq_min=freq_min, freq_max=freq_max, n_freq=2000)
+        kt = res.kspace_true(freq_min=f_min, freq_max=f_max, n_freq=2000)
         gp_stats_list.append(
-            compute_spectral_stats(kt["freq"], kt["power"], bins=bins, period_lim=period_lim)
+            compute_spectral_stats(kt["freq"], kt["power"],
+                                   freq_lim=freq_lim, n_bins=n_bins, eps=eps)
         )
 
-    # Print bin layout once so user knows what band_power_0/1/2 correspond to
-    print(f"Spectral bands (band_power_0 = longest periods, "
-          f"period range {period_min:.2f}–{period_max:.2f} d):")
-    for j in range(n_bins):
-        p_hi = 1.0 / freq_edges[j]
-        p_lo = 1.0 / freq_edges[j + 1]
-        print(f"  band_power_{j}: {p_lo:.2f} – {p_hi:.2f} d  "
-              f"({freq_edges[j]:.3f} – {freq_edges[j+1]:.3f} 1/day)")
+        if include_lsp:
+            from GP_Fit import residual_lsp_peak
+            lsp = residual_lsp_peak(
+                res.t, res.y,
+                flux_err=res.yerr,
+                min_period=1.0 / f_max,
+                max_period=1.0 / f_min,
+            )
+            lsp_stats_list.append(
+                compute_spectral_stats(lsp["freq"], lsp["power"],
+                                       freq_lim=freq_lim, n_bins=n_bins, eps=eps)
+            )
 
-    subset_table = _add_stats_columns(subset_table, lsp_stats_list, prefix="lsp")
+    edges = np.logspace(np.log10(f_min), np.log10(f_max), n_bins + 1)
+    print("GP PSD spectral bands (log_band_powers[0] = lowest freq / longest period):")
+    for j in range(n_bins):
+        print(f"  [{j}]: {edges[j]:.4f} – {edges[j+1]:.4f} 1/day  "
+              f"({1/edges[j+1]:.2f} – {1/edges[j]:.2f} d)")
+
     subset_table = _add_stats_columns(subset_table, gp_stats_list, prefix="gp_kspace")
+    if include_lsp and lsp_stats_list:
+        subset_table = _add_stats_columns(subset_table, lsp_stats_list, prefix="lsp")
 
     return subset_table

@@ -124,7 +124,7 @@ class GPFitResult:
             "gp_uniform": gp_uniform,
         }
 
-    def kspace_true(self, freq_min=0.1, freq_max=10.0, n_freq=1000):
+    def kspace_true(self, freq_min, freq_max, n_freq=1000):
         """
         Analytic prior power spectral density of the fitted GP kernel.
 
@@ -139,7 +139,7 @@ class GPFitResult:
         Parameters
         ----------
         freq_min, freq_max : float
-            Frequency range in 1/day (default 0.1–10).
+            Frequency range in 1/day (default 0.1–24, i.e. 10–1/24 days).
         n_freq : int
             Number of frequency grid points (default 1000).
 
@@ -166,7 +166,7 @@ class GPFitResult:
 
         return {"freq": freq, "power": power}
 
-    def kspace_compare_allfits(self, freq_min=0.1, freq_max=10.0, n_freq=1000):
+    def kspace_compare_allfits(self, freq_min, freq_max, n_freq=1000):
         """
         Compute analytic PSD for every attempted m-component model in all_fits.
 

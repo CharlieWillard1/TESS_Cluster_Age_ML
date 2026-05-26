@@ -122,7 +122,7 @@ def make_initial_theta(period_guesses, y, yerr, init_Q=2.0):
     return np.array(pieces, dtype=float)
 
 
-def make_bounds(n_components, min_period=0.05, max_period=50.0, Q_min=0.51, Q_max=100.0):
+def make_bounds(n_components, min_period, max_period, Q_min=0.51, Q_max=100.0):
     bounds = []
 
     for _ in range(n_components):
@@ -199,8 +199,8 @@ def fit_multi_sho_gp(
     y,
     yerr,
     period_guesses,
-    min_period=0.05,
-    max_period=50.0,
+    min_period,
+    max_period,
     Q_min=0.51,
     Q_max=100.0,
     init_Q=10.0,
@@ -292,9 +292,10 @@ def compute_gp_residuals(fit, x, y):
 def residual_lsp_peak(
     t,
     residual,
+    *,
     flux_err=None,
-    min_period=0.05,
-    max_period=50.0,
+    min_period,
+    max_period,
     samples_per_peak=10,
 ):
     min_freq = 1.0 / max_period
@@ -339,8 +340,8 @@ def residual_lsp_peak(
 def estimate_lsp_white_noise_level(
     t,
     flux_err,
-    min_period=0.05,
-    max_period=50.0,
+    min_period,
+    max_period,
     samples_per_peak=10,
     n_boot=200,
     percentile=99.0,
@@ -556,8 +557,8 @@ def iterative_sho_gp_fit(
     norm_flux,
     flux_err,
     max_components=6,
-    min_period=0.05,
-    max_period=50.0,
+    min_period=1/24,
+    max_period=10.0,
     samples_per_peak=10,
     Q_min=0.51,
     Q_max=100.0,
@@ -643,7 +644,7 @@ def iterative_sho_gp_fit(
         for i, p in enumerate(all_peaks[:n]):
             print(f"  Peak {i+1}: period={p['period']:.3f} d, power={p['power']:.4f}")
 
-    if verbose >= 2:
+    if verbose >= 1:
         from visualize_gp_duringfit import plot_initial_lsp
         plot_initial_lsp(
             initial_lsp["freq"],
@@ -731,6 +732,7 @@ def iterative_sho_gp_fit(
                 break
 
         prev_bic = fit["bic"]
+        jax.clear_caches()
 
     # Select best-BIC model
     bics = [f["bic"] for f in fits]

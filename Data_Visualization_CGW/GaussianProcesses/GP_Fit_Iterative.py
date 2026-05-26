@@ -119,7 +119,7 @@ def make_initial_theta(period_guesses, y, yerr, init_Q=2.0):
     return np.array(pieces, dtype=float)
 
 
-def make_bounds(n_components, min_period=0.05, max_period=50.0):
+def make_bounds(n_components, min_period, max_period):
     bounds = []
 
     for _ in range(n_components):
@@ -139,8 +139,8 @@ def fit_multi_sho_gp(
     y,
     yerr,
     period_guesses,
-    min_period=0.05,
-    max_period=50.0,
+    min_period,
+    max_period,
     init_Q=2.0,
 ):
     n_components = len(period_guesses)
@@ -211,9 +211,10 @@ def compute_gp_residuals(fit, x, y):
 def residual_lsp_peak(
     t,
     residual,
+    *,
     flux_err=None,
-    min_period=0.05,
-    max_period=50.0,
+    min_period,
+    max_period,
     samples_per_peak=10,
 ):
     min_freq = 1.0 / max_period
@@ -258,8 +259,8 @@ def residual_lsp_peak(
 def estimate_lsp_white_noise_level(
     t,
     flux_err,
-    min_period=0.05,
-    max_period=50.0,
+    min_period,
+    max_period,
     samples_per_peak=10,
     n_boot=200,
     percentile=99.0,
@@ -354,8 +355,8 @@ def iterative_sho_gp_fit(
     norm_flux,
     flux_err,
     max_components=3,
-    min_period=0.05,
-    max_period=50.0,
+    min_period=1/24,
+    max_period=10.0,
     samples_per_peak=10,
     fap_threshold=0.01,
     bic_improvement_threshold=10.0,
