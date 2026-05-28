@@ -71,4 +71,4 @@ step 6: move all the visualization functions over as well, making sure I can cal
 
 Before starting give me the full final file structure you expect to create. I suspect the noptebook file and 3 folders with the python functions (The tablegenerator+LC/LSP/summary stat functions in one folder, the visualization code for that stuff in another, and all the GP+GP_vis code in another folder).
 
-I exc
+I excpect you way need to make multiple seperate plans for this. recall no wrties to the Data_Visualization_CGW folder, only write to the GenerateTable_CGW folder. you may save time/tokens by just copying some files over instead of re-writing them from scratch, so do that when able.
