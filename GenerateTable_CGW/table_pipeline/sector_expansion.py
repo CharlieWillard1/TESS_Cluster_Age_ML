@@ -38,7 +38,7 @@ def _get_sector_cadences(hdul):
 
 def _process_one_cluster_row(name, age, origin, lc_dir, f_max, seed, shuffle,
                               include_full, cadence_bin_min, P_min, P_max, alpha,
-                              n_wn_boot, wn_percentile):
+                              n_wn_boot, wn_percentile, nsigma):
     """
     Process a single cluster row: open FITS, generate sector combos, compute
     LC + LSP + noise thresholds for each combo.
@@ -87,6 +87,7 @@ def _process_one_cluster_row(name, age, origin, lc_dir, f_max, seed, shuffle,
                             cadence_bin_min=cadence_bin_min,
                             P_min=P_min, P_max=P_max, alpha=alpha,
                             n_wn_boot=n_wn_boot, wn_percentile=wn_percentile,
+                            nsigma=nsigma,
                         )
                     rows.append({
                         'name':                   name,
@@ -102,7 +103,10 @@ def _process_one_cluster_row(name, age, origin, lc_dir, f_max, seed, shuffle,
                         'LSP_power':              lsp_dict['power'],
                         'LSP_FAP':                lsp_dict['fap_threshold'],
                         'LSP_WN_threshold':       wn_threshold,
-                        'LSP_red_noise_params':   red_noise_params,
+                        'rn_log10_N':             red_noise_params[0],
+                        'rn_alpha':               red_noise_params[1],
+                        'rn_P_empirical':         red_noise_params[2],
+                        'rn_P_theoretical':       red_noise_params[3],
                     })
                     n_ok += 1
                 except Exception as e:
@@ -128,7 +132,8 @@ def _process_one_cluster_row(name, age, origin, lc_dir, f_max, seed, shuffle,
 def expand_table(base_table, lc_dir=LC_BASE,
                  f_max=0.5, seed=0, shuffle=True, include_full=True,
                  cadence_bin_min=30.0, P_min=0.1, P_max=10.0, alpha=5,
-                 n_wn_boot=200, wn_percentile=99.0, n_workers=1):
+                 n_wn_boot=200, wn_percentile=99.0, n_workers=1,
+                 nsigma=None):
     """
     Expand a base cluster table into one row per distinct sector combination,
     computing the LC and LSP for each row in a single FITS-file pass.
@@ -167,13 +172,17 @@ def expand_table(base_table, lc_dir=LC_BASE,
         Percentile for WN thresholds. Default 99.0.
     n_workers : int
         Number of parallel worker processes. 1 = sequential (default).
+    nsigma : float or None
+        If given, apply MAD-based sigma clipping to each sector LC individually
+        after resampling and before stitching.  Typical value: 5.0.
+        None (default) disables clipping.
 
     Returns
     -------
     pd.DataFrame
         Columns: name, age, origin, sectors, n_sectors, cadence,
         LC_t, LC_flux, LC_flux_err, LSP_freq, LSP_power, LSP_FAP,
-        LSP_WN_threshold, LSP_red_noise_params.
+        LSP_WN_threshold, rn_log10_N, rn_alpha, rn_P_empirical, rn_P_theoretical.
     """
     n_clusters = len(base_table)
     print(f"[expand_table] {n_clusters} clusters  |  n_workers={n_workers}")
@@ -183,6 +192,7 @@ def expand_table(base_table, lc_dir=LC_BASE,
         include_full=include_full, cadence_bin_min=cadence_bin_min,
         P_min=P_min, P_max=P_max, alpha=alpha,
         n_wn_boot=n_wn_boot, wn_percentile=wn_percentile,
+        nsigma=nsigma,
     )
 
     rows = []
@@ -220,7 +230,7 @@ def expand_table(base_table, lc_dir=LC_BASE,
         return pd.DataFrame(columns=[
             'name', 'age', 'origin', 'sectors', 'n_sectors', 'cadence',
             'LC_t', 'LC_flux', 'LC_flux_err', 'LSP_freq', 'LSP_power', 'LSP_FAP',
-            'LSP_WN_threshold', 'LSP_red_noise_params',
+            'LSP_WN_threshold', 'rn_log10_N', 'rn_alpha', 'rn_P_empirical', 'rn_P_theoretical',
         ])
 
     return pd.DataFrame(rows)

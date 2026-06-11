@@ -61,6 +61,54 @@ def get_lc_path(name, origin, lc_dir=LC_BASE):
 # LC preprocessing
 # ---------------------------------------------------------------------------
 
+def mad_clip_lc(time, flux, flux_err=None, nsigma=5.0):
+    """
+    Return a boolean mask that removes outliers using MAD-based sigma clipping.
+
+    Computes the median and median absolute deviation of the finite flux values,
+    converts MAD to a robust sigma estimate (sigma_mad = 1.4826 * MAD), then
+    keeps points within nsigma of the median.  When flux_err is provided the
+    effective threshold is widened by the per-point uncertainty in quadrature:
+    sigma_eff = sqrt(sigma_mad^2 + flux_err^2).
+
+    Parameters
+    ----------
+    time : array-like
+    flux : array-like
+    flux_err : array-like or None
+    nsigma : float
+        Clipping threshold in units of sigma_mad.  Default 5.0.
+
+    Returns
+    -------
+    mask : ndarray of bool
+        True where the point should be kept.  Same length as input arrays.
+    """
+    time     = np.asarray(time)
+    flux     = np.asarray(flux)
+    mask     = np.isfinite(time) & np.isfinite(flux)
+    if flux_err is not None:
+        flux_err = np.asarray(flux_err)
+        mask    &= np.isfinite(flux_err) & (flux_err > 0)
+
+    f         = flux[mask]
+    med       = np.nanmedian(f)
+    mad       = np.nanmedian(np.abs(f - med))
+    sigma_mad = 1.4826 * mad
+
+    if not np.isfinite(sigma_mad) or sigma_mad == 0:
+        return mask
+
+    if flux_err is None:
+        keep = np.abs(f - med) < nsigma * sigma_mad
+    else:
+        sigma_eff = np.sqrt(sigma_mad**2 + flux_err[mask]**2)
+        keep      = np.abs(f - med) < nsigma * sigma_eff
+
+    new_mask = mask.copy()
+    new_mask[np.where(mask)[0]] = keep
+    return new_mask
+
 def resample_lc(t, f, err_f, cadence_bin_min=30.0):
     """
     Downsample a raw lightcurve to a common cadence by block-averaging
@@ -457,7 +505,8 @@ def _fit_red_noise_vaughan(freqs, power, P_N):
 
 def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
                               P_min=0.1, P_max=10.0, alpha=5,
-                              n_wn_boot=200, wn_percentile=99.0):
+                              n_wn_boot=200, wn_percentile=99.0,
+                              nsigma=None):
     """
     Load, resample, normalize, concatenate, compute LSP, and compute the
     white-noise bootstrap threshold for a list of sector HDUs.
@@ -477,6 +526,10 @@ def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
     wn_percentile : float
         Percentile of the bootstrap max-power distribution used as the
         significance threshold. Default 99.0.
+    nsigma : float or None
+        If given, apply MAD-based sigma clipping to each sector individually
+        after resampling and before normalization.  Typical value: 5.0.
+        None (default) disables clipping.
 
     Returns
     -------
@@ -515,6 +568,12 @@ def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
             continue
 
         time, flux, ferr = resample_lc(time, flux, ferr, cadence_bin_min)
+
+        if nsigma is not None:
+            clip_mask = mad_clip_lc(time, flux, flux_err=ferr, nsigma=nsigma)
+            time, flux, ferr = time[clip_mask], flux[clip_mask], ferr[clip_mask]
+            if len(time) < 2:
+                continue
 
         try:
             t_s, x_s, err_s = normalize_flux(time, flux, ferr)

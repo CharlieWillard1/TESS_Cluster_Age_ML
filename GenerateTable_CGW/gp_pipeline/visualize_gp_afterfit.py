@@ -1,3 +1,6 @@
+import os
+from collections import defaultdict
+
 import numpy as np
 import matplotlib.pyplot as plt
 import jax
@@ -53,6 +56,33 @@ def _label(table_row, idx):
         name = name.decode()
     sectors = table_row["sectors"]
     return f"{name} | sectors={list(sectors)}"
+
+
+# ============================================================
+# Save helpers
+# ============================================================
+
+def _prepare_save_dir(save_path):
+    """Create save_path dir, renaming any existing folder to <name>_OLD1 (incrementing)."""
+    path = os.path.abspath(save_path)
+    if os.path.exists(path):
+        i = 1
+        old_path = f"{path}_OLD{i}"
+        while os.path.exists(old_path):
+            i += 1
+            old_path = f"{path}_OLD{i}"
+        os.rename(path, old_path)
+        print(f"[plot_noise_gp] renamed '{path}' → '{old_path}'")
+    os.makedirs(path)
+    return path
+
+
+def _save_cluster_fig(fig, save_dir, cluster_name):
+    """Save fig to save_dir/fig_<cluster_name>.png (spaces/slashes → underscores)."""
+    safe = cluster_name.replace(' ', '_').replace('/', '_')
+    fpath = os.path.join(save_dir, f"fig_{safe}.png")
+    fig.savefig(fpath, dpi=150, bbox_inches='tight')
+    print(f"[plot_noise_gp] saved → {fpath}")
 
 
 # ============================================================
@@ -521,119 +551,178 @@ def plot_summary_stats(table, cluster_name=None, stats=None, seed=None):
     plt.close(fig)
 
 
-def plot_noise_gp(data, period_lim=(1/24, 10.0)):
+def plot_noise_gp(data, period_lim=(1/24, 10.0), save_path=None):
     """
-    Four-panel diagnostic for one or more post-GP-fit table rows.
+    Four-panel diagnostic for post-GP-fit table rows, one figure per cluster.
 
-    One figure per row is produced.
+    All rows sharing a cluster name are grouped into a single N×4 figure
+    (N = number of rows for that cluster).
 
-    Panel 1 : LC with errorbars.
-    Panel 2 : GP fit on LC — data + GP mean ± 1σ (first 27 days).
-    Panel 3 : LSP with all noise thresholds, log x-scale.
-    Panel 4 : Analytic GP kernel PSD from pre-computed GP_freq / GP_PSD columns.
+    Panel 1 : GP fit on LC — data + GP mean ± 1σ (first 27 days).
+    Panel 2 : LSP with all noise thresholds, log x-scale.
+    Panel 3 : Analytic GP kernel PSD from pre-computed GP_freq / GP_PSD columns.
+    Panel 4 : Table of fitted SHO component parameters (period, Q, σ) + jitter.
+              Capped at 8 components; a '...' row is added if the model has more.
 
     Parameters
     ----------
     data : pandas Series or DataFrame
         Single row or DataFrame; rows where gp_result is None are skipped.
     period_lim : (float, float)
-        Period range in days for panel 4.  Default (1/24, 10).
+        Period range in days for panel 3.  Default (1/24, 10).
+    save_path : str or None
+        Directory to save figures. Each cluster saved as fig_<name>.png.
+        If the directory already exists it is renamed to <dir>_OLD1 and a
+        fresh directory is created.  If None, figures are not saved.
     """
     results, rows = _rows_to_results(data)
 
     freq_min = 1.0 / period_lim[1]
     freq_max = 1.0 / period_lim[0]
 
+    save_dir = _prepare_save_dir(save_path) if save_path is not None else None
+
+    # Group (result, row) pairs by cluster name, preserving insertion order
+    clusters = defaultdict(list)
     for res, row in zip(results, rows):
-        name    = row["name"].decode() if isinstance(row["name"], bytes) else row["name"]
-        sectors = list(row["sectors"])
+        name = row["name"].decode() if isinstance(row["name"], bytes) else row["name"]
+        clusters[name].append((res, row))
 
-        fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(26, 4))
+    for cluster_name, cluster_rows in clusters.items():
+        n = len(cluster_rows)
+        fig, axes = plt.subplots(n, 4, figsize=(26, 4 * n), squeeze=False)
 
-        # ------------------------------------------------------------------
-        # Panel 1 — LC
-        # ------------------------------------------------------------------
-        ax1.errorbar(row['LC_t'], row['LC_flux'], row['LC_flux_err'],
-                     lw=0.3, ecolor='lightcoral')
-        ax1.set(xlabel='time (days)', ylabel='normalized flux',
-                title=f"{name} — LC")
+        for row_idx, (res, row) in enumerate(cluster_rows):
+            ax_lc, ax_lsp, ax_psd, ax_tab = axes[row_idx]
+            sectors = list(row["sectors"])
 
-        # ------------------------------------------------------------------
-        # Panel 2 — GP fit on LC
-        # ------------------------------------------------------------------
-        ax2.errorbar(res.t, res.y, yerr=res.yerr,
-                     fmt='.', color='black', alpha=0.3, ms=3, elinewidth=0.5,
-                     label='Data')
-        ax2.plot(res.t, res.gp_mean, color='red', lw=1.5, label='GP mean')
-        ax2.fill_between(res.t,
-                         res.gp_mean - res.gp_std,
-                         res.gp_mean + res.gp_std,
-                         alpha=0.3, color='blue', label='GP ±1σ')
-        ax2.set_xlim(res.t.min(), res.t.min() + 27)
-        ax2.set(xlabel='time (days)', ylabel='relative flux',
-                title=f"{name} — GP fit  |  sectors={sectors}")
-        ax2.legend(fontsize=7)
+            # ------------------------------------------------------------------
+            # Panel 1 — GP fit on LC
+            # ------------------------------------------------------------------
+            ax_lc.errorbar(res.t, res.y, yerr=res.yerr,
+                           fmt='.', color='black', alpha=0.3, ms=3, elinewidth=0.5,
+                           label='Data')
+            ax_lc.plot(res.t, res.gp_mean, color='red', lw=1.5, label='GP mean')
+            ax_lc.fill_between(res.t,
+                               res.gp_mean - res.gp_std,
+                               res.gp_mean + res.gp_std,
+                               alpha=0.3, color='blue', label='GP ±1σ')
+            ax_lc.set_xlim(res.t.min(), res.t.min() + 27)
+            ax_lc.set(xlabel='time (days)', ylabel='relative flux',
+                      title=f"GP fit  |  sectors={sectors}")
+            ax_lc.legend(fontsize=7)
 
-        # ------------------------------------------------------------------
-        # Panel 3 — LSP + noise thresholds (log x-scale)
-        # ------------------------------------------------------------------
-        freq  = np.asarray(row['LSP_freq'])
-        power = np.asarray(row['LSP_power'])
-        ax3.plot(freq, power, lw=0.8, color='steelblue', zorder=2)
+            # ------------------------------------------------------------------
+            # Panel 2 — LSP + noise thresholds (log x-scale)
+            # ------------------------------------------------------------------
+            freq  = np.asarray(row['LSP_freq'])
+            power = np.asarray(row['LSP_power'])
+            ax_lsp.plot(freq, power, lw=0.8, color='steelblue', zorder=2)
 
-        ax3.axhline(row['LSP_FAP'], color='red', ls='--', lw=1,
-                    label='1% FAP (bootstrap)')
-        ax3.axhline(row['LSP_WN_threshold'], color='darkorange', ls='--', lw=1,
-                    label='WN threshold (99th pct)')
+            ax_lsp.axhline(row['LSP_FAP'], color='red', ls='--', lw=1,
+                           label='1% FAP (bootstrap)')
+            ax_lsp.axhline(row['LSP_WN_threshold'], color='darkorange', ls='--', lw=1,
+                           label='WN threshold (99th pct)')
 
-        log10_N, alpha_rn, P_N_empirical, P_N_theoretical = row['LSP_red_noise_params']
-        P_model   = 10**log10_N * freq**(-alpha_rn)
-        n_freq    = len(freq)
-        gamma     = -np.log(1 - 0.99**(1/n_freq))
-        threshold = P_model * gamma
+            log10_N, alpha_rn = row['rn_log10_N'], row['rn_alpha']
+            P_N_empirical, P_N_theoretical = row['rn_P_empirical'], row['rn_P_theoretical']
+            P_model   = 10**log10_N * freq**(-alpha_rn)
+            n_freq    = len(freq)
+            gamma     = -np.log(1 - 0.99**(1/n_freq))
+            threshold = P_model * gamma
 
-        ax3.plot(freq, P_model, color='firebrick', lw=1, ls='-.',
-                 label=f'Red-noise continuum (α={alpha_rn:.2f})', zorder=3)
-        ax3.plot(freq, threshold, color='darkred', lw=1.2, ls='-',
-                 label='Red-noise threshold (FAP=1%)', zorder=3)
-        ax3.axhline(P_N_empirical, color='black', ls='--', lw=1,
-                    label=f'P_N empirical ({P_N_empirical:.3f})')
-        ax3.axhline(P_N_theoretical, color='black', ls=':', lw=1,
-                    label=f'P_N theoretical ({P_N_theoretical:.1f})')
+            ax_lsp.plot(freq, P_model, color='firebrick', lw=1, ls='-.',
+                        label=f'Red-noise continuum (α={alpha_rn:.2f})', zorder=3)
+            ax_lsp.plot(freq, threshold, color='darkred', lw=1.2, ls='-',
+                        label='Red-noise threshold (FAP=1%)', zorder=3)
+            ax_lsp.axhline(P_N_empirical, color='black', ls='--', lw=1,
+                           label=f'P_N empirical ({P_N_empirical:.3f})')
+            ax_lsp.axhline(P_N_theoretical, color='black', ls=':', lw=1,
+                           label=f'P_N theoretical ({P_N_theoretical:.1f})')
 
-        ax3.set(xlabel='frequency (1/day)', ylabel='LSP power',
-                xscale='log', yscale='log',
-                title=f"{name} — LSP  |  sectors={sectors}")
-        ax3.legend(fontsize=7)
+            ax_lsp.set(xlabel='frequency (1/day)', ylabel='LSP power',
+                       xscale='log', yscale='log',
+                       title=f"LSP  |  sectors={sectors}")
+            ax_lsp.legend(fontsize=7)
 
-        # ------------------------------------------------------------------
-        # Panel 4 — GP analytic PSD
-        # ------------------------------------------------------------------
-        gp_freq = row.get('GP_freq')
-        gp_psd  = row.get('GP_PSD')
+            # ------------------------------------------------------------------
+            # Panel 3 — GP analytic PSD
+            # ------------------------------------------------------------------
+            gp_freq = row.get('GP_freq')
+            gp_psd  = row.get('GP_PSD')
 
-        if gp_freq is None:
-            ax4.text(0.5, 0.5, 'No GP PSD', ha='center', va='center',
-                     transform=ax4.transAxes, fontsize=12)
-            ax4.set_title(f"{name} — GP PSD")
-        else:
-            gp_freq = np.asarray(gp_freq)
-            gp_psd  = np.asarray(gp_psd)
-            mask    = (gp_freq >= freq_min) & (gp_freq <= freq_max)
-            ax4.plot(gp_freq[mask], gp_psd[mask], lw=1.2, color='mediumseagreen')
+            if gp_freq is None:
+                ax_psd.text(0.5, 0.5, 'No GP PSD', ha='center', va='center',
+                            transform=ax_psd.transAxes, fontsize=12)
+                ax_psd.set_title(f"GP PSD  |  sectors={sectors}")
+            else:
+                gp_freq = np.asarray(gp_freq)
+                gp_psd  = np.asarray(gp_psd)
+                mask    = (gp_freq >= freq_min) & (gp_freq <= freq_max)
+                ax_psd.plot(gp_freq[mask], gp_psd[mask], lw=1.2, color='mediumseagreen',
+                            label='GP PSD')
 
-            periods    = row.get('gp_periods') or []
-            n_comp     = int(row['gp_n_components']) if np.isfinite(row['gp_n_components']) else '?'
-            period_str = ', '.join(f'{p:.2f}d' for p in periods)
-            ax4.set_title(f"{name} — GP PSD  |  m={n_comp}  P=[{period_str}]")
+                bin_centers = row.get('gp_kspace_bin_centers')
+                log_powers  = row.get('gp_kspace_log_band_powers')
+                if bin_centers is not None and log_powers is not None:
+                    bc = np.asarray(bin_centers)
+                    lp = np.asarray(log_powers)
+                    ax_psd.scatter(bc, 10**lp / bc, s=30, color='orange', zorder=5,
+                                   label='Binned GP power / freq')
+                ax_psd.legend(fontsize=7)
 
-        sec4 = ax4.secondary_xaxis('top',
-                                   functions=(lambda f: 1.0/f, lambda p: 1.0/p))
-        sec4.set_xlabel('Period [days]')
-        ax4.set(xlabel='frequency (1/day)', ylabel=r'GP PSD [$y^2\,\mathrm{day}$]',
-                xscale='log', yscale='log', xlim=(freq_min, freq_max))
+                seed_periods = row.get('gp_initial_lsp_peak_periods') or []
+                n_comp       = int(row['gp_n_components']) if np.isfinite(row['gp_n_components']) else '?'
+                period_str   = ', '.join(f'{p:.2f}d' for p in seed_periods)
+                ax_psd.set_title(f"GP PSD  |  m={n_comp}  seed P=[{period_str}]  sectors={sectors}")
 
+            sec = ax_psd.secondary_xaxis('top',
+                                         functions=(lambda f: 1.0/f, lambda p: 1.0/p))
+            sec.set_xlabel('Period [days]')
+            ax_psd.set(xlabel='frequency (1/day)', ylabel=r'GP PSD [$y^2\,\mathrm{day}$]',
+                       xscale='log', yscale='log', xlim=(freq_min, freq_max))
+
+            # ------------------------------------------------------------------
+            # Panel 4 — GP component parameter table
+            # ------------------------------------------------------------------
+            _N_MAX = 8
+            ax_tab.axis('off')
+            m      = res.n_components
+            n_show = min(m, _N_MAX)
+            truncated = m > _N_MAX
+
+            cell_data = []
+            for i in range(1, n_show + 1):
+                c = res.component(i)
+                cell_data.append([
+                    str(i),
+                    f"{c['period_days']:.3f}",
+                    f"{c['Q']:.2f}",
+                    f"{c['sigma']:.1e}",
+                ])
+            if truncated:
+                cell_data.append(['...', '...', '...', '...'])
+            cell_data.append(['jitter', '—', '—', f"{res.features['sho_jitter']:.1e}"])
+
+            tbl = ax_tab.table(
+                cellText=cell_data,
+                colLabels=['#', 'Period (d)', 'Q', 'σ'],
+                loc='upper center',
+                cellLoc='center',
+            )
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8)
+            tbl.scale(1, 1.3)
+
+            tab_title = f"GP components  (m={m})"
+            if truncated:
+                tab_title += f"\n(top {n_show} of {m} shown)"
+            ax_tab.set_title(tab_title, fontsize=8, pad=4)
+
+        fig.suptitle(cluster_name, fontsize=13, y=1.01)
         fig.tight_layout()
+        if save_dir is not None:
+            _save_cluster_fig(fig, save_dir, cluster_name)
         plt.show()
         plt.close(fig)
 

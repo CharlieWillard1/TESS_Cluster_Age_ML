@@ -99,7 +99,7 @@ def neg_log_likelihood(theta, x, y, yerr, n_components):
 # 3. Fit GP
 # ============================================================
 
-def make_initial_theta(period_guesses, y, yerr, init_Q=2.0):
+def make_initial_theta(period_guesses, y, yerr, init_Q=5.0):
     n_components = len(period_guesses)
 
     y_std = np.nanstd(y)
@@ -107,8 +107,11 @@ def make_initial_theta(period_guesses, y, yerr, init_Q=2.0):
 
     pieces = []
 
-    # split variance roughly across components
-    init_sigma = max(y_std / np.sqrt(max(n_components, 1)), 1e-8)
+    # Conservative amplitude initialization for low-SNR peaks.
+    # Total GP RMS is roughly amp_frac * y_std, split across components.
+    amp_frac = 0.3 #was originaly 1 which was high?
+    init_sigma = amp_frac * y_std / np.sqrt(max(n_components, 1))
+    init_sigma = max(init_sigma, 1e-8)
 
     for p in period_guesses:
         pieces.extend([

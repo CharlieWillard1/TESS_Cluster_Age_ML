@@ -19,20 +19,14 @@ def _add_stats_columns(table, stats_list, prefix):
 
     for key in keys:
         first = stats_list[0][key]
+        col_name = f"{prefix}_{key}"
         if isinstance(first, (list, np.ndarray)):
-            n = len(first)
-            for i in range(n):
-                col_name = f"{prefix}_{key}_{i}"
-                values = np.array([s[key][i] for s in stats_list])
-                if is_pandas:
-                    table = table.copy()
-                table[col_name] = values
+            values = [np.array(s[key], dtype=np.float64) for s in stats_list]
         else:
-            col_name = f"{prefix}_{key}"
             values = np.array([s[key] for s in stats_list])
-            if is_pandas:
-                table = table.copy()
-            table[col_name] = values
+        if is_pandas:
+            table = table.copy()
+        table[col_name] = values
 
     return table
 

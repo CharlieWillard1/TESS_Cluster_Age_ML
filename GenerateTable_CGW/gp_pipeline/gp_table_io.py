@@ -59,11 +59,16 @@ def add_gp_fits(
     GP_PSD_binned          object     (log_band_powers, bin_centers) tuple
     GP_PSD_bin_ratios      object     (log_band_ratios, bin_midpoints) tuple
     GP_PSD_high_low_ratio  float64    scalar log10 ratio
-    gp_n_components        float64    best-model SHO count (NaN on failure)
-    gp_bic                 float64    best-model BIC
-    gp_log_likelihood      float64    best-model log-likelihood
-    gp_periods             object     list of fitted periods in days
-    gp_kspace_*            float64    flat spectral columns for plot_summary_stats
+    gp_n_components              float64    best-model SHO count (NaN on failure)
+    gp_bic                       float64    best-model BIC
+    gp_log_likelihood            float64    best-model log-likelihood
+    gp_jitter                    float64    fitted white-noise jitter term
+    gp_periods                   object     list of fitted periods in days (length m)
+    gp_sho_sigmas                object     list of fitted sigma per component (length m)
+    gp_sho_omegas                object     list of fitted omega per component (length m)
+    gp_sho_Qs                    object     list of fitted Q per component (length m)
+    gp_initial_lsp_peak_periods  object     LSP seed periods used to initialise fit
+    gp_kspace_*                  float64    flat spectral columns for plot_summary_stats
     """
     min_period = 1.0 / freq_lim[1]
     max_period = 1.0 / freq_lim[0]
@@ -76,6 +81,7 @@ def add_gp_fits(
     gp_bic_vals       = pd.Series(np.nan, index=idx, dtype=float)
     gp_loglike_vals   = pd.Series(np.nan, index=idx, dtype=float)
     gp_hl_ratio_vals  = pd.Series(np.nan, index=idx, dtype=float)
+    gp_jitter_vals    = pd.Series(np.nan, index=idx, dtype=float)
 
     # Object columns
     gp_result_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
@@ -84,6 +90,10 @@ def add_gp_fits(
     gp_psd_binned     = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_psd_ratios     = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_periods_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_sigmas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_omegas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_Qs_vals     = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_init_lsp_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
 
     # For add_gp_summary_stats we need aligned lists
     results_for_stats = []
@@ -120,7 +130,10 @@ def add_gp_fits(
             elif threshold_mode == 'fap':
                 thresh_kwargs = dict(fap_threshold=float(row.get("LSP_FAP")))
             elif threshold_mode == 'red_noise':
-                thresh_kwargs = dict(red_noise_params=row.get("LSP_red_noise_params"))
+                thresh_kwargs = dict(red_noise_params=(
+                    row["rn_log10_N"], row["rn_alpha"],
+                    row["rn_P_empirical"], row["rn_P_theoretical"],
+                ))
             else:
                 raise ValueError(f"Unknown threshold_mode: {threshold_mode!r}")
 
@@ -158,16 +171,23 @@ def add_gp_fits(
                     for i in range(len(bin_centers) - 1)
                 ]
 
-                gp_result_vals[label]   = result
-                gp_freq_vals[label]     = gp_freq
-                gp_psd_vals[label]      = gp_psd
-                gp_psd_binned[label]    = (log_band_powers, bin_centers)
-                gp_psd_ratios[label]    = (log_band_ratios, bin_midpoints)
-                gp_hl_ratio_vals[label] = stats["log_low_high_ratio"]
-                gp_n_comp_vals[label]   = result.n_components
-                gp_bic_vals[label]      = result.bic
-                gp_loglike_vals[label]  = result.log_likelihood
-                gp_periods_vals[label]  = result.periods
+                m = result.n_components
+
+                gp_result_vals[label]    = result
+                gp_freq_vals[label]      = gp_freq
+                gp_psd_vals[label]       = gp_psd
+                gp_psd_binned[label]     = (log_band_powers, bin_centers)
+                gp_psd_ratios[label]     = (log_band_ratios, bin_midpoints)
+                gp_hl_ratio_vals[label]  = stats["log_low_high_ratio"]
+                gp_n_comp_vals[label]    = m
+                gp_bic_vals[label]       = result.bic
+                gp_loglike_vals[label]   = result.log_likelihood
+                gp_periods_vals[label]   = result.periods
+                gp_jitter_vals[label]    = result.features["sho_jitter"]
+                gp_sho_sigmas_vals[label] = [result.features[f"sho_{i}_sigma"] for i in range(1, m + 1)]
+                gp_sho_omegas_vals[label] = [result.features[f"sho_{i}_omega"] for i in range(1, m + 1)]
+                gp_sho_Qs_vals[label]     = [result.features[f"sho_{i}_Q"]     for i in range(1, m + 1)]
+                gp_init_lsp_vals[label]   = result.features["initial_lsp_peak_periods"]
 
                 results_for_stats.append(result)
                 results_index.append(label)
@@ -196,16 +216,21 @@ def add_gp_fits(
     print(f"[add_gp_fits] done  |  ok={n_ok}  null={n_null}  failed={n_failed}")
 
     # Populate scalar / object columns
-    table["gp_result"]             = gp_result_vals
-    table["GP_freq"]               = gp_freq_vals
-    table["GP_PSD"]                = gp_psd_vals
-    table["GP_PSD_binned"]         = gp_psd_binned
-    table["GP_PSD_bin_ratios"]     = gp_psd_ratios
-    table["GP_PSD_high_low_ratio"] = gp_hl_ratio_vals
-    table["gp_n_components"]       = gp_n_comp_vals
-    table["gp_bic"]                = gp_bic_vals
-    table["gp_log_likelihood"]     = gp_loglike_vals
-    table["gp_periods"]            = gp_periods_vals
+    table["gp_result"]                   = gp_result_vals
+    table["GP_freq"]                     = gp_freq_vals
+    table["GP_PSD"]                      = gp_psd_vals
+    table["GP_PSD_binned"]               = gp_psd_binned
+    table["GP_PSD_bin_ratios"]           = gp_psd_ratios
+    table["GP_PSD_high_low_ratio"]       = gp_hl_ratio_vals
+    table["gp_n_components"]             = gp_n_comp_vals
+    table["gp_bic"]                      = gp_bic_vals
+    table["gp_log_likelihood"]           = gp_loglike_vals
+    table["gp_jitter"]                   = gp_jitter_vals
+    table["gp_periods"]                  = gp_periods_vals
+    table["gp_sho_sigmas"]               = gp_sho_sigmas_vals
+    table["gp_sho_omegas"]               = gp_sho_omegas_vals
+    table["gp_sho_Qs"]                   = gp_sho_Qs_vals
+    table["gp_initial_lsp_peak_periods"] = gp_init_lsp_vals
 
     # Flat gp_kspace_* columns for plot_summary_stats
     if results_for_stats:
