@@ -143,7 +143,7 @@ class GPFitResult:
         -------
         dict with keys: freq (1/day), power (analytic PSD)
         """
-        from .gp_fit import unpack_theta  # deferred — avoids circular import at module load
+        from .gp_fit import unpack_theta, _unpack_rn_comp  # deferred — avoids circular import at module load
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
@@ -160,6 +160,15 @@ class GPFitResult:
             denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
             power += numer / denom
 
+        if self.final_fit.get("has_red_noise", False):
+            rn     = _unpack_rn_comp(jnp.asarray(self.final_fit["theta"]), self.n_components)
+            sigma  = float(rn["sigma"])
+            omega0 = float(rn["omega"])
+            Q      = float(rn["Q"])
+            numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
+            denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
+            power += numer / denom
+
         return {"freq": freq, "power": power}
 
     def kspace_compare_allfits(self, freq_min, freq_max, n_freq=1000):
@@ -172,7 +181,7 @@ class GPFitResult:
         Pass the result to visualize_gp_afterfit.plot_kspace_compare_allfits
         to overlay them all in a single figure.
         """
-        from .gp_fit import unpack_theta  # deferred
+        from .gp_fit import unpack_theta, _unpack_rn_comp  # deferred
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
@@ -187,6 +196,15 @@ class GPFitResult:
                 sigma  = float(comp["sigma"])
                 omega0 = float(comp["omega"])
                 Q      = float(comp["Q"])
+                numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
+                denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
+                power += numer / denom
+
+            if fit.get("has_red_noise", False):
+                rn     = _unpack_rn_comp(jnp.asarray(fit["theta"]), m)
+                sigma  = float(rn["sigma"])
+                omega0 = float(rn["omega"])
+                Q      = float(rn["Q"])
                 numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
                 denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
                 power += numer / denom
@@ -239,6 +257,7 @@ class GPFitResult:
                 jnp.asarray(self.x),
                 jnp.asarray(self.yerr),
                 fit["n_components"],
+                fit.get("has_red_noise", False),
             )
             return {**fit, "gp": gp}
         self.final_fit = _rebuild(self.final_fit)

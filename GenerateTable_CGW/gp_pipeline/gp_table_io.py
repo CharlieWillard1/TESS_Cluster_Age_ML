@@ -82,6 +82,9 @@ def add_gp_fits(
     gp_loglike_vals   = pd.Series(np.nan, index=idx, dtype=float)
     gp_hl_ratio_vals  = pd.Series(np.nan, index=idx, dtype=float)
     gp_jitter_vals    = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_sigma_vals  = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_period_vals = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_Q_vals      = pd.Series(np.nan, index=idx, dtype=float)
 
     # Object columns
     gp_result_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
@@ -188,6 +191,9 @@ def add_gp_fits(
                 gp_sho_omegas_vals[label] = [result.features[f"sho_{i}_omega"] for i in range(1, m + 1)]
                 gp_sho_Qs_vals[label]     = [result.features[f"sho_{i}_Q"]     for i in range(1, m + 1)]
                 gp_init_lsp_vals[label]   = result.features["initial_lsp_peak_periods"]
+                gp_rn_sigma_vals[label]   = result.features.get("rn_sigma",       np.nan)
+                gp_rn_period_vals[label]  = result.features.get("rn_period_days", np.nan)
+                gp_rn_Q_vals[label]       = result.features.get("rn_Q",           np.nan)
 
                 results_for_stats.append(result)
                 results_index.append(label)
@@ -231,6 +237,9 @@ def add_gp_fits(
     table["gp_sho_omegas"]               = gp_sho_omegas_vals
     table["gp_sho_Qs"]                   = gp_sho_Qs_vals
     table["gp_initial_lsp_peak_periods"] = gp_init_lsp_vals
+    table["gp_rn_sigma"]                 = gp_rn_sigma_vals
+    table["gp_rn_period"]                = gp_rn_period_vals
+    table["gp_rn_Q"]                     = gp_rn_Q_vals
 
     # Flat gp_kspace_* columns for plot_summary_stats
     if results_for_stats:

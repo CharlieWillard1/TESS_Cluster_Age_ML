@@ -194,7 +194,7 @@ def _cluster_color_map(table_rows):
 
 def _analytic_psd(fit, freq_min, freq_max, n_freq):
     """Analytic SHO kernel PSD for a single fit dict."""
-    from .gp_fit import unpack_theta
+    from .gp_fit import unpack_theta, _unpack_rn_comp
     import jax.numpy as jnp
     freq  = np.linspace(freq_min, freq_max, n_freq)
     omega = 2.0 * np.pi * freq
@@ -204,6 +204,14 @@ def _analytic_psd(fit, freq_min, freq_max, n_freq):
         sigma  = float(comp["sigma"])
         omega0 = float(comp["omega"])
         Q      = float(comp["Q"])
+        numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
+        denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
+        power += numer / denom
+    if fit.get("has_red_noise", False):
+        rn     = _unpack_rn_comp(jnp.asarray(fit["theta"]), fit["n_components"])
+        sigma  = float(rn["sigma"])
+        omega0 = float(rn["omega"])
+        Q      = float(rn["Q"])
         numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
         denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
         power += numer / denom
@@ -662,13 +670,16 @@ def plot_noise_gp(data, period_lim=(1/24, 10.0), save_path=None):
                 ax_psd.plot(gp_freq[mask], gp_psd[mask], lw=1.2, color='mediumseagreen',
                             label='GP PSD')
 
+                bin_edges   = row.get('gp_kspace_bin_edges')
                 bin_centers = row.get('gp_kspace_bin_centers')
                 log_powers  = row.get('gp_kspace_log_band_powers')
-                if bin_centers is not None and log_powers is not None:
+                if bin_centers is not None and log_powers is not None and bin_edges is not None:
                     bc = np.asarray(bin_centers)
                     lp = np.asarray(log_powers)
-                    ax_psd.scatter(bc, 10**lp / bc, s=30, color='orange', zorder=5,
-                                   label='Binned GP power / freq')
+                    be = np.asarray(bin_edges)
+                    delta_f = be[1:] - be[:-1]   # linear bin widths (1/day)
+                    ax_psd.scatter(bc, 10**lp / delta_f, s=30, color='orange', zorder=5,
+                                   label='Binned GP PSD (P/Δf)')
                 ax_psd.legend(fontsize=7)
 
                 seed_periods = row.get('gp_initial_lsp_peak_periods') or []
@@ -702,6 +713,13 @@ def plot_noise_gp(data, period_lim=(1/24, 10.0), save_path=None):
                 ])
             if truncated:
                 cell_data.append(['...', '...', '...', '...'])
+            if res.final_fit.get("has_red_noise", False):
+                cell_data.append([
+                    'RN',
+                    f"{res.features['rn_period_days']:.3f}",
+                    f"{res.features['rn_Q']:.2f}*",  # * = fixed
+                    f"{res.features['rn_sigma']:.1e}",
+                ])
             cell_data.append(['jitter', '—', '—', f"{res.features['sho_jitter']:.1e}"])
 
             tbl = ax_tab.table(

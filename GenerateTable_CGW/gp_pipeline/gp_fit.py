@@ -13,6 +13,8 @@ from .gp_fit_result import GPFitResult
 
 jax.config.update("jax_enable_x64", True)
 
+_RN_Q = 1.0 / np.sqrt(2.0)  # fixed Q for red noise SHO (critical damping, Matérn-3/2 limit)
+
 
 # ============================================================
 # 1. Data prep
@@ -71,7 +73,14 @@ def unpack_theta(theta, n_components):
     return comps, jitter
 
 
-def build_multi_sho_gp(theta, x, yerr, n_components):
+def _unpack_rn_comp(theta, n_components):
+    """Unpack the fixed-Q red noise SHO from theta[3*n : 3*n+2]."""
+    sigma  = jnp.exp(theta[3 * n_components])
+    period = jnp.exp(theta[3 * n_components + 1])
+    return {"sigma": sigma, "period": period, "omega": 2.0 * jnp.pi / period, "Q": _RN_Q}
+
+
+def build_multi_sho_gp(theta, x, yerr, n_components, has_red_noise=False):
     comps, jitter = unpack_theta(theta, n_components)
 
     kernel = None
@@ -85,21 +94,54 @@ def build_multi_sho_gp(theta, x, yerr, n_components):
 
         kernel = k if kernel is None else kernel + k
 
+    if has_red_noise:
+        rn = _unpack_rn_comp(theta, n_components)
+        kernel = kernel + quasisep.SHO(omega=rn["omega"], quality=_RN_Q, sigma=rn["sigma"])
+
     diag = yerr**2 + jitter**2
 
     return GaussianProcess(kernel, x, diag=diag, mean=0.0)
 
 
-def neg_log_likelihood(theta, x, y, yerr, n_components):
-    gp = build_multi_sho_gp(theta, x, yerr, n_components)
+def neg_log_likelihood(theta, x, y, yerr, n_components, has_red_noise=False):
+    gp = build_multi_sho_gp(theta, x, yerr, n_components, has_red_noise)
     return -gp.log_probability(y)
+
+
+def _period_neg_log_prior(theta, period_seeds_j, n_components, sigma_dex):
+    """Non-negative penalty: negative log of a log-normal prior on each periodic SHO period.
+
+    Returned value is added to the NLL to form the negative log-posterior.
+    Covers only the n_components periodic SHOs; RN period is excluded.
+    """
+    sigma_ln    = sigma_dex * jnp.log(10.0)  # dex → natural log
+    log_seeds   = jnp.log(period_seeds_j)
+    log_periods = theta[:3 * n_components].reshape(n_components, 3)[:, 1]
+    return 0.5 * jnp.sum(((log_periods - log_seeds) / sigma_ln) ** 2)
+
+
+def _q_neg_log_prior(theta, n_components, q_prior_weight):
+    """Half-quadratic penalty in log-Q space that activates below Q=2.
+
+    No penalty for Q >= 2 (uniform prior). Below Q=2 the penalty grows
+    quadratically in log space so that Q=1.5 is a small nudge, Q=1 is
+    a moderate push, and Q<1 is a strong pull back toward Q=2.
+    """
+    log_q_threshold = jnp.log(2.0)
+    total = jnp.zeros(())
+    for i in range(n_components):
+        log_Q = theta[3 * i + 2]
+        deficit = jnp.maximum(0.0, log_q_threshold - log_Q)
+        total = total + deficit ** 2
+    return q_prior_weight * total
 
 
 # ============================================================
 # 3. Fit GP
 # ============================================================
 
-def make_initial_theta(period_guesses, y, yerr, init_Q=5.0):
+def make_initial_theta(period_guesses, y, yerr, init_Q=5.0,
+                       has_red_noise=False, rn_max_period=10.0):
     n_components = len(period_guesses)
 
     y_std = np.nanstd(y)
@@ -120,12 +162,19 @@ def make_initial_theta(period_guesses, y, yerr, init_Q=5.0):
             np.log(init_Q),
         ])
 
-    pieces.append(np.log(max(med_err, 1e-8)))  # jitter
+    if has_red_noise:
+        rn_sigma = max(init_sigma, 1e-8)
+        # Seed at 0.5 * rn_max_period (interior of bound; avoids degenerate first L-BFGS-B step)
+        rn_period = 0.5 * rn_max_period
+        pieces.extend([np.log(rn_sigma), np.log(rn_period)])
+
+    pieces.append(np.log(max(med_err, 1e-8)))  # jitter always last
 
     return np.array(pieces, dtype=float)
 
 
-def make_bounds(n_components, min_period, max_period, Q_min=0.51, Q_max=100.0):
+def make_bounds(n_components, min_period, max_period, Q_min=0.71, Q_max=100.0,
+                has_red_noise=False, rn_max_period=None):
     bounds = []
 
     for _ in range(n_components):
@@ -135,7 +184,17 @@ def make_bounds(n_components, min_period, max_period, Q_min=0.51, Q_max=100.0):
             (np.log(Q_min), np.log(Q_max)),            # Q
         ])
 
-    bounds.append((np.log(1e-10), np.log(1.0)))  # jitter
+    if has_red_noise:
+        # RN period range extends to the full time baseline so it can absorb
+        # slow trends that would otherwise leak into the periodic SHOs.
+        rn_per_max = rn_max_period if rn_max_period is not None else max_period
+        bounds.extend([
+            (np.log(1e-10), np.log(1.0)),              # sigma_rn
+            (np.log(min_period), np.log(rn_per_max)),  # period_rn
+            # Q is fixed at _RN_Q — not in theta
+        ])
+
+    bounds.append((np.log(1e-10), np.log(1.0)))  # jitter always last
 
     return bounds
 
@@ -147,19 +206,33 @@ def fit_multi_sho_gp(
     period_guesses,
     min_period,
     max_period,
-    Q_min=0.51,
+    Q_min=0.71,
     Q_max=100.0,
     init_Q=10.0,
+    has_red_noise=False,
+    use_lognormal_period_prior=False,
+    period_prior_sigma_dex=0.3,
+    two_phase_fitting=False,
+    use_q_prior=False,
+    q_prior_weight=1.0,
+    rn_period_cap=10.0,
 ):
     n_components = len(period_guesses)
+    _baseline = float(np.max(x))
+    rn_max_period = min(_baseline, rn_period_cap) if rn_period_cap is not None else _baseline
 
-    theta0 = make_initial_theta(period_guesses, y, yerr, init_Q=init_Q)
+    theta0 = make_initial_theta(
+        period_guesses, y, yerr, init_Q=init_Q,
+        has_red_noise=has_red_noise, rn_max_period=rn_max_period,
+    )
     bounds = make_bounds(
         n_components,
         min_period=min_period,
         max_period=max_period,
         Q_min=Q_min,
         Q_max=Q_max,
+        has_red_noise=has_red_noise,
+        rn_max_period=rn_max_period,
     )
 
     # Convert data to JAX arrays ONCE, not inside every likelihood call
@@ -167,10 +240,32 @@ def fit_multi_sho_gp(
     y_j = jnp.asarray(y)
     yerr_j = jnp.asarray(yerr)
 
-    # JIT-compiled objective
-    @jax.jit
-    def objective(theta):
-        return neg_log_likelihood(theta, x_j, y_j, yerr_j, n_components)
+    # JIT-compiled objective. Branches are resolved at Python level (not inside
+    # JIT) so each compiled function has a fixed structure.
+    _use_period_prior = use_lognormal_period_prior and n_components > 0
+    if _use_period_prior:
+        period_seeds_j = jnp.asarray(period_guesses)
+
+    if _use_period_prior and use_q_prior:
+        @jax.jit
+        def objective(theta):
+            return (neg_log_likelihood(theta, x_j, y_j, yerr_j, n_components, has_red_noise)
+                    + _period_neg_log_prior(theta, period_seeds_j, n_components, period_prior_sigma_dex)
+                    + _q_neg_log_prior(theta, n_components, q_prior_weight))
+    elif _use_period_prior:
+        @jax.jit
+        def objective(theta):
+            return (neg_log_likelihood(theta, x_j, y_j, yerr_j, n_components, has_red_noise)
+                    + _period_neg_log_prior(theta, period_seeds_j, n_components, period_prior_sigma_dex))
+    elif use_q_prior:
+        @jax.jit
+        def objective(theta):
+            return (neg_log_likelihood(theta, x_j, y_j, yerr_j, n_components, has_red_noise)
+                    + _q_neg_log_prior(theta, n_components, q_prior_weight))
+    else:
+        @jax.jit
+        def objective(theta):
+            return neg_log_likelihood(theta, x_j, y_j, yerr_j, n_components, has_red_noise)
 
     # JIT-compiled value + gradient
     value_and_grad = jax.jit(jax.value_and_grad(objective))
@@ -180,19 +275,53 @@ def fit_multi_sho_gp(
         val, grad = value_and_grad(jnp.asarray(theta_np))
         return float(val), np.asarray(grad, dtype=float)
 
-    result = minimize(
-        scipy_objective,
-        theta0,
-        method="L-BFGS-B",
-        jac=True,
-        bounds=bounds,
-        options={
-            "maxiter": 1000,
-            "ftol": 1e-8,
-            "gtol": 1e-6,
-            "maxls": 20,
-        },
-    )
+    opt_options = {"maxiter": 1000, "ftol": 1e-8, "gtol": 1e-6, "maxls": 20}
+
+    if two_phase_fitting and n_components > 0:
+        # Pass 1: freeze each periodic SHO period to its LSP seed so that σ, Q,
+        # the red-noise term, and jitter can find their level while the period is
+        # pinned.  This "switches on" the component so the likelihood has a sharp
+        # minimum at the correct period by the time we release it in pass 2.
+        frozen_bounds = list(bounds)
+        for i, p_seed in enumerate(period_guesses):
+            log_p = np.log(p_seed)
+            frozen_bounds[3 * i + 1] = (log_p, log_p)
+
+        result1 = minimize(
+            scipy_objective, theta0,
+            method="L-BFGS-B", jac=True,
+            bounds=frozen_bounds, options=opt_options,
+        )
+
+        # Pass 2: full period bounds, warm-started from pass-1 solution.
+        result2 = minimize(
+            scipy_objective, result1.x,
+            method="L-BFGS-B", jac=True,
+            bounds=bounds, options=opt_options,
+        )
+
+        # Fallback: pass-1's solution is always feasible for pass 2, so pass 2
+        # should never produce a worse objective.  If it does (optimizer escaped
+        # the basin or hit an iteration limit mid-flight), revert to pass 1.
+        val1, _ = scipy_objective(result1.x)
+        val2, _ = scipy_objective(result2.x)
+        if val2 > val1:
+            import warnings
+            warnings.warn(
+                f"two_phase_fitting: pass-2 objective ({val2:.4f}) is worse than "
+                f"pass-1 ({val1:.4f}). Reverting to pass-1 result.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            result = result1
+        else:
+            result = result2
+    else:
+        result = minimize(
+            scipy_objective, theta0,
+            method="L-BFGS-B", jac=True,
+            bounds=bounds, options=opt_options,
+        )
 
     theta_best = result.x
 
@@ -201,8 +330,11 @@ def fit_multi_sho_gp(
         x_j,
         yerr_j,
         n_components,
+        has_red_noise,
     )
 
+    # BIC uses the raw log-likelihood (prior excluded by convention — we rank
+    # models with an MLE-flavored criterion, not a true posterior comparison).
     loglike = float(gp.log_probability(y_j))
 
     return {
@@ -211,6 +343,7 @@ def fit_multi_sho_gp(
         "result": result,
         "loglike": loglike,
         "n_components": n_components,
+        "has_red_noise": has_red_noise,
     }
 
 
@@ -338,7 +471,7 @@ def compute_bic(loglike, n_params, n_data):
     return n_params * np.log(n_data) - 2.0 * loglike
 
 
-def summarize_components(theta, n_components):
+def summarize_components(theta, n_components, has_red_noise=False):
     comps, jitter = unpack_theta(jnp.asarray(theta), n_components)
 
     out = {}
@@ -348,6 +481,12 @@ def summarize_components(theta, n_components):
         out[f"sho_{i+1}_period_days"] = float(c["period"])
         out[f"sho_{i+1}_omega"] = float(c["omega"])
         out[f"sho_{i+1}_Q"] = float(c["Q"])
+
+    if has_red_noise:
+        rn = _unpack_rn_comp(jnp.asarray(theta), n_components)
+        out["rn_sigma"]      = float(rn["sigma"])
+        out["rn_period_days"] = float(rn["period"])
+        out["rn_Q"]          = float(rn["Q"])  # always _RN_Q ≈ 0.707
 
     out["sho_jitter"] = float(jitter)
 
@@ -440,7 +579,8 @@ def _save_checkpoint(checkpoint_dir, m, t, x, y, yerr, fits,
     best_fit = fits[best_idx]
 
     final_resid, final_mu, final_std = compute_gp_residuals(best_fit, x, y)
-    final_features = summarize_components(best_fit["theta"], best_fit["n_components"])
+    final_features = summarize_components(best_fit["theta"], best_fit["n_components"],
+                                          has_red_noise=best_fit.get("has_red_noise", False))
     final_features.update({
         "n_gp_components": best_fit["n_components"],
         "gp_log_likelihood": best_fit["loglike"],
@@ -506,7 +646,7 @@ def iterative_sho_gp_fit(
     max_components=6,
     min_period=1/24,
     max_period=10.0,
-    Q_min=0.51,
+    Q_min=0.71,
     Q_max=100.0,
     init_Q=10.0,
     harmonic_tolerance=0.10,
@@ -516,6 +656,13 @@ def iterative_sho_gp_fit(
     debug_fitalln=False,
     verbose=0,
     checkpoint_dir=None,
+    fit_red_noise_component=False,
+    use_lognormal_period_prior=False,
+    period_prior_sigma_dex=0.3,
+    two_phase_fitting=False,
+    use_q_prior=False,
+    q_prior_weight=1.0,
+    rn_period_cap=10.0,
 ):
     """
     Exhaustive-search multi-component SHO GP fit.
@@ -640,8 +787,15 @@ def iterative_sho_gp_fit(
             Q_min=Q_min,
             Q_max=Q_max,
             init_Q=1.0,
+            has_red_noise=fit_red_noise_component,
+            use_lognormal_period_prior=use_lognormal_period_prior,
+            period_prior_sigma_dex=period_prior_sigma_dex,
+            use_q_prior=use_q_prior,
+            q_prior_weight=q_prior_weight,
+            rn_period_cap=rn_period_cap,
         )
-        fb_fit["bic"] = compute_bic(fb_fit["loglike"], n_params=4, n_data=len(y))
+        fb_n_params = 4 + (2 if fit_red_noise_component else 0)
+        fb_fit["bic"] = compute_bic(fb_fit["loglike"], n_params=fb_n_params, n_data=len(y))
 
         if verbose >= 2:
             fb_comps, _ = unpack_theta(fb_fit["theta"], 1)
@@ -649,7 +803,7 @@ def iterative_sho_gp_fit(
                   f"BIC={fb_fit['bic']:.1f}  ({time.perf_counter() - t0_fb:.1f} s)")
 
         fb_resid, fb_mu, fb_std = compute_gp_residuals(fb_fit, x, y)
-        fb_features = summarize_components(fb_fit["theta"], 1)
+        fb_features = summarize_components(fb_fit["theta"], 1, has_red_noise=fit_red_noise_component)
         fb_features.update({
             "n_gp_components":          1,
             "gp_log_likelihood":        fb_fit["loglike"],
@@ -714,11 +868,18 @@ def iterative_sho_gp_fit(
             Q_min=Q_min,
             Q_max=Q_max,
             init_Q=init_Q,
+            has_red_noise=fit_red_noise_component,
+            use_lognormal_period_prior=use_lognormal_period_prior,
+            period_prior_sigma_dex=period_prior_sigma_dex,
+            two_phase_fitting=two_phase_fitting,
+            use_q_prior=use_q_prior,
+            q_prior_weight=q_prior_weight,
+            rn_period_cap=rn_period_cap,
         )
         if verbose >= 2:
             print(f"  Fit {m} component(s): {time.perf_counter() - t0:.1f} s")
 
-        n_params = 3 * m + 1
+        n_params = 3 * m + 1 + (2 if fit_red_noise_component else 0)
         fit["bic"] = compute_bic(fit["loglike"], n_params=n_params, n_data=len(y))
 
         fits.append(fit)
@@ -785,7 +946,8 @@ def iterative_sho_gp_fit(
 
     final_resid, final_mu, final_std = compute_gp_residuals(best_fit, x, y)
 
-    final_features = summarize_components(best_fit["theta"], best_fit["n_components"])
+    final_features = summarize_components(best_fit["theta"], best_fit["n_components"],
+                                          has_red_noise=fit_red_noise_component)
     final_features.update({
         "n_gp_components": best_fit["n_components"],
         "gp_log_likelihood": best_fit["loglike"],

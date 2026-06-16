@@ -8,3 +8,6 @@ GaussianNN_CGW/Model_Pipeline/RemoteTempFiles/
 __pycache__/
 
 GenerateTable_CGW/**/*.fits
+GenerateTable_CGW/figs/
+GenerateTable_CGW/data/
+GenerateTable_CGW/scratch/
