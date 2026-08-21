@@ -1,0 +1,701 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage[colorlinks=true, linkcolor=blue, urlcolor=blue]{hyperref}
+
+\newcommand{\istd}{\texttt{intrinsic\_std}}
+\newcommand{\irms}{\texttt{intrinsic\_rms}}
+\newcommand{\imad}{\texttt{intrinsic\_mad}}
+\newcommand{\moff}{\texttt{mean\_median\_offset}}
+\newcommand{\gp}{\gamma_{\mathrm{P}}}
+\newcommand{\sigobs}{\sigma_{\mathrm{obs}}}
+\newcommand{\sigphot}{\sigma_{\mathrm{phot}}}
+\newcommand{\sigint}{\sigma_{\mathrm{int}}}
+
+\title{Variability Summary Statistics for the TESS Cluster Table:\\
+       Noise Correction, Normalisation, and Sector Stitching}
+\author{TESS Cluster Age ML --- \texttt{GenerateTable\_CGW}}
+\date{2026 August 19}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note documents the six per-row variability statistics computed by
+\texttt{table\_pipeline/summary\_stats.py} and analyses each along three axes:
+whether it admits an exact photometric-noise correction, whether it is invariant
+under the pipeline's median flux normalisation, and how it behaves when several
+TESS sectors are stitched into a single row. The organising result is that a
+statistic is analytically noise-correctable if and only if it is built from
+\emph{cumulants}, which add under convolution; statistics built from
+\emph{quantiles} (the median, the MAD) are not correctable in closed form. This
+cleanly separates the three amplitude statistics and the moment skewness
+$g_1$, which are correctable, from the MAD-based amplitude and the Pearson
+nonparametric skew $\gp$, which are not. A second, independent axis --- stability
+under sector mixing --- ranks the statistics in the opposite order, so no single
+statistic dominates.
+\end{abstract}
+
+\tableofcontents
+
+% ============================================================================
+\section{Notation and pipeline context}
+% ============================================================================
+
+\subsection{Construction of a table row}
+
+Each row of the cluster table corresponds to one cluster observed in one
+\emph{combination} of TESS sectors. The light curve for a row is assembled in
+\texttt{lc\_lsp.py:load\_and\_process\_sectors} by the following sequence, applied
+independently to each sector $k$ in the combination:
+
+\begin{enumerate}
+  \item drop non-finite samples;
+  \item block-average (\texttt{resample\_lc}) to a common $30$\,min cadence,
+        performed on \emph{raw} flux, discarding any block spanning a time gap;
+  \item MAD-based sigma clipping (\texttt{mad\_clip\_lc}) at $n_\sigma = 4$,
+        applied \emph{symmetrically} about the sector median;
+  \item median normalisation (\texttt{normalize\_flux}), see below;
+\end{enumerate}
+
+after which the normalised sectors are concatenated and sorted in time.
+
+\subsection{The median normalisation}
+
+For a single sector with raw flux $f_i$ and uncertainty $\varsigma_i$,
+\texttt{normalize\_flux} applies
+%
+\begin{equation}
+  x_i = \frac{f_i}{\mathrm{med}(f)}, \qquad
+  s_i = \frac{\varsigma_i}{\mathrm{med}(f)} .
+  \label{eq:norm}
+\end{equation}
+%
+This is a purely \emph{multiplicative} rescaling: it is not a mean subtraction.
+Two consequences are used repeatedly below.
+
+\paragraph{(i) The sector median is exactly unity.}
+By construction $\mathrm{med}(x) = \mathrm{med}(f)/\mathrm{med}(f) = 1$.
+
+\paragraph{(ii) The \emph{pooled} median is also exactly unity.}
+Each sector contributes exactly half of its own points below its own median.
+Summing over $K$ sectors with $n_k$ points each, the concatenated array has
+$\sum_k n_k/2 = N/2$ points below $1$, so the pooled median is $1$ regardless of
+how unequal the sector lengths are (up to the usual $\pm 1$ discreteness for odd
+$n_k$). This was verified numerically on the full table: over $1250$ rows,
+$\max|\mathrm{med}(x) - 1| = 2.2\times10^{-16}$, and separately for
+$n_{\rm sec} = 1$, $2$, and $3$.
+
+Because both the flux and its uncertainty are divided by the same constant, all
+statistics below are in dimensionless \emph{relative flux} units, which is what
+makes them comparable between clusters of different apparent brightness.
+
+\subsection{Basic quantities}
+
+For a row with $N$ samples $\{x_i\}$ and uncertainties $\{s_i\}$, write
+%
+\begin{align}
+  \bar{x}       &= \frac{1}{N}\sum_{i=1}^{N} x_i,
+  &
+  \sigphot^{2}  &= \frac{1}{N}\sum_{i=1}^{N} s_i^{2},
+  \label{eq:basic1}\\[4pt]
+  \sigobs^{2}   &= \frac{1}{N}\sum_{i=1}^{N}\left(x_i - \bar{x}\right)^{2},
+  &
+  \mu_3         &= \frac{1}{N}\sum_{i=1}^{N}\left(x_i - \bar{x}\right)^{3}.
+  \label{eq:basic2}
+\end{align}
+%
+Note that $\sigphot^2$ is the \emph{mean of the squared} error bars, not the
+square of the mean error bar, and that all central moments use $\mathrm{ddof}=0$.
+
+% ============================================================================
+\section{The noise model and the governing principle}
+% ============================================================================
+
+\subsection{Model}
+
+Write the observed flux as the sum of an astrophysical signal and a measurement
+error,
+%
+\begin{equation}
+  x = s + n,
+  \label{eq:model}
+\end{equation}
+%
+with $n$ independent of $s$, zero-mean, and \emph{symmetric}, with variance
+$\mathrm{Var}(n) = \sigphot^2$. Symmetry is the operative assumption: TESS
+photometric errors are approximately Gaussian, and Gaussians are symmetric.
+
+\subsection{Cumulants add; quantiles do not}
+
+Equation~\eqref{eq:model} is a convolution of probability densities. Under
+convolution of independent variables, \emph{cumulants} $\kappa_j$ are additive:
+%
+\begin{equation}
+  \kappa_j(s+n) = \kappa_j(s) + \kappa_j(n).
+  \label{eq:cumadd}
+\end{equation}
+%
+The first three cumulants are the mean, the variance, and the third \emph{central
+moment} $\mu_3$ (for $j\le3$ cumulant and central moment coincide). Applying
+\eqref{eq:cumadd} to each:
+%
+\begin{align}
+  \bar{x}       &= \bar{s} + \underbrace{E[n]}_{=\,0} = \bar{s}
+                 && \text{(immune)},
+  \label{eq:cum1}\\
+  \sigobs^{2}   &= \sigma_s^{2} + \sigphot^{2}
+                 && \text{(inflated, exactly correctable)},
+  \label{eq:cum2}\\
+  \mu_3(x)      &= \mu_3(s) + \underbrace{\mu_3(n)}_{=\,0} = \mu_3(s)
+                 && \text{(immune, since $n$ is symmetric)}.
+  \label{eq:cum3}
+\end{align}
+%
+Equation~\eqref{eq:cum3} is the central result of this note: \textbf{symmetric
+noise contributes exactly zero third moment}, so the numerator of any
+moment-based skewness requires no noise subtraction at all. Only the
+normalising $\sigma^3$ is contaminated, and \eqref{eq:cum2} tells us exactly how.
+
+By contrast, \emph{quantiles} are not cumulants and do not obey
+\eqref{eq:cumadd}. In particular
+%
+\begin{equation}
+  \mathrm{med}(s+n) \;\neq\; \mathrm{med}(s)
+  \label{eq:medshift}
+\end{equation}
+%
+in general. Convolving a skewed density with symmetric noise fills in the sparse
+side of the distribution and \emph{pulls the median toward the mean} by an amount
+that depends on the unknown shape of $p(s)$. There is no closed-form inverse.
+The same objection applies to the median absolute deviation.
+
+\paragraph{The unavoidable trade-off.} The property that makes the median robust
+to outliers --- that it counts points rather than weighting them by magnitude ---
+is precisely the property that breaks additivity under convolution. Robustness to
+outliers and analytic noise-correctability are therefore in direct tension: among
+the statistics below, no quantile-based estimator is exactly correctable, and no
+exactly correctable estimator is outlier-robust.
+
+% ============================================================================
+\section{The statistics}
+% ============================================================================
+
+Throughout, $\sigint \equiv \istd$ denotes the noise-corrected scale defined in
+\S\ref{sec:std}. Every ``intrinsic'' quantity in the pipeline applies the floor
+$\max(0,\cdot)$ before taking a square root; the consequences are discussed in
+\S\ref{sec:floor}.
+
+% ----------------------------------------------------------------------------
+\subsection{Noise-corrected standard deviation, \istd}
+\label{sec:std}
+% ----------------------------------------------------------------------------
+
+\paragraph{Base form.} $\sigobs$ as defined in \eqref{eq:basic2}: the scatter
+about the row's own mean.
+
+\paragraph{Noise-corrected form.} Directly from \eqref{eq:cum2},
+%
+\begin{equation}
+  \boxed{\;\istd \;=\; \sigint \;=\; \sqrt{\max\!\left(0,\;
+         \sigobs^{2} - \sigphot^{2}\right)}\;}
+  \label{eq:istd}
+\end{equation}
+%
+This correction is \textbf{exact}. The variance is a cumulant, the subtraction is
+the identity \eqref{eq:cum2} rearranged, and no distributional assumption beyond
+independence is required.
+
+% ----------------------------------------------------------------------------
+\subsection{Noise-corrected RMS, \irms}
+\label{sec:rms}
+% ----------------------------------------------------------------------------
+
+\paragraph{Base form.} The scatter about the \emph{absolute} baseline $1$,
+%
+\begin{equation}
+  \mathrm{rms}_{\mathrm{obs}}^{2} = \frac{1}{N}\sum_{i}\left(x_i - 1\right)^{2}.
+  \label{eq:rmsobs}
+\end{equation}
+
+\paragraph{Relation to \istd.} Writing $x_i - 1 = (x_i - \bar{x}) + (\bar{x}-1)$
+and expanding, the cross term vanishes because $\sum_i (x_i - \bar{x}) = 0$:
+%
+\begin{equation}
+  \mathrm{rms}_{\mathrm{obs}}^{2}
+    = \sigobs^{2} + \left(\bar{x} - 1\right)^{2}
+    = \sigobs^{2} + \Delta^{2},
+  \label{eq:rmsidentity}
+\end{equation}
+%
+where $\Delta \equiv \bar{x} - \mathrm{med}(x)$ is the offset of
+\S\ref{sec:offset}, the substitution $1 \to \mathrm{med}(x)$ being exact by the
+normalisation. Subtracting $\sigphot^2$ from both sides,
+%
+\begin{equation}
+  \boxed{\;\irms^{2} \;=\; \istd^{2} + \Delta^{2}\;}
+  \label{eq:rmsstd}
+\end{equation}
+%
+valid wherever neither quantity is truncated by its $\max(0,\cdot)$ floor. This
+was verified on real data: over the $1216$ of $1250$ rows where neither is
+clamped, \eqref{eq:rmsstd} holds to a maximum absolute residual of
+$2.9\times10^{-19}$.
+
+\paragraph{Interpretation.} \irms{} carries \emph{no amplitude information beyond}
+\istd. The two are degenerate for any symmetric light curve, and their difference
+is purely the squared asymmetry. This makes \irms{} a hybrid object: the
+$\sigobs^2$ part of \eqref{eq:rmsidentity} is a cumulant and is exactly
+corrected, but the $\Delta^2$ part is quantile-contaminated and is \emph{not}.
+Its noise correction is therefore exact only in the symmetric limit
+$\Delta \to 0$.
+
+% ----------------------------------------------------------------------------
+\subsection{Noise-corrected MAD, \imad}
+\label{sec:mad}
+% ----------------------------------------------------------------------------
+
+\paragraph{Base form.} The median absolute deviation rescaled to a
+Gaussian-equivalent $\sigma$,
+%
+\begin{equation}
+  \mathrm{MAD} = \mathrm{med}\left(\left|x_i - \mathrm{med}(x)\right|\right),
+  \qquad
+  \sigma_{\mathrm{MAD}} = 1.4826\,\mathrm{MAD},
+  \label{eq:mad}
+\end{equation}
+%
+where $1.4826 = 1/\Phi^{-1}(3/4)$ is the consistency factor making
+$\sigma_{\mathrm{MAD}}$ an unbiased estimator of $\sigma$ \emph{for Gaussian
+data}.
+
+\paragraph{Nominal noise-corrected form.}
+%
+\begin{equation}
+  \imad = \sqrt{\max\!\left(0,\;\sigma_{\mathrm{MAD}}^{2}
+                            - \sigphot^{2}\right)} .
+  \label{eq:imad}
+\end{equation}
+
+\paragraph{Caveat --- this correction is an approximation, not an identity.}
+Equation~\eqref{eq:imad} presumes that $\sigma_{\mathrm{MAD}}^2$ is additive
+under convolution. It is not: the MAD is a quantile statistic and violates
+\eqref{eq:cumadd}. Additivity holds exactly only when \emph{both} $s$ and $n$
+are Gaussian, in which case $\sigma_{\mathrm{MAD}} = \sigma$ identically and one
+may as well have used \eqref{eq:istd}. For genuinely non-Gaussian signal --- spot
+modulation, flares, precisely the regime in which a robust estimator is wanted ---
+\eqref{eq:imad} carries a shape-dependent bias. \imad{} should be read as a
+robust \emph{diagnostic} rather than as an exactly de-biased amplitude, and
+disagreement between \imad{} and \istd{} is itself informative about
+non-Gaussianity.
+
+% ----------------------------------------------------------------------------
+\subsection{Mean--median offset, \moff}
+\label{sec:offset}
+% ----------------------------------------------------------------------------
+
+\paragraph{Base form.}
+%
+\begin{equation}
+  \boxed{\;\Delta \;\equiv\; \moff \;=\; \bar{x} - \mathrm{med}(x)\;}
+  \label{eq:offset}
+\end{equation}
+
+\paragraph{Noise-corrected form: none exists.} By \eqref{eq:cum1} the mean is
+immune, but by \eqref{eq:medshift} the median is not: as noise increases, the
+observed median migrates toward the observed mean and $\Delta$ collapses toward
+zero. Since the shift depends on the unknown shape of $p(s)$, no closed-form
+correction is available. Note that this is a bias in the \emph{numerator}, so it
+cannot be repaired by any change of denominator.
+
+\paragraph{Dimensions.} $\Delta$ has units of relative flux; it is an
+\emph{amplitude}, not a shape parameter, and belongs with \istd{}/\irms{}/\imad{}
+rather than with $\gp$ and $g_1$.
+
+% ----------------------------------------------------------------------------
+\subsection{Pearson nonparametric skew, $\gp$}
+\label{sec:gammap}
+% ----------------------------------------------------------------------------
+
+\paragraph{Base form.}
+%
+\begin{equation}
+  \boxed{\;\gp \;=\; \frac{\bar{x} - \mathrm{med}(x)}{\sigobs}
+                 \;=\; \frac{\Delta}{\sigobs}\;}
+  \label{eq:gammap}
+\end{equation}
+%
+defined as \texttt{NaN} where $\sigobs = 0$. Negative $\gp$ indicates a
+dip-dominated (spot-like) flux distribution; positive $\gp$ a flare-dominated
+one.
+
+\paragraph{Mechanism.} $\gp$ is a \emph{location-contrast} statistic. It infers
+asymmetry from the disagreement between two location estimators: mean and median
+coincide for a symmetric density and separate when a tail drags the mean.
+
+\paragraph{Partially corrected form.} One may substitute the noise-corrected
+scale in the denominator,
+%
+\begin{equation}
+  \gp^{\mathrm{(int)}} = \frac{\Delta}{\sigint}
+                       = \gp \cdot \frac{\sigobs}{\sigint},
+  \label{eq:gammapint}
+\end{equation}
+%
+but this repairs only the denominator. Because $\Delta$ itself is biased, the
+result is \textbf{not} an unbiased estimate of the signal's $\gp$. An injection
+test (Table~\ref{tab:injection}) confirms this: applying \eqref{eq:gammapint} to
+data with a known true $\gp = -0.640$ recovers $-0.545$ at $\mathrm{SNR}=10$ and
+only $-0.163$ at $\mathrm{SNR}=1$ --- essentially identical to the uncorrected
+value, because the denominator was never the problem.
+
+% ----------------------------------------------------------------------------
+\subsection{Moment skewness, $g_1$}
+\label{sec:g1}
+% ----------------------------------------------------------------------------
+
+\paragraph{Base form.}
+%
+\begin{equation}
+  g_1 = \frac{\mu_3}{\sigobs^{3}}
+      = \frac{N^{-1}\sum_i \left(x_i-\bar{x}\right)^{3}}{\sigobs^{3}} .
+  \label{eq:g1}
+\end{equation}
+
+\paragraph{Mechanism.} $g_1$ is a \emph{moment} statistic. Cubing the deviations
+preserves sign, so points far above the mean contribute positively and points far
+below negatively; a symmetric density cancels term by term. Unlike $\gp$, it
+never references the median.
+
+\paragraph{Noise-corrected form.} By \eqref{eq:cum3} the numerator needs no
+correction; by \eqref{eq:cum2} the denominator is corrected by replacing
+$\sigobs$ with $\sigint$. The inflation factors cancel and the result collapses
+to a single expression:
+%
+\begin{equation}
+  \boxed{\;g_1^{\mathrm{(int)}}
+     \;=\; g_1 \left(\frac{\sigobs}{\sigint}\right)^{3}
+     \;=\; \frac{\mu_3}{\istd^{3}}\;}
+  \label{eq:g1int}
+\end{equation}
+%
+That is: \textbf{the noise-corrected skewness is the third central moment divided
+by the cube of the already-computed} \istd. Structurally this is exactly parallel
+to \eqref{eq:istd} --- the same numerator, normalised by the noise-corrected scale
+instead of the observed one. The correction is \emph{exact} under the symmetric
+noise assumption.
+
+\paragraph{Numerical verification.} Table~\ref{tab:injection} reports an
+injection test: an asymmetric spot-like signal of known skewness
+($g_1^{\rm true} = -1.3087$, $\mu_3^{\rm true} = -1.3087$ at unit variance,
+$\Delta^{\rm true} = -0.640$) with white noise added at decreasing SNR,
+$N = 2000$ samples, $200$ realisations per SNR.
+
+\begin{table}[htbp]
+\centering
+\caption{Injection test, mean recovered value over $200$ realisations. The
+$\mu_3$ column is flat across a tenfold change in noise, confirming
+\eqref{eq:cum3}; $g_1^{\mathrm{(int)}}$ recovers truth to four significant
+figures at every SNR. The $\Delta$ column collapses by a factor of four,
+confirming \eqref{eq:medshift}, and $\gp^{\mathrm{(int)}}$ inherits that
+collapse.}
+\label{tab:injection}
+\begin{tabular}{r rr rr}
+\toprule
+ & \multicolumn{2}{c}{moment route} & \multicolumn{2}{c}{quantile route} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+SNR & $\mu_3$ & $g_1^{\mathrm{(int)}}$ & $\Delta$ & $\gp^{\mathrm{(int)}}$ \\
+\midrule
+truth   & $-1.3087$ & $-1.3087$ & $-0.6399$ & $-0.6399$ \\
+\midrule
+$10.0$  & $-1.3086$ & $-1.3087$ & $-0.5452$ & $-0.5452$ \\
+$3.0$   & $-1.3048$ & $-1.3077$ & $-0.4009$ & $-0.4013$ \\
+$2.0$   & $-1.3056$ & $-1.3097$ & $-0.3213$ & $-0.3216$ \\
+$1.0$   & $-1.3022$ & $-1.3053$ & $-0.1625$ & $-0.1626$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Cost of the correction.} The factor $(\sigobs/\sigint)^3$ diverges as
+$\sigint \to 0$. On the real table, $391$ of $1250$ rows have
+$\sigint/\sigphot < 1$ and $34$ have $\sigint = 0$ exactly; computing
+\eqref{eq:g1int} without a signal-to-noise gate produces a distribution with
+standard deviation $341$ and maximum $1.19\times10^{4}$, against an interquartile
+range of only $[-0.25, +0.30]$. \textbf{Equation~\eqref{eq:g1int} must be gated on
+$\sigint/\sigphot$ above some threshold} (unity is a reasonable starting choice)
+or it will contaminate anything downstream.
+
+% ----------------------------------------------------------------------------
+\subsection{The $\max(0,\cdot)$ floor}
+\label{sec:floor}
+% ----------------------------------------------------------------------------
+
+All three amplitude statistics clamp a negative noise-subtracted variance to
+zero. When the intrinsic signal lies at or below the photometric noise the
+subtraction goes negative and is truncated, so the quiet end of the sample piles
+up at exactly zero rather than scattering about it. This destroys information: the
+signed quantity $\sigobs^2 - \sigphot^2$ is an unbiased (if noisy) estimator,
+whereas its clamped square root is biased upward. For regression at low
+amplitude, retaining the signed variance is preferable. The floor is also what
+makes the mask in \eqref{eq:rmsstd} necessary and what makes \eqref{eq:g1int}
+undefined on $34$ rows.
+
+% ============================================================================
+\section{Robustness to the median normalisation}
+% ============================================================================
+
+\subsection{Single-sector rows: an exact affine map}
+
+For a single sector, \eqref{eq:norm} is a global affine transformation
+$x \to (f - a)/c$ with $a = 0$, $c = \mathrm{med}(f) > 0$. Behaviour under such a
+map partitions the statistics into two classes.
+
+\paragraph{Scale-covariant (amplitudes).} \istd, \irms, \imad{} and $\Delta$ all
+carry one power of flux and therefore scale as $c^{-1}$. They are \emph{not}
+invariant --- deliberately so. The normalisation is what converts them from
+instrumental counts into relative flux, which is the entire reason two clusters
+of different apparent brightness can be compared at all.
+
+\paragraph{Scale-invariant (shapes).} $\gp$ and $g_1$ are dimensionless ratios:
+%
+\begin{align}
+  g_1 &\to \frac{\mu_3/c^{3}}{(\sigobs/c)^{3}} = g_1,
+  &
+  \gp &\to \frac{\Delta/c}{\sigobs/c} = \gp .
+  \label{eq:scaleinv}
+\end{align}
+%
+Both are additionally shift-invariant, being built from central quantities.
+\textbf{The median normalisation changes neither by any amount.}
+
+This invariance is inherited by the corrected form \eqref{eq:g1int}: because
+\eqref{eq:norm} divides the uncertainties by the same $c$, $\sigphot$ and hence
+$\sigint$ land in the same relative units as $\mu_3$, so
+$\mu_3/\sigint^3$ is scale-invariant as well.
+
+\subsection{Multi-sector rows: a piecewise map}
+
+For a stitched row the normalisation is applied \emph{per sector}, each with its
+own divisor $c_k$, and then the sectors are concatenated. This is
+\emph{piecewise} affine, not globally affine, so \eqref{eq:scaleinv} does not
+apply and every statistic --- shapes included --- depends on the choice.
+
+The choice matters, and per-sector is the correct one. Sectors sit at different
+instrumental flux levels (different pixel masks, different CCDs). Stitching
+without per-sector normalisation would leave a multi-modal pooled distribution of
+$K$ clumps at different levels, with the following effects:
+
+\begin{itemize}
+  \item \textbf{Amplitudes are corrupted at first order.} The pooled variance
+        acquires the between-clump term $\sum_k w_k (\bar{x}_k - \bar{x})^2$
+        directly, so \istd{} would be measuring the instrumental level
+        difference rather than the star. \emph{Any} offset inflates it.
+  \item \textbf{Shapes are corrupted only at second order.} A multi-modal
+        distribution is asymmetric only if the clumps are \emph{unequally
+        weighted}. Two equal-length sectors offset from one another produce a
+        perfectly symmetric bimodal density: variance badly corrupted, skewness
+        still exactly zero.
+\end{itemize}
+
+Hence per-sector normalisation is load-bearing for both classes, but it rescues
+the amplitudes from a first-order error and the shapes from a second-order one.
+Contrary to intuition, the amplitudes are the \emph{more} exposed of the two.
+
+% ============================================================================
+\section{Robustness to sector stitching}
+% ============================================================================
+
+Once the per-sector normalisation has removed the offsets, a residual and
+entirely separate issue remains: a stitched row is a statistical \emph{mixture}
+of its sectors, and the statistics survive mixing differently.
+
+\subsection{Pooled moments}
+
+Let sector $k$ contribute $n_k$ points with weight $w_k = n_k/N$, per-sector mean
+$\bar{x}_k$, variance $\sigma_k^2$, third moment $\mu_{3,k}$, and offset
+$\Delta_k = \bar{x}_k - 1$. Exactly,
+%
+\begin{align}
+  \sigobs^{2} &= \sum_k w_k \left[\sigma_k^{2}
+                 + (\bar{x}_k - \bar{x})^{2}\right],
+  \label{eq:poolvar}\\
+  \mu_3       &= \sum_k w_k \left[\mu_{3,k}
+                 + 3\sigma_k^{2}(\bar{x}_k - \bar{x})
+                 + (\bar{x}_k - \bar{x})^{3}\right].
+  \label{eq:poolmu3}
+\end{align}
+%
+Because per-sector normalisation forces $\mathrm{med}(x_k) = 1$ for every $k$,
+the sector means satisfy $\bar{x}_k = 1 + \Delta_k$ with $|\Delta_k| \ll
+\sigma_k$ in practice, so the between-sector terms are second order and to
+leading order both pooled moments \textbf{mix linearly}:
+%
+\begin{equation}
+  \sigobs^{2} \simeq \sum_k w_k \sigma_k^{2},
+  \qquad
+  \mu_3 \simeq \sum_k w_k \mu_{3,k},
+  \qquad
+  \Delta \simeq \sum_k w_k \Delta_k .
+  \label{eq:linearmix}
+\end{equation}
+
+\subsection{Consequences per statistic}
+
+\paragraph{Amplitudes: well-behaved.} $\istd = \sqrt{\sigobs^2 - \sigphot^2}$ is a
+monotone function of a clean linear mixture. A three-sector \istd{} is a
+\emph{better-averaged estimate of the same underlying quantity} as a one-sector
+\istd{} --- lower epoch-to-epoch scatter, identical meaning. Mixing is benign.
+
+\paragraph{Shapes: reweighted.} Substituting \eqref{eq:linearmix} into
+\eqref{eq:g1} and \eqref{eq:gammap} and writing $\mu_{3,k} = g_{1,k}\sigma_k^3$,
+$\Delta_k = \gamma_{{\rm P},k}\sigma_k$:
+%
+\begin{align}
+  g_1^{\mathrm{pooled}}
+    &= \frac{\sum_k w_k\, g_{1,k}\,\sigma_k^{3}}
+            {\left(\sum_k w_k \sigma_k^{2}\right)^{3/2}},
+  \label{eq:g1pool}\\[6pt]
+  \gp^{\mathrm{pooled}}
+    &= \frac{\sum_k w_k\, \gamma_{{\rm P},k}\,\sigma_k}
+            {\left(\sum_k w_k \sigma_k^{2}\right)^{1/2}} .
+  \label{eq:gppool}
+\end{align}
+%
+Neither is the weighted mean of its per-sector values. The effective weight on
+sector $k$ is
+%
+\begin{equation}
+  W_k^{(g_1)} \propto w_k \sigma_k^{3},
+  \qquad
+  W_k^{(\gp)} \propto w_k \sigma_k^{1},
+  \label{eq:effweights}
+\end{equation}
+%
+so the loudest sector dominates --- \emph{cubically} for $g_1$ and only
+\emph{linearly} for $\gp$. A stitched skewness is therefore not a better estimate
+of the single-sector quantity; it is a \textbf{different quantity}, and how
+different depends on the exponent of $\sigma$ in the denominator.
+
+\paragraph{Practical implication.} The cluster table deliberately contains all
+seven sector subsets ($r = 1,2,3$) per cluster. Any model trained across
+$n_{\rm sec}$ will see the reweighting of \eqref{eq:effweights} as real variation.
+Amplitudes are safe; $\gp$ is mildly affected; $g_1$ is the most affected. If
+$g_1$ is to be compared across $n_{\rm sec}$, it should be computed \emph{per
+sector} and combined explicitly via \eqref{eq:g1pool} rather than evaluated on
+the stitched array.
+
+% ============================================================================
+\section{Sampling error under the null}
+% ============================================================================
+
+Both shape statistics have non-zero scatter on pure noise at finite $N$. For a
+Gaussian sample of size $N$ the standard errors are
+%
+\begin{equation}
+  \mathrm{sd}(\gp) = \sqrt{\frac{\pi/2 - 1}{N}} \simeq \frac{0.756}{\sqrt{N}},
+  \qquad
+  \mathrm{sd}(g_1) = \sqrt{\frac{6}{N}} ,
+  \label{eq:nullse}
+\end{equation}
+%
+both confirmed by simulation to three significant figures over
+$N \in [500, 4000]$. Dividing by these gives a per-row significance,
+%
+\begin{equation}
+  z_{\gp} = \gp \sqrt{\tfrac{N}{\pi/2-1}},
+  \qquad
+  z_{g_1} = g_1 \sqrt{\tfrac{N}{6}},
+  \label{eq:zscores}
+\end{equation}
+%
+which is likely a better model input than the raw value, since it self-normalises
+for the very different $N$ of one-, two-, and three-sector rows.
+
+On the real table (median $N = 1260$), the observed scatter exceeds the null by a
+factor of $2.94$ for $\gp$ ($0.0561$ observed versus $0.0191$ expected) and
+$4.58$ for $g_1$ ($0.2825$ versus $0.0618$). Significant asymmetry at
+$|z| > 3$ is detected in $258/1250$ rows for $\gp$ and $467/1250$ for $g_1$.
+\textbf{Real asymmetry is present and $g_1$ is the more sensitive detector},
+despite the $n_\sigma = 4$ clipping discussed below.
+
+% ============================================================================
+\section{Summary}
+% ============================================================================
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{The six statistics along the three axes. ``Median norm.'' refers to a
+single global application of \eqref{eq:norm}; for stitched rows the per-sector
+application affects all six (\S5.2).}
+\label{tab:summary}
+\begin{tabular}{llccc}
+\toprule
+Statistic & Built from & Noise-correctable & Median norm. & Sector mixing \\
+\midrule
+\istd  & cumulant $\kappa_2$      & exact           & covariant ($c^{-1}$) & benign (linear) \\
+\irms  & $\kappa_2$ + quantile    & exact only if $\Delta\!=\!0$ & covariant ($c^{-1}$) & benign (linear) \\
+\imad  & quantile                 & approximate     & covariant ($c^{-1}$) & benign (linear) \\
+\moff  & $\kappa_1$ + quantile    & no              & covariant ($c^{-1}$) & benign (linear) \\
+$\gp$  & $\kappa_1$ + quantile    & no              & \textbf{invariant}   & reweighted $\propto\sigma^{1}$ \\
+$g_1$  & cumulant $\kappa_3$      & \textbf{exact}  & \textbf{invariant}   & reweighted $\propto\sigma^{3}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The two skewness statistics are complementary}
+
+$\gp$ and $g_1$ trade off along two \emph{independent} axes, in opposite
+directions:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+ & noise-correctable & survives sector mixing \\
+\midrule
+$\gp$ & no             & better ($\sigma^1$) \\
+$g_1$ & yes, exactly   & worse ($\sigma^3$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Neither dominates. $\gp$ is outlier-robust and survives the pipeline's symmetric
+$4\sigma$ clipping intact, but is diluted by noise in a way no denominator can
+repair. $g_1$ is exactly de-biasable and empirically the more sensitive detector,
+but rests on cubed residuals and is the more distorted by sector mixing. Carrying
+both is defensible.
+
+\subsection{Caveat: symmetric sigma clipping}
+
+Step 2 of the pipeline runs \texttt{mad\_clip\_lc} at $n_\sigma = 4$,
+\emph{symmetrically} about the sector median. Skewness lives in the tails, so a
+symmetric cut actively removes the signal both shape statistics are built to
+measure --- flares especially. Values of $\gp$ and $g_1$ computed downstream are
+therefore the residual asymmetry of an already partly symmetrised distribution,
+and should be read as \emph{lower bounds} on the true asymmetry. If either
+statistic proves useful, recomputing at looser $n_\sigma$ (or before the clip) is
+the natural follow-up.
+
+\subsection{Empirical status}
+
+On the current table ($1250$ rows, $348$ clusters), neither shape statistic shows
+a monotonic relation with cluster age: Spearman $|\rho| \le 0.03$ for $\gp$,
+$g_1$, $g_1^{\mathrm{(int)}}$, and both $z$-scores when restricted to the $859$
+rows with $\sigint/\sigphot > 1$. (An apparent $\rho = +0.081$ for
+$g_1^{\mathrm{(int)}}$ over all rows is an artifact of the divergence described
+in \S\ref{sec:g1}; it vanishes under the SNR cut.) Asymmetry is detected at high
+significance, but it does not track age.
+
+A plausible physical explanation is that these are \emph{integrated} cluster
+light curves --- one flux time series per cluster, summing many stars. Individual
+spot and flare signatures, which are precisely the asymmetric features these
+statistics detect, average toward symmetry by the central limit theorem as more
+stars are blended. This is testable: the scatter in $\gp$ should decrease with
+cluster membership count. If it does, skewness is the wrong instrument for
+blended photometry irrespective of the clipping; if it does not, the $n_\sigma=4$
+clip becomes the prime suspect.
+
+\end{document}

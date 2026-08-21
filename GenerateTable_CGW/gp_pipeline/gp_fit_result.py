@@ -124,13 +124,22 @@ class GPFitResult:
         """
         Analytic prior power spectral density of the fitted GP kernel.
 
-        For each SHO component with parameters (sigma, omega_0, Q), the PSD is:
+        Each SHO component contributes ``gp_fit.sho_psd(freq, sigma, omega_0, Q)``::
 
-            S(f) = sigma^2 * (omega_0/Q) * (omega_0^2 + omega^2)
-                   / ((omega^2 - omega_0^2)^2 + omega^2 * omega_0^2 / Q^2)
+            S(f) = 4 * sigma^2 * omega_0^3
+                   / ( Q * ((omega^2 - omega_0^2)^2 + omega^2 * omega_0^2 / Q^2) )
 
-        where omega = 2*pi*f (rad/day).  This integrates to sigma^2 over all f
-        and is independent of the observed data.
+        where omega = 2*pi*f (rad/day).  This integrates to sigma^2 over all f and is
+        independent of the observed data.  Asymptotically S ~ f^-4, matching
+        ``tinygp.kernels.quasisep.SHO`` as actually built by ``build_multi_sho_gp``.
+
+        Corrected 2026-08-21: the numerator previously carried an extra
+        ``(omega_0^2 + omega^2)`` factor, giving f^-2 instead of f^-4 and disagreeing
+        with the fitted kernel by up to ~2.2 dex inside 0.1-12 /day.  Fitted parameters
+        were never affected; only the reported spectra.  Any table written before that
+        date has stale GP_PSD / gp_kspace_* columns -- see
+        ``gp_table_io.recompute_gp_psd_columns``, which rebuilds them from the stored
+        parameters without refitting.
 
         Parameters
         ----------
@@ -143,7 +152,7 @@ class GPFitResult:
         -------
         dict with keys: freq (1/day), power (analytic PSD)
         """
-        from .gp_fit import unpack_theta, _unpack_rn_comp  # deferred — avoids circular import at module load
+        from .gp_fit import unpack_theta, _unpack_rn_comp, sho_psd  # deferred — avoids circular import at module load
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
@@ -156,18 +165,14 @@ class GPFitResult:
             omega0 = float(comp["omega"])
             Q      = float(comp["Q"])
 
-            numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
-            denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
-            power += numer / denom
+            power += sho_psd(freq, sigma, omega0, Q)
 
         if self.final_fit.get("has_red_noise", False):
             rn     = _unpack_rn_comp(jnp.asarray(self.final_fit["theta"]), self.n_components)
             sigma  = float(rn["sigma"])
             omega0 = float(rn["omega"])
             Q      = float(rn["Q"])
-            numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
-            denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
-            power += numer / denom
+            power += sho_psd(freq, sigma, omega0, Q)
 
         return {"freq": freq, "power": power}
 
@@ -181,7 +186,7 @@ class GPFitResult:
         Pass the result to visualize_gp_afterfit.plot_kspace_compare_allfits
         to overlay them all in a single figure.
         """
-        from .gp_fit import unpack_theta, _unpack_rn_comp  # deferred
+        from .gp_fit import unpack_theta, _unpack_rn_comp, sho_psd  # deferred
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
@@ -196,18 +201,14 @@ class GPFitResult:
                 sigma  = float(comp["sigma"])
                 omega0 = float(comp["omega"])
                 Q      = float(comp["Q"])
-                numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
-                denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
-                power += numer / denom
+                power += sho_psd(freq, sigma, omega0, Q)
 
             if fit.get("has_red_noise", False):
                 rn     = _unpack_rn_comp(jnp.asarray(fit["theta"]), m)
                 sigma  = float(rn["sigma"])
                 omega0 = float(rn["omega"])
                 Q      = float(rn["Q"])
-                numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
-                denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
-                power += numer / denom
+                power += sho_psd(freq, sigma, omega0, Q)
 
             entries.append({
                 "n_components": m,

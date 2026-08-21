@@ -11,3 +11,9 @@ GenerateTable_CGW/**/*.fits
 GenerateTable_CGW/figs/
 GenerateTable_CGW/data/
 GenerateTable_CGW/scratch/
+
+# Synthetic LC set: regenerable in ~1 min from
+# GenerateTable_CGW/sytheticdata_generate_compare/01_generate_synthetic.ipynb.
+# NOTE: the real light_curves/ is deliberately TRACKED -- do not widen this to a
+# wildcard, or a rename would silently start ignoring it.
+light_curves_synthetic/

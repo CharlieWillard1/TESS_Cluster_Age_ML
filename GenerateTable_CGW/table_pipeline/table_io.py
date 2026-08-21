@@ -6,6 +6,13 @@ from astropy.table import Table
 
 
 _DROP_COLS = ['gp_result', 'GP_PSD_binned', 'GP_PSD_bin_ratios']
+
+# Legacy column names -> current names.  Applied on load so tables written before a
+# rename stay usable without regenerating them.  Pure renames only: anything needing
+# a value transformation does not belong here.
+_COLUMN_ALIASES = {
+    'LSP_FAP': 'LSP_FAP_power',   # holds a power level, not a probability
+}
 _ARRAY_COLS = ['LC_t', 'LC_flux', 'LC_flux_err', 'LSP_freq', 'LSP_power', 'GP_freq', 'GP_PSD']
 
 # FITS 'P' (32-bit) variable-length-array descriptors address at most ~4 GiB of
@@ -15,6 +22,13 @@ _ARRAY_COLS = ['LC_t', 'LC_flux', 'LC_flux_err', 'LSP_freq', 'LSP_power', 'GP_fr
 # before the real limit so there's room to switch to save_as_pickle.
 _HEAP_WARN_BYTES  = 1_500_000_000   # 1.5 GB
 _HEAP_ERROR_BYTES = 3_500_000_000   # 3.5 GB
+
+
+def _apply_column_aliases(df):
+    """Rename legacy columns on load so older tables stay usable."""
+    present = {k: v for k, v in _COLUMN_ALIASES.items()
+               if k in df.columns and v not in df.columns}
+    return df.rename(columns=present) if present else df
 
 
 def _estimate_heap_bytes(df, cols):
@@ -51,6 +65,7 @@ def save_as_fits(df, path):
     _vla_cols = _ARRAY_COLS + [
         'gp_periods', 'gp_sho_sigmas', 'gp_sho_omegas', 'gp_sho_Qs',
         'gp_initial_lsp_peak_periods',
+        'gamma_p_persector', 'g1_int_persector',
     ]
     for col in _vla_cols:
         if col not in df.columns:
@@ -100,6 +115,7 @@ def save_as_pickle(df, path):
 def load_from_pickle(path):
     """Load cluster table previously saved with save_as_pickle."""
     df = pd.read_pickle(path)
+    df = _apply_column_aliases(df)
     print(f"[table_io] loaded {len(df)} rows from {path}")
     return df
 
@@ -140,6 +156,7 @@ def load_from_fits(path):
     if 'sectors' in df.columns:
         df['sectors'] = df['sectors'].apply(ast.literal_eval)
 
+    df = _apply_column_aliases(df)
     print(f"[table_io] loaded {len(df)} rows from {path}")
     return df
 
@@ -205,6 +222,7 @@ def load_from_hdf5(path):
     df = pd.DataFrame(rows)
     if 'sectors' in df.columns:
         df['sectors'] = df['sectors'].apply(ast.literal_eval)
+    df = _apply_column_aliases(df)
     print(f"[table_io] loaded {len(df)} rows from {path}")
     return df
 

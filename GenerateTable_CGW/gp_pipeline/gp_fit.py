@@ -80,6 +80,50 @@ def _unpack_rn_comp(theta, n_components):
     return {"sigma": sigma, "period": period, "omega": 2.0 * jnp.pi / period, "Q": _RN_Q}
 
 
+def sho_psd(freq, sigma, omega0, Q):
+    """One-sided analytic PSD of a ``tinygp.kernels.quasisep.SHO`` component.
+
+    Single source of truth for the SHO power spectrum.  Lives next to
+    ``build_multi_sho_gp`` so the kernel and its spectrum cannot drift apart::
+
+                            4 * sigma^2 * omega0^3
+        S(f) = -------------------------------------------------------
+                Q * ( (w^2 - omega0^2)^2 + w^2 * omega0^2 / Q^2 )
+
+    with ``w = 2*pi*freq``.  Asymptotically ``S ~ f^-4``, matching the kernel.
+
+    Normalisation is fixed by the kernel itself: ``sigma`` is the process standard
+    deviation (``k(0) == sigma^2``), so the one-sided PSD integrates back to the
+    variance, ``integral_0^inf S(f) df == sigma^2``.  The prefactor was obtained by
+    solving that condition numerically; ``A * Q / period == 2/pi`` is universal in Q.
+
+    Historical note: this previously carried ``(omega0^2 + w^2)`` in the numerator,
+    which falls as ``f^-2`` and disagreed with the fitted kernel by up to ~2.2 dex
+    inside the 0.1-12 /day band.  The fits themselves were never affected -- the
+    likelihood uses the real kernel -- only the reported spectra.
+
+    Parameters
+    ----------
+    freq : array-like
+        Frequencies in 1/day.
+    sigma : float
+        Component amplitude; the standard deviation of that component.
+    omega0 : float
+        Angular frequency in rad/day (``2*pi/period``).
+    Q : float
+        Quality factor.
+
+    Returns
+    -------
+    ndarray
+        PSD in units of ``sigma^2 * day``.
+    """
+    omega = 2.0 * np.pi * np.asarray(freq, dtype=float)
+    numer = 4.0 * sigma ** 2 * omega0 ** 3
+    denom = Q * ((omega ** 2 - omega0 ** 2) ** 2 + omega ** 2 * omega0 ** 2 / Q ** 2)
+    return numer / denom
+
+
 def build_multi_sho_gp(theta, x, yerr, n_components, has_red_noise=False):
     comps, jitter = unpack_theta(theta, n_components)
 
@@ -503,6 +547,7 @@ def find_all_significant_peaks(
     white_noise_threshold,
     harmonic_tolerance=0.10,
     harmonic_masking=True,
+    continuum=None,
 ):
     """
     Iteratively find all LSP peaks above `white_noise_threshold`.
@@ -514,16 +559,32 @@ def find_all_significant_peaks(
     next peak).  Set harmonic_masking=False to allow harmonic peaks to appear
     in the output.
 
+    Parameters
+    ----------
+    continuum : ndarray or None
+        If given, peaks are ORDERED by ``power - continuum`` instead of by
+        ``power - white_noise_threshold``.  Acceptance is unchanged: a peak is kept
+        only while ``power > white_noise_threshold``.
+
+        This separates the two jobs the statistic was doing.  Ordering by
+        ``power - gamma*C`` over-subtracts the continuum by gamma (~12.7), which
+        penalises low frequencies far more than high ones and biases selection toward
+        short periods.  Ordering by ``power - C`` is unbiased: for a signal added
+        independently to red noise, E[P - C] = S is the same at every frequency, so a
+        sinusoid of fixed physical amplitude competes equally regardless of period.
+
     Returns
     -------
     peaks : list of dicts [{freq, period, power}, ...]
-        Significant peaks in descending power order.
+        Significant peaks in descending order of the ordering statistic.
     masked_windows : list of (f_lo, f_hi) tuples
         Frequency intervals that were masked out during the search.
         Useful for visualising which regions were suppressed.
     """
     freq = np.asarray(freq)
     power = np.asarray(power)
+    if continuum is not None:
+        continuum = np.asarray(continuum)
 
     mask = np.ones(len(freq), dtype=bool)  # True = still searchable
     peaks = []
@@ -532,7 +593,27 @@ def find_all_significant_peaks(
     harmonics = [1.0, 2.0, 3.0, 4.0, 0.5, 1.0 / 3.0] if harmonic_masking else [1.0]
 
     while True:
-        if np.isscalar(white_noise_threshold):
+        if continuum is not None:
+            # Unbiased ordering: largest excess over the CONTINUUM, not over the scaled
+            # threshold.
+            #
+            # The ordering must be restricted to bins that already pass the threshold.
+            # When ordering and acceptance use the SAME quantity (the other branches),
+            # argmax failing the test proves no bin passes, so the loop can terminate on
+            # it.  That proof does not hold here: the bin maximising P - C may fail
+            # P > threshold while a different bin passes.  Selecting among eligible bins
+            # only makes termination depend on the order-independent question "is any bin
+            # significant?", which is what keeps this mode consistent with 'red_noise'.
+            thr = (np.asarray(white_noise_threshold)
+                   if not np.isscalar(white_noise_threshold)
+                   else np.full(len(power), float(white_noise_threshold)))
+            eligible = mask & (power > thr)
+            if not eligible.any():
+                break
+            masked_excess = np.where(eligible, power - continuum, -np.inf)
+            idx = int(np.argmax(masked_excess))
+            t_idx = float(thr[idx])
+        elif np.isscalar(white_noise_threshold):
             # Scalar: highest absolute power is the right candidate
             masked_power = np.where(mask, power, -np.inf)
             idx = int(np.argmax(masked_power))
@@ -643,6 +724,7 @@ def iterative_sho_gp_fit(
     wn_threshold=None,
     fap_threshold=None,
     red_noise_params=None,
+    excess_frac=1.0,
     max_components=6,
     min_period=1/24,
     max_period=10.0,
@@ -682,10 +764,10 @@ def iterative_sho_gp_fit(
         Pre-computed LSP frequency grid (1/day) from the table's LSP_freq column.
     lsp_power : array-like
         Pre-computed LSP power from the table's LSP_power column.
-    threshold_mode : {'white_noise', 'fap', 'red_noise'}
+    threshold_mode : {'white_noise', 'fap', 'red_noise', 'red_noise_subtracted'}
         Which significance threshold to use for peak detection.
         'white_noise' : scalar 99th-pct bootstrap max (LSP_WN_threshold).
-        'fap'         : scalar 1% FAP analytic threshold (LSP_FAP / Baluev).
+        'fap'         : scalar 1% FAP analytic threshold (LSP_FAP_power / Baluev).
         'red_noise'   : per-frequency Vaughan 1% significance (LSP_red_noise_params).
     wn_threshold : float, optional
         Required when threshold_mode='white_noise'.
@@ -693,6 +775,32 @@ def iterative_sho_gp_fit(
         Required when threshold_mode='fap'.
     red_noise_params : tuple, optional
         (log10_N, alpha, P_N_empirical, P_N_theoretical) from LSP_red_noise_params.
+        Required for 'red_noise' and 'red_noise_subtracted'.
+    excess_frac : float, default 1.0
+        Only used by threshold_mode='red_noise_subtracted'.  Peaks are accepted while
+        P - C > k*C, with the threshold expressed as a FRACTION of the significance
+        gate so the caller never needs gamma (which depends on len(freq) and so is not
+        knowable outside this function)::
+
+            k = excess_frac * (gamma - 1)
+
+          1.0 : the 1% significance gate.  Identical to the 'red_noise' acceptance
+                (P/C > gamma), so the two modes find the SAME peaks and differ only in
+                the order they are seeded.  Default.
+          0.0 : pure subtraction -- every bin above the continuum qualifies.
+          0.5 : halfway between, in k.
+          >1  : stricter than the 1% gate.
+
+        NOTE: the parameter is linear in the threshold but *exponential* in how many
+        bins pass, since the null acceptance rate is exp(-(1+k)).  For a typical
+        N_f = 3200 bins the expected number of pure-noise bins accepted is::
+
+            excess_frac  0.00   0.25    0.50    0.75    1.00
+            null bins    1178     64     3.4    0.19    0.01
+
+        So 0.5 is already close to the significance end, not the midpoint in practice,
+        and 0.0 is qualitatively different: the search then never self-terminates and
+        runs to max_components on every row, including pure noise.
         Required when threshold_mode='red_noise'.
     verbose : int
         0 = silent (default). 1 = peak list, per-fit BIC/timing, early-stop reason.
@@ -707,6 +815,7 @@ def iterative_sho_gp_fit(
     power_arr = np.asarray(lsp_power)
 
     # Resolve threshold based on mode
+    peak_continuum = None       # only 'red_noise_subtracted' orders by P - C
     if threshold_mode == 'white_noise':
         peak_threshold = float(wn_threshold)
     elif threshold_mode == 'fap':
@@ -716,9 +825,27 @@ def iterative_sho_gp_fit(
         P_model = 10**log10_N * freq_arr**(-alpha)
         gamma   = -np.log(1 - 0.99**(1 / len(freq_arr)))
         peak_threshold = P_model * gamma   # ndarray, per-frequency
+    elif threshold_mode == 'red_noise_subtracted':
+        log10_N, alpha, _, _ = red_noise_params
+        P_model = 10**log10_N * freq_arr**(-alpha)
+        gamma   = -np.log(1 - 0.99**(1 / len(freq_arr)))
+        try:
+            frac = float(excess_frac)
+        except (TypeError, ValueError):
+            raise ValueError(f"excess_frac must be a number, got {excess_frac!r}")
+        if not np.isfinite(frac) or frac < 0:
+            raise ValueError(f"excess_frac must be finite and >= 0, got {excess_frac!r}")
+        # frac = 1 -> k = gamma-1 -> acceptance identical to 'red_noise'
+        # frac = 0 -> k = 0       -> every bin above the continuum
+        k = frac * (gamma - 1.0)
+        # Accept while P - C > k*C, i.e. P > (1+k)*C.  Order by P - C (see
+        # find_all_significant_peaks), which is the unbiased locator.
+        peak_threshold = (1.0 + k) * P_model
+        peak_continuum = P_model
     else:
         raise ValueError(
-            f"threshold_mode must be 'white_noise', 'fap', or 'red_noise', got {threshold_mode!r}"
+            "threshold_mode must be 'white_noise', 'fap', 'red_noise', or "
+            f"'red_noise_subtracted', got {threshold_mode!r}"
         )
 
     scalar_repr = float(np.mean(peak_threshold)) if not np.isscalar(peak_threshold) else peak_threshold
@@ -743,6 +870,7 @@ def iterative_sho_gp_fit(
         peak_threshold,
         harmonic_tolerance=harmonic_tolerance,
         harmonic_masking=harmonic_masking,
+        continuum=peak_continuum,
     )
 
     n = min(len(all_peaks), max_components)

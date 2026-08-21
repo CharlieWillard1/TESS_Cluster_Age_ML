@@ -101,12 +101,10 @@ def _process_one_cluster_row(name, age, origin, lc_dir, f_max, seed, shuffle,
                         'LC_flux_err':            flux_err,
                         'LSP_freq':               lsp_dict['freqs'],
                         'LSP_power':              lsp_dict['power'],
-                        'LSP_FAP':                lsp_dict['fap_threshold'],
+                        'LSP_FAP_power':                lsp_dict['fap_threshold'],
                         'LSP_WN_threshold':       wn_threshold,
                         'rn_log10_N':             red_noise_params[0],
                         'rn_alpha':               red_noise_params[1],
-                        'rn_P_empirical':         red_noise_params[2],
-                        'rn_P_theoretical':       red_noise_params[3],
                     })
                     n_ok += 1
                 except Exception as e:
@@ -181,8 +179,11 @@ def expand_table(base_table, lc_dir=LC_BASE,
     -------
     pd.DataFrame
         Columns: name, age, origin, sectors, n_sectors, cadence,
-        LC_t, LC_flux, LC_flux_err, LSP_freq, LSP_power, LSP_FAP,
-        LSP_WN_threshold, rn_log10_N, rn_alpha, rn_P_empirical, rn_P_theoretical.
+        LC_t, LC_flux, LC_flux_err, LSP_freq, LSP_power, LSP_FAP_power,
+        LSP_WN_threshold, rn_log10_N, rn_alpha.
+
+        ``rn_P_empirical`` / ``rn_P_theoretical`` are no longer emitted -- they were
+        constant (1.0 exactly, and 1.000 +/- 0.003) and unused downstream.
     """
     n_clusters = len(base_table)
     print(f"[expand_table] {n_clusters} clusters  |  n_workers={n_workers}")
@@ -229,8 +230,8 @@ def expand_table(base_table, lc_dir=LC_BASE,
     if not rows:
         return pd.DataFrame(columns=[
             'name', 'age', 'origin', 'sectors', 'n_sectors', 'cadence',
-            'LC_t', 'LC_flux', 'LC_flux_err', 'LSP_freq', 'LSP_power', 'LSP_FAP',
-            'LSP_WN_threshold', 'rn_log10_N', 'rn_alpha', 'rn_P_empirical', 'rn_P_theoretical',
+            'LC_t', 'LC_flux', 'LC_flux_err', 'LSP_freq', 'LSP_power', 'LSP_FAP_power',
+            'LSP_WN_threshold', 'rn_log10_N', 'rn_alpha',
         ])
 
     return pd.DataFrame(rows)

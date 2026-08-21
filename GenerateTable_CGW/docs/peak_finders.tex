@@ -1,0 +1,442 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\newcommand{\Praw}{\texttt{LSP\_peak\_period}}
+\newcommand{\Prn}{\texttt{LSP\_peak\_period\_rn}}
+\newcommand{\Srn}{\texttt{LSP\_peak\_snr\_rn}}
+
+\title{Three Ways to Find a Periodogram Peak:\\
+       Raw, Continuum-Divided, and Continuum-Subtracted}
+\author{\texttt{GenerateTable\_CGW}}
+\date{2026 August 20}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The pipeline stores two peak periods --- \Praw{} (maximum of the raw periodogram) and
+\Prn{} (maximum of the continuum-normalised periodogram) --- and they disagree
+substantially. This note evaluates both against a third option, continuum
+\emph{subtraction}, using an injection--recovery experiment. The result is that the raw
+periodogram is biased toward long periods, the continuum-divided periodogram is biased
+toward short periods, and the continuum-\emph{subtracted} periodogram
+$P(f)-C(f)$ is the one whose recovery is flat in period and therefore reproduces the
+input period distribution regardless of its shape. An earlier version of this note argued
+from null-hypothesis variance that subtraction offered nothing over the raw
+periodogram; that argument was wrong and is corrected in \S6.
+\end{abstract}
+
+% ===========================================================================
+\section{Setup}
+% ===========================================================================
+
+Let $P(f_j)$ be the observed Lomb--Scargle power on the linear grid
+$f_j \in [0.1, 12]$ d$^{-1}$ ($N_f \simeq 3200$ bins, median), and let
+%
+\begin{equation}
+  C(f) = 10^{\log_{10}N} f^{-\alpha}
+  \label{eq:continuum}
+\end{equation}
+%
+be the fitted red-noise continuum. With
+$\gamma = -\ln[1-(1-\mathrm{FAP})^{1/N_f}] \simeq 12.7$ at $\mathrm{FAP}=0.01$, the 1\%
+significance threshold is $T(f) = C(f)\gamma$. The three peak-finders are
+%
+\begin{align}
+  \text{(a) raw:}\qquad
+    f^{\ast}_{\rm raw}   &= \arg\max_f \; P(f)
+    &&\Rightarrow\;\; \Praw
+    \label{eq:fraw}\\[3pt]
+  \text{(b) ratio:}\qquad
+    f^{\ast}_{\rm ratio} &= \arg\max_f \; P(f)/C(f)
+    &&\Rightarrow\;\; \Prn
+    \label{eq:fratio}\\[3pt]
+  \text{(c) difference:}\qquad
+    f^{\ast}_{\rm diff}  &= \arg\max_f \; \left[P(f) - C(f)\right]
+    &&\text{(not currently implemented)}
+    \label{eq:fdiff}
+\end{align}
+%
+$\gamma$ is a per-row constant, so dividing by $T(f)$ or $C(f)$ gives the same
+$\arg\max$; only the reported value \Srn{} differs by that factor. Because
+$C(f)\propto f^{-\alpha}$, statistic (b) is equivalent to maximising
+$P(f)\cdot f^{\alpha}$ --- a monotonically increasing gain across the band, a factor of
+$120$ at the median $\alpha \simeq 1$.
+
+% ===========================================================================
+\section{What ``unbiased'' means here}
+% ===========================================================================
+
+Let $R(P) = \Pr(\text{peak recovered} \mid P_{\rm true}=P)$ be the recovery probability of
+a finder. Injecting signals drawn from a distribution $p_{\rm true}(P)$, the recovered
+population has density
+%
+\begin{equation}
+  p_{\rm rec}(P) \;\propto\; p_{\rm true}(P)\, R(P) .
+  \label{eq:selection}
+\end{equation}
+%
+Hence
+%
+\begin{equation}
+  \boxed{\;R(P) = \text{const} \iff p_{\rm rec} \propto p_{\rm true}\;}
+  \label{eq:unbiased}
+\end{equation}
+%
+A \emph{flat} recovery curve is exactly the condition under which the recovered periods
+reproduce the true distribution, whatever that distribution happens to be --- uniform in
+$P$, uniform in $\log P$, or anything else. Any period-dependence in $R$ reweights the
+population and distorts it.
+
+Two distinctions matter. Flat is not the same as \emph{high}: a finder with
+$R = 0.35$ everywhere is unbiased but recovers only a third of injections; flatness
+measures bias, height measures statistical power. And this is \emph{selection} bias ---
+whether a signal is found at all --- not estimator bias; conditional on recovery all three
+finders return the correct period to within the grid resolution.
+
+% ===========================================================================
+\section{Null behaviour: why the three differ at all}
+% ===========================================================================
+
+Periodogram noise is \emph{multiplicative} in the continuum. Under the null of red noise
+with no coherent signal,
+%
+\begin{equation}
+  P(f) = C(f)\,X(f), \qquad X(f)\sim\mathrm{Exp}(1) \;\;\text{i.i.d.}
+  \label{eq:null}
+\end{equation}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{llll}
+\toprule
+Statistic & Under $H_0$ & $\mathbb{E}$ & $\mathrm{Var}$ \\
+\midrule
+$P(f)$      & $C(f)X$     & $C(f)$ & $C(f)^2$ \\
+$P(f)/C(f)$ & $X$         & $1$    & $1$ \\
+$P(f)-C(f)$ & $C(f)(X-1)$ & $0$    & $C(f)^2$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Only the ratio is homoscedastic, so it is the correct \emph{significance} statistic: its
+null distribution is identical at every frequency and its $\arg\max$ is uniform over bins
+under $H_0$. This is a statement about the null only. As \S5 shows, it does not determine
+which statistic best \emph{locates a signal}.
+
+\paragraph{Uniform over bins is not uniform over period.}
+The grid is linear in frequency, so bin density is uniform in $f$ and highly non-uniform
+in period:
+%
+\begin{equation}
+  \Pr\left(P_{\rm bin} > P_0\right) = \frac{1/P_0 - f_{\min}}{f_{\max}-f_{\min}} .
+  \label{eq:griddensity}
+\end{equation}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lr}
+\toprule
+Period range & Share of grid bins \\
+\midrule
+$P > 2.5$ d               & 2.5\% \\
+$P > 1$ d                 & 7.6\% \\
+$0.167 < P < 1$ d         & 41.9\% \\
+$P < 0.167$ d $(f>6)$     & \textbf{50.4\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+So under $H_0$ the ratio's $\arg\max$ exceeds one day only $7.6\%$ of the time --- a
+property of the grid, removable by regridding uniformly in $\log f$, not a defect of the
+statistic.
+
+% ===========================================================================
+\section{How each statistic treats a signal}
+% ===========================================================================
+
+Null behaviour alone does not settle peak-finding. What matters is how the signal enters
+each statistic, and that follows directly from the physical model.
+
+\subsection{The additive-signal model}
+
+Take the physical model to be a periodic signal added independently to a red-noise
+background,
+%
+\begin{equation}
+  x(t) = s(t) + n(t) .
+  \label{eq:additive}
+\end{equation}
+%
+The periodogram is $P = |\,\tilde{S} + \tilde{N}\,|^{2}$, so
+%
+\begin{equation}
+  P = |\tilde{S}|^{2} + |\tilde{N}|^{2} + 2\,\mathrm{Re}\!\left(\tilde{S}\tilde{N}^{*}\right),
+  \qquad
+  \mathbb{E}\!\left[\tilde{N}\right] = 0 ,
+  \label{eq:expand}
+\end{equation}
+%
+and the signal--noise cross term averages to zero. Writing $S \equiv |\tilde{S}|^{2}$ for
+the sinusoid's periodogram power and $C(f) = \mathbb{E}[\,|\tilde{N}|^{2}\,]$ for the
+red-noise continuum, the expectation at the true signal frequency is
+%
+\begin{equation}
+  \mathbb{E}\!\left[P(f_{\rm rot})\right] \;\simeq\; C(f_{\rm rot}) + S .
+  \label{eq:Eraw}
+\end{equation}
+
+\paragraph{Subtraction isolates the signal.}
+Subtracting the expected continuum gives
+%
+\begin{equation}
+  \boxed{\;\mathbb{E}\!\left[P(f) - C(f)\right] \;\simeq\; S\;}
+  \label{eq:Ediff}
+\end{equation}
+%
+so a sinusoid of fixed physical amplitude has approximately the \emph{same} expected
+excess power regardless of its period. This is what makes subtraction the natural peak
+finder when the goal is to recover the strongest periodic component without imposing a
+frequency-dependent weighting inherited from the red-noise continuum.
+
+\paragraph{The ratio measures conspicuousness, not amplitude.}
+Dividing instead gives
+%
+\begin{equation}
+  \mathbb{E}\!\left[\frac{P(f)}{C(f)}\right] \;\simeq\; 1 + \frac{S}{C(f)} ,
+  \label{eq:Eratio}
+\end{equation}
+%
+which asks how large a peak is \emph{relative to the local red-noise background}. The same
+sinusoid is amplified where the continuum is weak and suppressed where it is strong. For a
+red-noise spectrum falling toward high frequency, this preferentially favours
+high-frequency signals even when their physical amplitudes are identical. The ratio is
+therefore the right statistic for detection significance or conspicuousness against the
+noise, but it is not a neutral peak locator if the objective is to recover the underlying
+population of sinusoidal signals without period-dependent selection.
+
+\subsection{Competition against the null}
+
+Combining \eqref{eq:Eraw}--\eqref{eq:Eratio} with the null distributions of \S3, the
+signal at $f_{\rm rot}$ competes against the null fluctuations as follows:
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lll}
+\toprule
+Finder & Height at the peak & Competes against \\
+\midrule
+(a) raw        & $C(f_{\rm rot}) + S$   & $\max_f C(f)X(f)$ \\
+(b) ratio      & $1 + S/C(f_{\rm rot})$ & $\max_f X(f)$ \\
+(c) difference & $S$                    & $\max_f C(f)(X(f)-1)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The raw statistic gives the peak an additive $C(f_{\rm rot})$ \emph{boost}, which is
+largest at long periods and helps long-period signals win. The ratio applies a
+$1/C(f_{\rm rot})$ \emph{gain}, which is largest at short periods. The difference applies
+neither: the signal enters at its own amplitude, with no period-dependent rescaling. Its
+noise floor is still low-$f$ heavy, but it has given up the low-$f$ boost, and the two
+effects largely cancel.
+
+This predicts (a) biased long, (b) biased short, (c) approximately flat --- which is what
+is observed in \S5.
+
+The conditional matters: \eqref{eq:Ediff} holds because the model \eqref{eq:additive}
+treats the signal as \emph{added independently} to the red noise. Where that assumption
+fails --- for instance if the low-frequency continuum is itself generated by the same
+rotation-linked processes (spot evolution, active-region growth and decay, differential
+rotation) rather than being an independent nuisance background --- then $C(f)$ carries
+signal, and subtracting it removes part of what is being measured. The recommendation in
+\S8 is conditional on the additive model being the right description.
+
+% ===========================================================================
+\section{Injection--recovery experiment}
+% ===========================================================================
+
+A single coherent sinusoid of \emph{fixed absolute amplitude} is injected on
+$\alpha=1$ red noise, sampled at real TESS timestamps ($N=1305$ points, $T=27.9$ d,
+$N_f=3314$), with white noise drawn from the real per-point uncertainties. The red-noise
+level is set so that $\mathrm{Var}[x]/\langle\sigma^2\rangle\simeq5$, matching the table
+median. Amplitudes are quoted in units of the red-noise RMS $\sigma_{\rm red}$. Recovery
+means $|P_{\rm rec}/P_{\rm true}-1| < 5\%$; $700$ trials per configuration.
+
+Fixed absolute amplitude is the physically appropriate injection for rotation: a starspot
+of given filling factor produces a modulation of given fractional amplitude regardless of
+the rotation period.
+
+\begin{table}[htbp]
+\centering
+\caption{Recovery fraction by true period, at the amplitude where detection is partial
+and bias is therefore visible. A flat row is unbiased.}
+\begin{tabular}{llrrrr}
+\toprule
+$p_{\rm true}$ & Finder & $0.15$--$0.4$ d & $0.4$--$1$ d & $1$--$2.5$ d & $2.5$--$8$ d \\
+\midrule
+log-uniform    & (a) raw        & 0.182 & 0.216 & 0.329 & 0.305 \\
+$A=0.3\,\sigma_{\rm red}$
+               & (b) ratio      & 1.000 & 0.898 & 0.604 & 0.181 \\
+               & (c) difference & \textbf{0.473} & \textbf{0.438} & \textbf{0.530} & \textbf{0.348} \\
+\midrule
+linear-uniform & (a) raw        & 0.000 & 0.184 & 0.342 & 0.314 \\
+$A=0.3\,\sigma_{\rm red}$
+               & (b) ratio      & 1.000 & 0.939 & 0.521 & 0.139 \\
+               & (c) difference & \textbf{0.294} & \textbf{0.347} & \textbf{0.493} & \textbf{0.330} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The raw finder rises monotonically with period; the ratio falls monotonically, spanning a
+factor of $5.5$ (log-uniform) to $7.2$ (linear-uniform) across the bins; the difference is
+flat to within a factor of $1.5$--$1.7$. Critically, (c) is flat under \emph{both} input
+distributions, which is the property \eqref{eq:unbiased} requires.
+
+The $0.000$ entry for raw under linear-uniform truth is zero recoveries out of $\sim19$
+trials --- linear-uniform sampling barely populates the shortest bin --- so it should be
+read as ``never recovered'' rather than as a precise rate.
+
+\begin{table}[htbp]
+\centering
+\caption{Amplitude dependence, log-uniform truth. Bias vanishes once every signal is
+strong enough to be found regardless of method.}
+\begin{tabular}{lrrr}
+\toprule
+$A/\sigma_{\rm red}$ & raw & ratio & difference \\
+\midrule
+$0.2$ & 0.006--0.176 & 0.897--0.052 & 0.073--0.215 \\
+$0.3$ & 0.182--0.329 & 1.000--0.181 & 0.348--0.530 \\
+$0.5$ & 0.705--0.927 & 0.590--1.000 & 0.719--0.988 \\
+$0.8$ & 0.952--1.000 & 0.919--1.000 & 0.952--1.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+By $A = 0.8\,\sigma_{\rm red}$ all three recover $\gtrsim95\%$ everywhere and the choice
+is immaterial. The distinction matters only in the marginal-detection regime --- which is
+where the real data predominantly sit (\S7).
+
+% ===========================================================================
+\section{Correction to the previous version of this note}
+% ===========================================================================
+
+An earlier version argued that subtraction was ``not a fix'' and ``theoretically worse''
+than the raw periodogram. Two errors:
+
+\paragraph{The variance argument was applied to the wrong regime.}
+From $P-C = C(X-1)$ it follows that the difference statistic has null variance $C(f)^2$
+and so, \emph{under $H_0$}, prefers low frequencies just as the raw periodogram does. That
+is correct, and it is what \S3 states. But peak-finding performance is set by the
+signal-versus-null competition of \S4, not by null variance alone. The difference
+statistic forfeits the additive $C(f_{\rm rot})$ boost that biases the raw finder long,
+and that is what flattens it.
+
+\paragraph{The supporting measurement characterised the null, not the signal.}
+The earlier claim rested on the observation that on real data the raw and difference
+finders agree to within $2\%$ for $92.2\%$ of rows (versus $53.5\%$ for raw against
+ratio). But only $8.6\%$ of rows contain a formally significant peak (\S7), so that
+agreement statistic is dominated by rows where no signal exists and both finders are
+tracking the same $C(f)$ structure. Agreement in the null implies nothing about which
+finder locates a real signal.
+
+% ===========================================================================
+\section{Behaviour on the real table}
+% ===========================================================================
+
+All three finders on the same $1250$ rows:
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Finder & median & 25\% & 75\% & $\Pr(P>1\,\mathrm{d})$ & $\Pr(P<0.167\,\mathrm{d})$ \\
+\midrule
+(a) raw        & 2.581 & 1.391 & 4.071 & 0.814 & 0.026 \\
+(b) ratio      & 0.828 & 0.253 & 2.142 & 0.462 & 0.190 \\
+(c) difference & 2.298 & 1.296 & 3.791 & 0.793 & 0.027 \\
+\midrule
+$H_0$ (uniform over bins) & --- & --- & --- & 0.076 & 0.504 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The stored column is $\Srn = \max_f P/(C\gamma)$ --- $\gamma$ is \emph{already divided
+out} --- so the detection criterion is $\Srn > 1$, not $\Srn > \gamma$. On that criterion
+$794/1250 = 63.5\%$ of rows contain a significant peak.
+
+\begin{table}[htbp]
+\centering
+\caption{Peak period by finder, split on significance ($\Srn > 1$).}
+\begin{tabular}{lrrrrrr}
+\toprule
+ & \multicolumn{3}{c}{median period (d)} & \multicolumn{3}{c}{agreement within 2\%} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Subset & raw & ratio & diff & raw--ratio & raw--diff & ratio--diff \\
+\midrule
+significant \;($n=794$)     & 2.106 & 1.175 & 1.961 & 0.674 & 0.941 & 0.694 \\
+not significant \;($n=456$) & 3.487 & 0.358 & 3.196 & 0.294 & 0.888 & 0.325 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On the significant subset the difference finder gives the strongest correlation with age
+of the three --- Spearman $-0.158$, against $-0.149$ (ratio) and $-0.089$ (raw) --- which
+is the ordering the bias analysis predicts, and it agrees with the raw finder for
+$94.1\%$ of rows.
+
+\paragraph{Correction to an earlier version.}
+This section previously reported that only $8.6\%$ of rows ($n=107$) were significant,
+with a significant-subset median period of $0.456$ d and raw--ratio agreement of
+$90.7\%$. Those figures came from gating at $\Srn > \gamma$, which --- since $\gamma$ is
+already divided out of the stored column --- actually tests $\max_f P/C > \gamma^2 \simeq
+160$ and selects only the extreme tail. A hypothesis was then built on that tail: that in
+\emph{integrated} cluster photometry a single bright eclipsing or contact binary imposes a
+coherent short-period peak on the summed light, while ensemble rotation superposes
+incoherently into the red-noise continuum. That reading may still hold \emph{for the
+$\gamma^2$ tail}, whose peaks genuinely are short, but it does not describe the bulk of
+detections: the $794$ significant rows have a median raw period of $2.106$ d, entirely
+consistent with rotation. The hypothesis no longer explains what it was introduced to
+explain and should not be carried forward without independent evidence.
+
+% ===========================================================================
+\section{Recommendations}
+% ===========================================================================
+
+\begin{description}
+  \item[Implement $P(f)-C(f)$.] Use continuum subtraction when the physical model is a
+        periodic signal added independently to a red-noise background, \eqref{eq:additive}.
+        Under that model $\mathbb{E}[P-C]\simeq S$ by \eqref{eq:Ediff}, so a sinusoid of
+        fixed physical amplitude carries the same expected excess power at any period; it
+        is consequently the unbiased peak-finder by the criterion \eqref{eq:unbiased},
+        flat under both log- and linear-uniform truth, and the only one of the three whose
+        recovered period distribution reproduces the underlying population. It is a cheap
+        post-hoc column computed from already-stored arrays.
+  \item[Keep \Srn{} as the detection gate.] By \eqref{eq:Eratio} the ratio measures
+        conspicuousness relative to the local noise, which is exactly what a significance
+        statistic should measure. It remains the correct one, and identifies the $8.6\%$
+        of rows where any peak period is meaningful. Its unsuitability as a peak
+        \emph{locator} is a separate matter from its suitability as a detection statistic.
+  \item[Keep \Praw{} for continuity,] but note it is biased toward long periods; its
+        apparent suitability for rotation is a coincidence of that bias aligning with the
+        physical prior.
+  \item[Interpret \Prn{} only when gated.] Ungated it is largely a null draw; gated it is
+        nearly redundant with \Praw{}.
+\end{description}
+
+\paragraph{Caveats.}
+The injected signal was a pure coherent sinusoid; real spot modulation is quasi-periodic
+with finite coherence time, which will reduce recovery for all three and could shift their
+relative ordering. The injected continuum was exactly the $\alpha=1$ power law the fitter
+assumes, so the experiment does not capture model misspecification. Finally,
+\texttt{\_fit\_red\_noise\_vaughan} fits \emph{all} bins including real peaks, so a strong
+peak inflates $C$ at its own frequency and steepens $\alpha$; every statistic that divides
+or subtracts $C$ inherits this, and masking the dominant peak before fitting would be the
+correct treatment.
+
+\end{document}

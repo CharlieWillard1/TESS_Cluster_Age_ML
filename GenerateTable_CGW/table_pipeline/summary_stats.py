@@ -31,6 +31,24 @@ def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
         sigma_obs       : observed standard deviation (before noise correction)
         rms_obs         : observed RMS around 1 (before noise correction)
         sigma_mad_obs   : observed MAD scaled to Gaussian sigma (1.4826 * MAD)
+        mean_median_offset : mean(x) - median(x); the signed asymmetry of the flux
+                          distribution. Since normalize_flux sets median(x) = 1,
+                          this is exactly the term by which intrinsic_rms exceeds
+                          intrinsic_std:  intrinsic_rms^2 = intrinsic_std^2 +
+                          mean_median_offset^2 (where neither hit the max(0,.) floor).
+        gamma_p         : Pearson nonparametric skew, mean_median_offset / sigma_obs.
+                          Negative for dip-dominated (spot-like) light curves, positive
+                          for flare-dominated ones. NaN when sigma_obs == 0.
+                          Note: sigma_obs is the *observed* scatter, so gamma_p is
+                          diluted toward 0 at low photometric SNR.
+        excess_var      : sigma_obs^2 - sigma_phot^2, SIGNED and unfloored (contrast
+                          intrinsic_std, which clamps at 0 before the square root).
+                          Negative means no variability detected above the noise.
+        snr             : excess_var / sigma_phot^2, i.e. a variance (power) ratio, not
+                          an amplitude ratio. Signed for the same reason. Supplied as a
+                          model feature so the network can learn the noise dilution of
+                          the statistics that cannot be corrected analytically
+                          (sigma_mad, mean_median_offset, gamma_p).
     """
     x = x_binned.copy()
     sx = err_x_binned.copy()
@@ -62,10 +80,23 @@ def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
     sigma_mad_obs = 1.4826 * mad_obs
     intrinsic_mad = np.sqrt(max(0.0, sigma_mad_obs ** 2 - sigma_phot2))
 
+    # Distribution asymmetry. median(x) == 1 by construction (normalize_flux divides
+    # each sector by its own median), so this is also the exact rms/std excess term.
+    mean_median_offset = float(x.mean() - np.median(x))
+    gamma_p = mean_median_offset / sigma_obs if sigma_obs > 0 else np.nan
+
+    # Excess variance: the same noise subtraction as intrinsic_std, but SIGNED and left
+    # unfloored. The max(0,.) floor used elsewhere piles the quiet end of the sample at
+    # exactly zero and biases the square root upward; V_XS < 0 is a valid measurement of
+    # "no variability detected above the noise" and is kept as such.
+    excess_var = float(sigma_obs2 - sigma_phot2)
+    snr = excess_var / sigma_phot2 if sigma_phot2 > 0 else np.nan
+
     for stat_name, val in [('sigma_phot', sigma_phot), ('sigma_obs', sigma_obs),
                             ('rms_obs', rms_obs), ('sigma_mad_obs', sigma_mad_obs),
                             ('intrinsic_std', intrinsic_std), ('intrinsic_rms', intrinsic_rms),
-                            ('intrinsic_mad', intrinsic_mad)]:
+                            ('intrinsic_mad', intrinsic_mad),
+                            ('mean_median_offset', mean_median_offset)]:
         if not np.isfinite(val):
             print(f"  WARNING [_compute_stats] {stat_name}=NaN/inf  |  "
                   f"N={N}  sigma_phot2={sigma_phot2:.4e}  sigma_obs2={sigma_obs2:.4e}  "
@@ -82,6 +113,10 @@ def _compute_stats(x_binned, err_x_binned, sigma_clip_thresh=None):
         'sigma_obs':      sigma_obs,
         'rms_obs':        rms_obs,
         'sigma_mad_obs':  sigma_mad_obs,
+        'mean_median_offset': mean_median_offset,
+        'gamma_p':        gamma_p,
+        'excess_var':     excess_var,
+        'snr':            snr,
     }
 
 
@@ -275,6 +310,16 @@ def add_variability_metrics(table, sigma_clip_thresh=None):
     n_bins_used         float64   number of points used after sigma-clipping
     vn_ratio_gap_aware  float64   gap-aware inverted von Neumann ratio (1/eta)
     stetson_j_gap_aware float64   gap-aware Stetson J statistic
+    mean_median_offset  float64   mean(x) - median(x); signed distribution asymmetry
+    gamma_p             float64   Pearson nonparametric skew, mean_median_offset/sigma_obs
+    sigma_mad           float64   1.4826 * MAD, raw (NOT noise-corrected; see note)
+    excess_var          float64   sigma_obs^2 - sigma_phot^2, signed and unfloored
+    snr                 float64   excess_var / sigma_phot^2 (variance ratio, signed)
+
+    Note on sigma_mad: unlike intrinsic_mad this is deliberately left uncorrected. The
+    MAD is a quantile statistic and does not add under convolution, so subtracting
+    sigma_phot^2 from it is valid only in the Gaussian limit. The `snr` column carries
+    the noise information instead.
     """
     n_rows = len(table)
     print(f"[add_variability_metrics] processing {n_rows} rows")
@@ -286,6 +331,11 @@ def add_variability_metrics(table, sigma_clip_thresh=None):
     n_bins_vals              = pd.Series(np.nan, index=idx, dtype=float)
     vn_ratio_gap_aware_vals  = pd.Series(np.nan, index=idx, dtype=float)
     stetson_j_gap_aware_vals = pd.Series(np.nan, index=idx, dtype=float)
+    mean_median_offset_vals  = pd.Series(np.nan, index=idx, dtype=float)
+    gamma_p_vals             = pd.Series(np.nan, index=idx, dtype=float)
+    sigma_mad_vals           = pd.Series(np.nan, index=idx, dtype=float)
+    excess_var_vals          = pd.Series(np.nan, index=idx, dtype=float)
+    snr_vals                 = pd.Series(np.nan, index=idx, dtype=float)
 
     n_ok, n_skipped, n_failed = 0, 0, 0
 
@@ -304,6 +354,11 @@ def add_variability_metrics(table, sigma_clip_thresh=None):
             intrinsic_rms_vals[label] = result['intrinsic_rms']
             intrinsic_mad_vals[label] = result['intrinsic_mad']
             n_bins_vals[label]        = result['n_bins']
+            mean_median_offset_vals[label] = result['mean_median_offset']
+            gamma_p_vals[label]            = result['gamma_p']
+            sigma_mad_vals[label]          = result['sigma_mad_obs']
+            excess_var_vals[label]         = result['excess_var']
+            snr_vals[label]                = result['snr']
 
             if t is not None:
                 vn_ratio_gap_aware_vals[label]  = von_neumann_ratio_gap_aware(t, x)
@@ -324,4 +379,9 @@ def add_variability_metrics(table, sigma_clip_thresh=None):
     table['n_bins_used']         = n_bins_vals
     table['vn_ratio_gap_aware']  = vn_ratio_gap_aware_vals
     table['stetson_j_gap_aware'] = stetson_j_gap_aware_vals
+    table['mean_median_offset']  = mean_median_offset_vals
+    table['gamma_p']             = gamma_p_vals
+    table['sigma_mad']           = sigma_mad_vals
+    table['excess_var']          = excess_var_vals
+    table['snr']                 = snr_vals
     return table

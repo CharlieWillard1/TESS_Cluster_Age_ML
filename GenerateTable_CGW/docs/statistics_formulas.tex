@@ -1,0 +1,365 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\title{Variability Statistics: Formulas as Implemented}
+\author{\texttt{GenerateTable\_CGW/table\_pipeline}}
+\date{2026 August 19}
+
+\begin{document}
+\maketitle
+
+Formula reference only. Each equation states the quantity exactly as computed in
+\texttt{summary\_stats.py} and \texttt{sector\_stats.py}, with the emitted column name
+given alongside. Scope is the per-row variability statistics and the normalisation chain
+they depend on; the Lomb--Scargle and red-noise machinery in \texttt{lc\_lsp.py} is not
+covered here.
+
+% ===========================================================================
+\section{Preprocessing (\texttt{lc\_lsp.py})}
+% ===========================================================================
+
+Applied per sector, in this order, before any statistic is computed.
+
+\paragraph{Resampling to $30$\,min --- \texttt{resample\_lc}.}
+Block average over $N_b = \mathrm{round}(30 / \Delta t_{\rm native})$ consecutive
+samples; blocks spanning a gap $>1.5\,\Delta t_{\rm native}$ are discarded entirely.
+%
+\begin{equation}
+  t_j = \frac{1}{N_b}\sum_{i \in b_j} t_i, \qquad
+  f_j = \frac{1}{N_b}\sum_{i \in b_j} f_i, \qquad
+  \varsigma_j = \frac{1}{N_b}\sqrt{\sum_{i \in b_j} \varsigma_i^{2}} .
+\end{equation}
+
+\paragraph{Outlier clipping --- \texttt{mad\_clip\_lc}, $n_\sigma = 4$.}
+Symmetric about the median, with the threshold widened by the per-point error:
+%
+\begin{equation}
+  \sigma_{\rm MAD} = 1.4826 \,\mathrm{med}\!\left(|f - \mathrm{med}(f)|\right),
+  \qquad
+  \text{keep } i \iff
+  \left|f_i - \mathrm{med}(f)\right| < n_\sigma \sqrt{\sigma_{\rm MAD}^{2} + \varsigma_i^{2}} .
+\end{equation}
+
+\paragraph{Median normalisation --- \texttt{normalize\_flux}.}
+%
+\begin{equation}
+  x_i = \frac{f_i}{\mathrm{med}(f)}, \qquad
+  s_i = \frac{\varsigma_i}{\mathrm{med}(f)}
+  \qquad\Longrightarrow\qquad \mathrm{med}(x) = 1 .
+  \label{eq:norm}
+\end{equation}
+%
+Sectors are then concatenated and sorted in time. Since each sector places exactly half
+its samples below its own median, the pooled median is also exactly $1$.
+
+% ===========================================================================
+\section{Pooled statistics (\texttt{summary\_stats.py:\_compute\_stats})}
+% ===========================================================================
+
+Computed on the full stitched array of $N$ samples $\{x_i\}$ with uncertainties
+$\{s_i\}$.
+
+\subsection{Scales}
+
+\begin{align}
+  \sigma_{\rm phot}^{2} &= \frac{1}{N}\sum_{i=1}^{N} s_i^{2}
+  && \texttt{sigma\_phot} = \sigma_{\rm phot}
+  \label{eq:sigphot}\\[4pt]
+  \sigma_{\rm obs}^{2}  &= \frac{1}{N}\sum_{i=1}^{N}\left(x_i - \bar{x}\right)^{2}
+  && \texttt{sigma\_obs} = \sigma_{\rm obs}
+  \label{eq:sigobs}\\[4pt]
+  \mathrm{rms}_{\rm obs}^{2} &= \frac{1}{N}\sum_{i=1}^{N}\left(x_i - 1\right)^{2}
+  && \texttt{rms\_obs}
+  \label{eq:rmsobs}\\[4pt]
+  \sigma_{\rm MAD} &= 1.4826\,\mathrm{med}\!\left(\left|x_i - \mathrm{med}(x)\right|\right)
+  && \texttt{sigma\_mad}
+  \label{eq:sigmad}
+\end{align}
+%
+All central moments use $\mathrm{ddof}=0$. Note $\sigma_{\rm phot}^2$ is the mean of the
+squared errors, not the square of the mean error.
+
+\subsection{Floored amplitudes}
+
+\begin{align}
+  \texttt{intrinsic\_std} &= \sqrt{\max\!\left(0,\;
+      \sigma_{\rm obs}^{2} - \sigma_{\rm phot}^{2}\right)}
+  \label{eq:istd}\\[4pt]
+  \texttt{intrinsic\_rms} &= \sqrt{\max\!\left(0,\;
+      \mathrm{rms}_{\rm obs}^{2} - \sigma_{\rm phot}^{2}\right)}
+  \label{eq:irms}\\[4pt]
+  \texttt{intrinsic\_mad} &= \sqrt{\max\!\left(0,\;
+      \sigma_{\rm MAD}^{2} - \sigma_{\rm phot}^{2}\right)}
+  \label{eq:imad}
+\end{align}
+
+\subsection{Unfloored amplitude and SNR}
+
+\begin{align}
+  V_{\rm XS} &= \sigma_{\rm obs}^{2} - \sigma_{\rm phot}^{2}
+  && \texttt{excess\_var} \quad \text{(signed, no floor)}
+  \label{eq:vxs}\\[4pt]
+  \mathrm{SNR} &= \frac{V_{\rm XS}}{\sigma_{\rm phot}^{2}}
+              = \frac{\sigma_{\rm obs}^{2}}{\sigma_{\rm phot}^{2}} - 1
+  && \texttt{snr} \quad \text{(variance ratio, signed)}
+  \label{eq:snr}
+\end{align}
+%
+$\mathrm{SNR} = \mathrm{NaN}$ where $\sigma_{\rm phot}^{2} = 0$.
+
+\subsection{Asymmetry}
+
+\begin{align}
+  \Delta &= \bar{x} - \mathrm{med}(x)
+  && \texttt{mean\_median\_offset}
+  \label{eq:delta}\\[4pt]
+  \gamma_{\rm P} &= \frac{\Delta}{\sigma_{\rm obs}}
+  && \texttt{gamma\_p}
+  \label{eq:gammap}
+\end{align}
+%
+$\gamma_{\rm P} = \mathrm{NaN}$ where $\sigma_{\rm obs} = 0$.
+
+\subsection{Identity relating the two RMS-like amplitudes}
+
+Since $\mathrm{med}(x) = 1$ by \eqref{eq:norm}, expanding \eqref{eq:rmsobs} about
+$\bar{x}$ gives $\mathrm{rms}_{\rm obs}^{2} = \sigma_{\rm obs}^{2} + \Delta^{2}$ and
+hence
+%
+\begin{equation}
+  \texttt{intrinsic\_rms}^{2} = \texttt{intrinsic\_std}^{2} + \Delta^{2},
+  \label{eq:identity}
+\end{equation}
+%
+valid wherever neither is truncated by its $\max(0,\cdot)$ floor.
+
+% ===========================================================================
+\section{Gap-aware statistics (\texttt{summary\_stats.py})}
+% ===========================================================================
+
+Both default their pairing threshold to $2.5\,\mathrm{med}(\Delta t)$.
+
+\paragraph{Inverted von Neumann ratio --- \texttt{vn\_ratio\_gap\_aware}.}
+With $\delta f_i = f_{i+1}-f_i$ and $\mathcal{U} = \{i : \Delta t_i \le \Delta t_{\max}\}$,
+%
+\begin{equation}
+  \eta = \frac{\left\langle \delta f_i^{2}\right\rangle_{i \in \mathcal{U}}}
+              {\mathrm{Var}(f)}, \qquad
+  \texttt{vn\_ratio\_gap\_aware} = \frac{1}{\eta},
+  \label{eq:vn}
+\end{equation}
+%
+where $\mathrm{Var}(f)$ uses $\mathrm{ddof}=1$.
+
+\paragraph{Gap-aware Stetson $J$ --- \texttt{stetson\_j\_gap\_aware}.}
+With the inverse-variance weighted mean
+$\bar{m}_w = \sum_i m_i \varsigma_i^{-2} / \sum_i \varsigma_i^{-2}$,
+%
+\begin{equation}
+  \delta_i = \sqrt{\frac{n}{n-1}}\;\frac{m_i - \bar{m}_w}{\varsigma_i} .
+  \label{eq:stetdelta}
+\end{equation}
+%
+Consecutive samples are paired greedily when
+$t_{i+1}-t_i \le \Delta t_{\max}$, each sample used at most once:
+%
+\begin{equation}
+  (P, w) =
+  \begin{cases}
+    \left(\delta_i \delta_{i+1},\; 1\right)      & \text{paired},\\[4pt]
+    \left(\delta_i^{2} - 1,\; 0.25\right)        & \text{unpaired},
+  \end{cases}
+  \qquad
+  J = \frac{\sum w \,\mathrm{sgn}(P)\sqrt{|P|}}{\sum w} .
+  \label{eq:stetson}
+\end{equation}
+
+% ===========================================================================
+\section{Per-sector statistics (\texttt{sector\_stats.py})}
+% ===========================================================================
+
+\subsection{Segmentation}
+
+Sector $k$ has FITS time range $[t^{(k)}_{\min}, t^{(k)}_{\max}]$ read from HDU
+$k+1$. The mask and its required partition property are
+%
+\begin{equation}
+  \mathcal{M}_k = \left\{ i : t^{(k)}_{\min} \le t_i \le t^{(k)}_{\max} \right\},
+  \qquad
+  \sum_{k=1}^{K} \mathbb{1}\!\left[i \in \mathcal{M}_k\right] = 1
+  \quad \forall\, i ,
+  \label{eq:partition}
+\end{equation}
+%
+violation of which raises rather than warns.
+
+\subsection{Per-sector quantities}
+
+For sector $k$ with $n_k$ samples, $d_i = x_i - \bar{x}_k$ for $i \in \mathcal{M}_k$:
+%
+\begin{align}
+  \sigma_{{\rm obs},k}^{2}  &= \frac{1}{n_k}\sum_{i \in \mathcal{M}_k} d_i^{2},
+  &
+  \sigma_{{\rm phot},k}^{2} &= \frac{1}{n_k}\sum_{i \in \mathcal{M}_k} s_i^{2},
+  \label{eq:seck1}\\[4pt]
+  \mu_{3,k} &= \frac{1}{n_k}\sum_{i \in \mathcal{M}_k} d_i^{3},
+  &
+  V_{{\rm XS},k} &= \sigma_{{\rm obs},k}^{2} - \sigma_{{\rm phot},k}^{2},
+  \label{eq:seck2}\\[4pt]
+  \Delta_k &= \bar{x}_k - \mathrm{med}(x_k),
+  &
+  \mathrm{SNR}_k &= \frac{V_{{\rm XS},k}}{\sigma_{{\rm phot},k}^{2}} .
+  \label{eq:seck3}
+\end{align}
+%
+The two shape statistics:
+%
+\begin{align}
+  \gamma_{{\rm P},k} &= \frac{\Delta_k}{\sigma_{{\rm obs},k}}
+  \label{eq:gpk}\\[6pt]
+  g_{1,{\rm int},k}  &= \frac{\mu_{3,k}}{V_{{\rm XS},k}^{3/2}}
+  \qquad\text{(NaN where } V_{{\rm XS},k} \le 0\text{)}
+  \label{eq:g1k}
+\end{align}
+%
+Equation~\eqref{eq:g1k} is the noise-corrected moment skewness. Its numerator requires
+no correction --- symmetric noise contributes zero third cumulant --- so only the
+normalising scale is replaced, $\sigma_{\rm obs}^3 \to V_{\rm XS}^{3/2}$.
+
+\subsection{Aggregation}
+
+Weights are $W_k = n_k$, taken over entries with finite value and positive weight:
+%
+\begin{equation}
+  \left\langle X \right\rangle = \frac{\sum_k n_k X_k}{\sum_k n_k} .
+  \label{eq:wmean}
+\end{equation}
+
+\paragraph{Pearson skew --- \texttt{gamma\_p\_sec}.} All sectors contribute:
+%
+\begin{equation}
+  \gamma_{\rm P}^{\rm sec} = \frac{\sum_k n_k \gamma_{{\rm P},k}}{\sum_k n_k} .
+  \label{eq:gpsec}
+\end{equation}
+
+\paragraph{Moment skew --- \texttt{g1\_int\_sec}.} Restricted to the valid set
+%
+\begin{equation}
+  \mathcal{V} = \left\{k \;:\; V_{{\rm XS},k} > 0 \;\wedge\;
+                  \mathrm{SNR}_k > \mathrm{SNR}_{\min}\right\},
+  \qquad \mathrm{SNR}_{\min} = 1 ,
+  \label{eq:valid}
+\end{equation}
+%
+\begin{equation}
+  g_{1,{\rm int}}^{\rm sec} =
+  \begin{cases}
+    \displaystyle
+    \frac{\sum_{k \in \mathcal{V}} n_k \, g_{1,{\rm int},k}}
+         {\sum_{k \in \mathcal{V}} n_k}
+      & \mathcal{V} \neq \varnothing, \\[14pt]
+    0 & \mathcal{V} = \varnothing,
+  \end{cases}
+  \label{eq:g1sec}
+\end{equation}
+%
+with the companion indicator columns
+%
+\begin{equation}
+  \texttt{n\_sectors\_valid} = |\mathcal{V}|,
+  \qquad
+  \texttt{g1\_valid} =
+  \begin{cases}
+    1 & |\mathcal{V}| > 0,\\
+    0 & \text{otherwise.}
+  \end{cases}
+  \label{eq:g1valid}
+\end{equation}
+%
+The constant $0$ in \eqref{eq:g1sec} is an imputation, not a measurement: it keeps the
+column finite for direct use as a model input. Because $0$ asserts perfect symmetry
+where the truth is "not measurable", \eqref{eq:g1valid} must be carried as a feature
+alongside it.
+
+\subsection{Why these two are not pooled}
+
+Substituting the leading-order linear mixtures
+$\sigma_{\rm obs}^{2} \simeq \sum_k w_k \sigma_k^{2}$ and
+$\mu_3 \simeq \sum_k w_k \mu_{3,k}$ (with $w_k = n_k/N$) into \eqref{eq:gammap} and
+$g_1 = \mu_3/\sigma_{\rm obs}^3$ gives the pooled forms
+%
+\begin{equation}
+  g_1^{\rm pooled}
+    = \frac{\sum_k w_k\, g_{1,k}\,\sigma_k^{3}}
+           {\left(\sum_k w_k \sigma_k^{2}\right)^{3/2}},
+  \qquad
+  \gamma_{\rm P}^{\rm pooled}
+    = \frac{\sum_k w_k\, \gamma_{{\rm P},k}\,\sigma_k}
+           {\left(\sum_k w_k \sigma_k^{2}\right)^{1/2}},
+  \label{eq:pooledshape}
+\end{equation}
+%
+i.e.\ effective sector weights $\propto w_k \sigma_k^{3}$ and $\propto w_k \sigma_k$
+rather than $\propto w_k$. Equations \eqref{eq:gpsec} and \eqref{eq:g1sec} avoid this.
+The amplitudes require no such treatment: $\Delta$ pools exactly, since
+$\mathrm{med}(x)=1$ for every sector and for the pool gives
+$\Delta = \sum_k w_k \Delta_k$ identically, and \eqref{eq:vxs} is a monotone function
+of a linear mixture.
+
+\subsection{Null sampling errors}
+
+For a Gaussian sample of size $N$,
+%
+\begin{equation}
+  \mathrm{sd}\!\left(\gamma_{\rm P}\right) = \sqrt{\frac{\pi/2 - 1}{N}}
+    \simeq \frac{0.756}{\sqrt{N}},
+  \qquad
+  \mathrm{sd}\!\left(g_1\right) = \sqrt{\frac{6}{N}},
+  \label{eq:nullse}
+\end{equation}
+%
+both $\propto N^{-1/2}$, which is why $W_k = n_k$ in \eqref{eq:wmean} is the
+inverse-variance optimum.
+
+% ===========================================================================
+\section{Emitted columns}
+% ===========================================================================
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+Column & Equation & Noise corrected & Computed \\
+\midrule
+\texttt{excess\_var}         & \eqref{eq:vxs}      & yes, exact & pooled \\
+\texttt{snr}                 & \eqref{eq:snr}      & ---        & pooled \\
+\texttt{sigma\_mad}          & \eqref{eq:sigmad}   & no         & pooled \\
+\texttt{mean\_median\_offset}& \eqref{eq:delta}    & no         & pooled \\
+\texttt{gamma\_p\_sec}       & \eqref{eq:gpsec}    & no         & per sector \\
+\texttt{g1\_int\_sec}        & \eqref{eq:g1sec}    & yes, exact & per sector \\
+\texttt{n\_sectors}          & ---                 & ---        & --- \\
+\midrule
+\multicolumn{4}{l}{\emph{Retained from the previous feature set}}\\
+\texttt{intrinsic\_std}      & \eqref{eq:istd}     & yes, exact & pooled \\
+\texttt{intrinsic\_rms}      & \eqref{eq:irms}     & partial    & pooled \\
+\texttt{intrinsic\_mad}      & \eqref{eq:imad}     & approximate& pooled \\
+\texttt{gamma\_p}            & \eqref{eq:gammap}   & no         & pooled \\
+\texttt{vn\_ratio\_gap\_aware}  & \eqref{eq:vn}      & no      & pooled \\
+\texttt{stetson\_j\_gap\_aware} & \eqref{eq:stetson} & no      & pooled \\
+\midrule
+\multicolumn{4}{l}{\emph{Supporting}}\\
+\texttt{g1\_valid}, \texttt{n\_sectors\_valid} & \eqref{eq:g1valid} & --- & per sector \\
+\texttt{gamma\_p\_persector} & \eqref{eq:gpk}      & ---        & per sector \\
+\texttt{g1\_int\_persector}  & \eqref{eq:g1k}      & ---        & per sector \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

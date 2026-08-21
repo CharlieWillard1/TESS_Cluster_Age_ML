@@ -194,7 +194,7 @@ def _cluster_color_map(table_rows):
 
 def _analytic_psd(fit, freq_min, freq_max, n_freq):
     """Analytic SHO kernel PSD for a single fit dict."""
-    from .gp_fit import unpack_theta, _unpack_rn_comp
+    from .gp_fit import unpack_theta, _unpack_rn_comp, sho_psd
     import jax.numpy as jnp
     freq  = np.linspace(freq_min, freq_max, n_freq)
     omega = 2.0 * np.pi * freq
@@ -204,17 +204,13 @@ def _analytic_psd(fit, freq_min, freq_max, n_freq):
         sigma  = float(comp["sigma"])
         omega0 = float(comp["omega"])
         Q      = float(comp["Q"])
-        numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
-        denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
-        power += numer / denom
+        power += sho_psd(freq, sigma, omega0, Q)
     if fit.get("has_red_noise", False):
         rn     = _unpack_rn_comp(jnp.asarray(fit["theta"]), fit["n_components"])
         sigma  = float(rn["sigma"])
         omega0 = float(rn["omega"])
         Q      = float(rn["Q"])
-        numer  = sigma**2 * (omega0 / Q) * (omega0**2 + omega**2)
-        denom  = (omega**2 - omega0**2)**2 + omega**2 * omega0**2 / Q**2
-        power += numer / denom
+        power += sho_psd(freq, sigma, omega0, Q)
     return freq, power
 
 
@@ -627,13 +623,16 @@ def plot_noise_gp(data, period_lim=(1/24, 10.0), save_path=None):
             power = np.asarray(row['LSP_power'])
             ax_lsp.plot(freq, power, lw=0.8, color='steelblue', zorder=2)
 
-            ax_lsp.axhline(row['LSP_FAP'], color='red', ls='--', lw=1,
+            ax_lsp.axhline(row['LSP_FAP_power'], color='red', ls='--', lw=1,
                            label='1% FAP (bootstrap)')
             ax_lsp.axhline(row['LSP_WN_threshold'], color='darkorange', ls='--', lw=1,
                            label='WN threshold (99th pct)')
 
             log10_N, alpha_rn = row['rn_log10_N'], row['rn_alpha']
-            P_N_empirical, P_N_theoretical = row['rn_P_empirical'], row['rn_P_theoretical']
+            # P_N_empirical / P_N_theoretical are no longer stored (constant, unused),
+            # so tolerate their absence on newly generated tables.
+            P_N_empirical   = row['rn_P_empirical'] if 'rn_P_empirical' in row.index else None
+            P_N_theoretical = 1.0
             P_model   = 10**log10_N * freq**(-alpha_rn)
             n_freq    = len(freq)
             gamma     = -np.log(1 - 0.99**(1/n_freq))
@@ -643,8 +642,9 @@ def plot_noise_gp(data, period_lim=(1/24, 10.0), save_path=None):
                         label=f'Red-noise continuum (α={alpha_rn:.2f})', zorder=3)
             ax_lsp.plot(freq, threshold, color='darkred', lw=1.2, ls='-',
                         label='Red-noise threshold (FAP=1%)', zorder=3)
-            ax_lsp.axhline(P_N_empirical, color='black', ls='--', lw=1,
-                           label=f'P_N empirical ({P_N_empirical:.3f})')
+            if P_N_empirical is not None:
+                ax_lsp.axhline(P_N_empirical, color='black', ls='--', lw=1,
+                               label=f'P_N empirical ({P_N_empirical:.3f})')
             ax_lsp.axhline(P_N_theoretical, color='black', ls=':', lw=1,
                            label=f'P_N theoretical ({P_N_theoretical:.1f})')
 

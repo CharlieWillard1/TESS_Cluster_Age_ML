@@ -295,13 +295,22 @@ def _sum_band_power(freqs, power, P_lo, P_hi):
     Returns
     -------
     float
-        Sum of ``power`` where ``P_lo <= 1/freq <= P_hi``.
-        Returns 0.0 if no frequencies fall in the band.
+        Integral of ``power`` over frequency where ``P_lo <= 1/freq <= P_hi``.
+        Returns 0.0 if fewer than 2 frequencies fall in the band.
+
+    Notes
+    -----
+    Integrates with ``np.trapezoid`` rather than summing grid points.  A raw sum is
+    proportional to the grid density, and df = 1/(alpha * T_eff) varies by ~3x across
+    the table (0.00416 -> 0.00135 /day for 1 -> 3 sectors), so summed band powers are
+    not comparable between rows of different baseline.  The integral is.
     """
     with np.errstate(divide='ignore'):
         periods = 1.0 / freqs
     mask = (periods >= P_lo) & (periods <= P_hi)
-    return float(power[mask].sum())
+    if int(mask.sum()) < 2:
+        return 0.0
+    return float(np.trapezoid(power[mask], freqs[mask]))
 
 
 def _compute_noise_floor(t, err_x, freqs, n_realizations=100, seed=None):
@@ -485,7 +494,9 @@ def _fit_red_noise_vaughan(freqs, power, P_N):
     Returns
     -------
     (log10_N, alpha, P_N) : tuple of float
-        Power-law fit parameters and noise floor. Full model: P̂(f) = 10**log10_N * f**(-alpha) + P_N.
+        Power-law fit parameters and noise floor. ``log10_N`` is the least-squares
+        intercept at f = 1, corrected upward by gamma_E / ln(10) = 0.25068.
+        Full model: P̂(f) = 10**log10_N * f**(-alpha) + P_N.
 
     Notes
     -----
@@ -543,8 +554,12 @@ def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
         Output of ``compute_lsp``.
     wn_threshold : float
         White-noise bootstrap power threshold at ``wn_percentile`` (global max).
-    red_noise_params : tuple (log10_N, alpha, P_N_empirical, P_N_theoretical)
+    red_noise_params : tuple (log10_N, alpha)
         Vaughan (2005) power-law continuum fit. Model: P̂(f) = 10**log10_N * f**(-alpha).
+        The white-noise floor is no longer returned: P_N_theoretical was a hardcoded
+        1.0 and P_N_empirical was constant to ~0.3%, and neither is used downstream
+        (gp_fit unpacks P_N_empirical but never references it). P_N_empirical is still
+        computed here to drive the divergence warning below.
 
     Raises
     ------
@@ -616,7 +631,7 @@ def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
     log10_N, alpha, _ = _fit_red_noise_vaughan(
         lsp_dict['freqs'], lsp_dict['power'], P_N_empirical,
     )
-    red_noise_params = (log10_N, alpha, P_N_empirical, P_N_theoretical)
+    red_noise_params = (log10_N, alpha)
 
     return t_arr, flux_arr, err_arr, lsp_dict, wn_threshold, red_noise_params
 
@@ -700,7 +715,7 @@ def add_lsps(table, P_min=0.1, P_max=10.0, alpha=5, fap_level=0.01,
     Compute LSP for every row using the LC arrays stored by ``add_lightcurves``.
 
     Expects columns: ``LC_t``, ``LC_flux``, ``LC_flux_err``.
-    Adds columns: ``LSP_freq``, ``LSP_power``, ``LSP_FAP``.
+    Adds columns: ``LSP_freq``, ``LSP_power``, ``LSP_FAP_power``.
 
     Parameters
     ----------
@@ -769,7 +784,7 @@ def add_lsps(table, P_min=0.1, P_max=10.0, alpha=5, fap_level=0.01,
 
     table['LSP_freq']  = lsp_freq
     table['LSP_power'] = lsp_power
-    table['LSP_FAP']   = lsp_fap
+    table['LSP_FAP_power']   = lsp_fap
     if compute_noise_floor:
         table['LSP_noise_floor'] = lsp_noise_floor
     return table

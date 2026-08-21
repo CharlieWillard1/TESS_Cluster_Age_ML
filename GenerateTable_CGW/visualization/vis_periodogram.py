@@ -16,7 +16,7 @@ def plot_cluster_lsp(table, name, max_num_pgs=10,
     """
     Plot LSP periodograms for a cluster, grouped by n_sectors.
 
-    Reads the ``LSP_freq``, ``LSP_power``, and ``LSP_FAP`` columns produced by
+    Reads the ``LSP_freq``, ``LSP_power``, and ``LSP_FAP_power`` columns produced by
     ``expand_table``. Because each row carries its own frequency grid (grid
     spacing depends on the row's time baseline), every line is plotted against
     its own x-axis rather than a shared bin index.
@@ -27,7 +27,7 @@ def plot_cluster_lsp(table, name, max_num_pgs=10,
     Parameters
     ----------
     table : pd.DataFrame
-        Must contain ``LSP_freq``, ``LSP_power``, ``LSP_FAP``, ``cadence`` columns.
+        Must contain ``LSP_freq``, ``LSP_power``, ``LSP_FAP_power``, ``cadence`` columns.
     name : str, bytes, or None
         Cluster name matching the ``name`` column. If None, a random cluster
         is chosen.
@@ -71,7 +71,7 @@ def plot_cluster_lsp(table, name, max_num_pgs=10,
         for (_, row), color in zip(sampled.iterrows(), colors):
             freqs = np.asarray(row['LSP_freq'])
             power = np.asarray(row['LSP_power'])
-            fap   = row['LSP_FAP']
+            fap   = row['LSP_FAP_power']
 
             if x_lim is not None:
                 mask = (freqs >= x_lim[0]) & (freqs <= x_lim[1])
@@ -177,7 +177,7 @@ def plot_cluster_lsp_specific(table, name, sectors_list,
         cad = row.get('cadence', '?')
         label = f'{list(sectors)} | {cad} min'
         ax.plot(freqs, power, lw=1.5, alpha=0.8, color=color, label=label)
-        fap = row['LSP_FAP']
+        fap = row['LSP_FAP_power']
         if np.isfinite(fap):
             ax.axhline(fap, color=color, lw=1.0, linestyle='--', alpha=0.6,
                        label=f'FAP={fap:.2e}')

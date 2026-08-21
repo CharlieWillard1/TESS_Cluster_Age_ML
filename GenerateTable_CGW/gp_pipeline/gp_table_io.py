@@ -37,11 +37,18 @@ def add_gp_fits(
         computed as int S(f) df within each bin (variance per band, not per log-freq).
     max_components : int
         Maximum number of SHO components to try.
-    threshold_mode : {'white_noise', 'fap', 'red_noise'}
+    threshold_mode : {'white_noise', 'fap', 'red_noise', 'red_noise_subtracted'}
         Threshold used for LSP peak detection.
         'white_noise' : scalar 99th-pct bootstrap max (LSP_WN_threshold). Default.
-        'fap'         : scalar 1% FAP analytic threshold (LSP_FAP / Baluev).
+        'fap'         : scalar 1% FAP analytic threshold (LSP_FAP_power / Baluev).
         'red_noise'   : per-frequency Vaughan 1% significance (LSP_red_noise_params).
+                        Orders candidate peaks by P - gamma*C, which is biased toward
+                        short periods.
+        'red_noise_subtracted' : same acceptance test, but orders peaks by P - C, which
+                        is unbiased in period. Pass excess_frac through **gp_kwargs to
+                        relax the acceptance: it is a fraction of the significance gate,
+                        so 1.0 (default) reproduces 'red_noise' exactly and 0.0 accepts
+                        every bin above the continuum. No need to know gamma.
     verbose : int
         0 = one summary line per cluster (default).
         1 = per-fit peak/BIC/timing info.
@@ -131,11 +138,12 @@ def add_gp_fits(
             if threshold_mode == 'white_noise':
                 thresh_kwargs = dict(wn_threshold=float(row.get("LSP_WN_threshold")))
             elif threshold_mode == 'fap':
-                thresh_kwargs = dict(fap_threshold=float(row.get("LSP_FAP")))
-            elif threshold_mode == 'red_noise':
+                thresh_kwargs = dict(fap_threshold=float(row.get("LSP_FAP_power")))
+            elif threshold_mode in ('red_noise', 'red_noise_subtracted'):
+                # Trailing two slots are placeholders: gp_fit unpacks P_N_empirical and
+                # then never references it, and P_N_theoretical was always 1.0.
                 thresh_kwargs = dict(red_noise_params=(
-                    row["rn_log10_N"], row["rn_alpha"],
-                    row["rn_P_empirical"], row["rn_P_theoretical"],
+                    float(row["rn_log10_N"]), float(row["rn_alpha"]), 1.0, 1.0,
                 ))
             else:
                 raise ValueError(f"Unknown threshold_mode: {threshold_mode!r}")
@@ -295,3 +303,124 @@ def load_gp_results(table_subset, save_path):
         sectors = tuple(row.get("sectors", []))
         out.append(results_dict.get((name, sectors), None))
     return out
+
+
+def recompute_gp_psd_columns(table, freq_lim=(0.1, 12.0), n_bins=10, verbose=True):
+    """Rebuild the GP PSD columns from stored parameters -- no refitting required.
+
+    ``GP_freq``, ``GP_PSD`` and the ``gp_kspace_*`` family are a pure function of the
+    fitted component parameters, all of which are already stored as table columns
+    (``gp_sho_sigmas``, ``gp_sho_omegas``, ``gp_sho_Qs`` and ``gp_rn_sigma`` /
+    ``gp_rn_period`` / ``gp_rn_Q``).  So they can be regenerated directly from a saved
+    table without re-running ``add_gp_fits`` and without ``gp_result``, which the table
+    writers drop anyway.
+
+    The reason to need this: the analytic SHO PSD was corrected on 2026-08-21 (it fell as
+    f^-2 rather than the kernel's f^-4).  Tables written before then carry stale spectra
+    even though their fitted parameters are correct.
+
+    Parameters
+    ----------
+    table : pd.DataFrame
+        Must have ``gp_sho_sigmas``, ``gp_sho_omegas``, ``gp_sho_Qs``.  The red-noise
+        term is included when ``gp_rn_sigma`` / ``gp_rn_period`` are present and finite.
+    freq_lim : (float, float)
+        Frequency range in 1/day.  Use the same values as the original ``add_gp_fits``
+        call, or the band definitions will not line up.
+    n_bins : int
+        Number of log-spaced bins for the spectral statistics.
+
+    Notes
+    -----
+    Reproduces ``add_gp_fits`` exactly, including its two different grids: ``GP_freq`` /
+    ``GP_PSD`` are stored on ``kspace_true``'s default 1000-point grid, while the
+    ``gp_kspace_*`` statistics are computed by ``add_gp_summary_stats`` on a 2000-point
+    grid.  The mismatch is pre-existing; it is mirrored here rather than tidied so that
+    recomputed columns are bit-comparable with freshly fitted ones.
+
+    Returns
+    -------
+    table : pd.DataFrame
+        Same object, columns replaced in-place.
+    """
+    from .gp_fit import sho_psd
+
+    f_min, f_max = freq_lim
+    freq = np.linspace(f_min, f_max, 1000)        # matches kspace_true default
+    freq_stats = np.linspace(f_min, f_max, 2000)  # matches add_gp_summary_stats
+    idx = table.index
+
+    gp_freq_vals = pd.Series([None] * len(table), index=idx, dtype=object)
+    gp_psd_vals = pd.Series([None] * len(table), index=idx, dtype=object)
+    stats_list, stats_index = [], []
+    n_ok = n_skip = 0
+
+    for label, row in table.iterrows():
+        sig = row.get('gp_sho_sigmas')
+        om = row.get('gp_sho_omegas')
+        Qs = row.get('gp_sho_Qs')
+        if sig is None or om is None or Qs is None:
+            n_skip += 1
+            continue
+        sig = np.atleast_1d(np.asarray(sig, dtype=float))
+        om = np.atleast_1d(np.asarray(om, dtype=float))
+        Qs = np.atleast_1d(np.asarray(Qs, dtype=float))
+        if len(sig) == 0 or not (len(sig) == len(om) == len(Qs)):
+            n_skip += 1
+            continue
+
+        def _total_psd(grid):
+            out = np.zeros_like(grid)
+            for s_, o_, q_ in zip(sig, om, Qs):
+                out += sho_psd(grid, s_, o_, q_)
+            rn_s, rn_p = row.get('gp_rn_sigma'), row.get('gp_rn_period')
+            rn_q = row.get('gp_rn_Q')
+            if (rn_s is not None and rn_p is not None
+                    and np.isfinite(rn_s) and np.isfinite(rn_p) and rn_p > 0):
+                q = (float(rn_q) if (rn_q is not None and np.isfinite(rn_q))
+                     else 1.0 / np.sqrt(2.0))
+                out += sho_psd(grid, float(rn_s), 2.0 * np.pi / float(rn_p), q)
+            return out
+
+        power = _total_psd(freq)
+        gp_freq_vals[label] = freq.copy()
+        gp_psd_vals[label] = power
+        stats_list.append(compute_spectral_stats(freq_stats, _total_psd(freq_stats),
+                                                 freq_lim, n_bins))
+        stats_index.append(label)
+        n_ok += 1
+
+    table['GP_freq'] = gp_freq_vals
+    table['GP_PSD'] = gp_psd_vals
+
+    # Mirror add_gp_fits: flat gp_kspace_* columns, plus the paired tuple columns.
+    if stats_list:
+        keys = list(stats_list[0].keys())
+        for k in keys:
+            col = f'gp_kspace_{k}'
+            first = stats_list[0][k]
+            vals = pd.Series([None] * len(table), index=idx, dtype=object) \
+                if isinstance(first, (list, np.ndarray)) \
+                else pd.Series(np.nan, index=idx, dtype=float)
+            for lab, st in zip(stats_index, stats_list):
+                vals[lab] = (np.asarray(st[k], dtype=float)
+                             if isinstance(first, (list, np.ndarray)) else st[k])
+            table[col] = vals
+
+        binned = pd.Series([None] * len(table), index=idx, dtype=object)
+        ratios = pd.Series([None] * len(table), index=idx, dtype=object)
+        hl = pd.Series(np.nan, index=idx, dtype=float)
+        for lab, st in zip(stats_index, stats_list):
+            bc = st['bin_centers']
+            binned[lab] = (st['log_band_powers'], bc)
+            ratios[lab] = (st['log_band_ratios'],
+                           [np.sqrt(bc[i] * bc[i + 1]) for i in range(len(bc) - 1)])
+            hl[lab] = st['log_low_high_ratio']
+        table['GP_PSD_binned'] = binned
+        table['GP_PSD_bin_ratios'] = ratios
+        table['GP_PSD_high_low_ratio'] = hl
+
+    if verbose:
+        print(f"[recompute_gp_psd_columns] ok={n_ok}  skipped={n_skip}  "
+              f"freq_lim={freq_lim}  n_bins={n_bins}")
+    return table

@@ -1,0 +1,350 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\newcommand{\dd}{\,\mathrm{d}}
+
+\title{Lomb--Scargle Periodogram, Red-Noise Continuum, and Peak Statistics:\\
+       Formulas as Implemented}
+\author{\texttt{GenerateTable\_CGW/table\_pipeline}}
+\date{2026 August 19}
+
+\begin{document}
+\maketitle
+
+Formula reference for \texttt{lc\_lsp.py} (grid, periodogram, noise thresholds,
+red-noise fit) and \texttt{lsp\_stats.py} (peak statistics, diagnostics). Emitted column
+names are given alongside each definition. The variability statistics computed on the
+light curve itself are documented separately in \texttt{statistics\_formulas.tex}.
+
+% ===========================================================================
+\section{Inputs and pipeline parameters}
+% ===========================================================================
+
+The periodogram is computed on the stitched, median-normalised light curve
+$\{t_i, x_i, s_i\}_{i=1}^{N}$ produced by \texttt{load\_and\_process\_sectors}
+(resample to $30$\,min $\to$ MAD clip at $4\sigma$ $\to$ divide each sector by its own
+median $\to$ concatenate and time-sort).
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{llll}
+\toprule
+Symbol & Value & Code & Meaning \\
+\midrule
+$P_{\min}$      & $0.0833$ d & \texttt{P\_min}        & $= 4\times30$\,min; shortest period searched \\
+$P_{\max}$      & $10$ d     & \texttt{P\_max}        & longest period searched \\
+$\alpha_{\rm os}$ & $10$     & \texttt{alpha}         & frequency oversampling factor \\
+$n_{\rm boot}$  & $200$      & \texttt{n\_wn\_boot}   & bootstrap realisations \\
+$q$             & $99$       & \texttt{wn\_percentile}& white-noise threshold percentile \\
+$\mathrm{FAP}$  & $0.01$     & \texttt{fap\_level}    & false-alarm probability \\
+$\tau_{\rm gap}$& $1$ d      & \texttt{gap\_threshold\_days} & segment-break threshold \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\section{Frequency grid}
+% ===========================================================================
+
+\subsection{Effective baseline}
+
+The wall-clock span overstates the resolving power of a light curve containing multi-day
+downlink and inter-sector gaps, so the baseline is the summed duration of the contiguous
+segments only. Splitting at every $\Delta t_i > \tau_{\rm gap}$ into segments
+$[t_{a_m}, t_{b_m}]$, $m = 1 \ldots M$:
+%
+\begin{equation}
+  T_{\rm eff} = \sum_{m=1}^{M}\left(t_{b_m} - t_{a_m}\right)
+  \qquad\text{(\texttt{\_effective\_baseline})}
+  \label{eq:teff}
+\end{equation}
+
+\subsection{Grid construction}
+
+\begin{equation}
+  f_{\min} = \frac{1}{P_{\max}^{\rm eff}}, \qquad
+  f_{\max} = \frac{1}{P_{\min}}, \qquad
+  P_{\max}^{\rm eff} = \min\!\left(P_{\max},\; \tfrac{1}{2}T_{\rm eff}\right)
+  \label{eq:frange}
+\end{equation}
+%
+\begin{equation}
+  \Delta f = \frac{1}{\alpha_{\rm os} T_{\rm eff}}, \qquad
+  N_f = \left\lfloor \frac{f_{\max}-f_{\min}}{\Delta f} \right\rfloor, \qquad
+  f_j = f_{\min} + j\,\Delta f, \quad j = 0 \ldots N_f-1
+  \label{eq:grid}
+\end{equation}
+%
+\emph{The grid is linear in frequency}, which matters repeatedly below: period
+resolution collapses at the long-period end, and $\Delta f$ varies by a factor $\sim 3$
+across the table ($0.00359 \to 0.00129$ d$^{-1}$ for $1 \to 3$ sectors), so any
+quantity proportional to grid density is not comparable between rows.
+$P_{\max}^{\rm eff} = P_{\max} = 10$\,d for every row in the current table, i.e.\ the
+$T_{\rm eff}/2$ cap never binds.
+
+% ===========================================================================
+\section{The periodogram}
+% ===========================================================================
+
+Computed with \texttt{astropy.timeseries.LombScargle} using inverse-variance weighting
+from $s_i$ and \texttt{normalization='psd'}:
+%
+\begin{equation}
+  P_j = P_{\rm LS}(f_j; \{t_i, x_i, s_i\})
+  \qquad
+  \texttt{LSP\_freq} = \{f_j\}, \quad \texttt{LSP\_power} = \{P_j\}
+  \label{eq:lsp}
+\end{equation}
+
+The \texttt{psd} normalisation fixes the null distribution: for pure Gaussian noise the
+power at each frequency follows
+%
+\begin{equation}
+  P_j \,\big|\, H_0 \;\sim\; \mathrm{Exp}(1),
+  \qquad \mathbb{E}[P_j \,|\, H_0] = 1 ,
+  \label{eq:null}
+\end{equation}
+%
+independently of the size of the error bars. This is the origin of the theoretical
+white-noise floor $P_N^{\rm theo} = 1$ and of the bias correction in
+\eqref{eq:biascorr}.
+
+% ===========================================================================
+\section{Noise thresholds}
+% ===========================================================================
+
+\subsection{Bootstrap false-alarm level}
+
+\begin{equation}
+  P_{\rm FAP} = \texttt{ls.false\_alarm\_level}\!\left(
+    \mathrm{FAP}; \text{bootstrap}, \; n_{\rm boot}\right)
+  \qquad \texttt{LSP\_FAP}
+  \label{eq:fap}
+\end{equation}
+
+\subsection{White-noise bootstrap}
+
+For $b = 1 \ldots n_{\rm boot}$ draw a pure-noise light curve at the \emph{observed}
+timestamps and uncertainties, $y_i^{(b)} \sim \mathcal{N}(0, s_i^2)$, and evaluate its
+periodogram $P_j^{(b)}$ on the same grid. Then
+%
+\begin{align}
+  \texttt{LSP\_WN\_threshold}
+    &= \mathrm{Pctl}_{q}\!\left[\;\max_j P_j^{(b)} \;\right]_{b=1}^{n_{\rm boot}}
+  \label{eq:wnthresh}\\[4pt]
+  \bar{P}_j &= \frac{1}{n_{\rm boot}}\sum_{b} P_j^{(b)},
+  \qquad
+  P_N^{\rm emp} = \frac{1}{N_f}\sum_j \bar{P}_j
+  \label{eq:pnemp}
+\end{align}
+%
+$P_N^{\rm emp}$ is retained only to drive a diagnostic warning, raised when
+$P_N^{\rm emp}/P_N^{\rm theo} \notin [0.9, 1.1]$, which would indicate non-Gaussian noise
+or mis-scaled uncertainties. Neither $P_N^{\rm emp}$ nor $P_N^{\rm theo}$ is stored:
+measured across the table $P_N^{\rm emp} \in [0.9965, 1.0150]$ (std $0.0031$) and
+$P_N^{\rm theo} \equiv 1$, so both are constants.
+
+Note that \eqref{eq:wnthresh} depends on the grid, not on the star: by \eqref{eq:null}
+the expected maximum of $N_f$ independent $\mathrm{Exp}(1)$ draws is
+$\approx \ln(N_f/(1-q/100))$, giving $12.6$ at $N_f = 2860$ and $13.7$ at $N_f = 8793$.
+It is a diagnostic, not a model feature.
+
+% ===========================================================================
+\section{Red-noise continuum}
+% ===========================================================================
+
+\subsection{Vaughan (2005) log-space fit}
+
+Stellar variability produces a power-law continuum rather than a flat floor. Fit a
+straight line in log--log space over all valid bins
+($P_j > 0$, $f_j > 0$), by unweighted least squares:
+%
+\begin{equation}
+  \log_{10} P_j = a + b \log_{10} f_j ,
+  \qquad
+  \alpha = -b
+  \label{eq:rnfit}
+\end{equation}
+%
+Under $H_0$ the ratio $P_j / P_{\rm model}(f_j)$ is $\mathrm{Exp}(1)$-distributed, and
+the log of an $\mathrm{Exp}(1)$ variate is biased low by the Euler--Mascheroni constant,
+%
+\begin{equation}
+  \mathbb{E}\!\left[\log_{10} X\right] = -\frac{\gamma_E}{\ln 10} = -0.25068,
+  \qquad X \sim \mathrm{Exp}(1),
+  \label{eq:biascorr}
+\end{equation}
+%
+so the fitted intercept is corrected upward by that amount:
+%
+\begin{equation}
+  \log_{10} N = a + 0.25068 .
+  \label{eq:log10N}
+\end{equation}
+%
+The continuum model is
+%
+\begin{equation}
+  P_{\rm model}(f) = 10^{\log_{10} N} \, f^{-\alpha} .
+  \label{eq:pmodel}
+\end{equation}
+%
+Both fitted parameters are stored directly: \texttt{rn\_log10\_N} $= \log_{10} N$ from
+\eqref{eq:log10N}, the amplitude at $f = 1$, and \texttt{rn\_alpha} $= \alpha$.\footnote{%
+An alternative parameterisation reporting the amplitude at the grid's log-frequency
+centroid, $F_{\rm pivot} = 10^{\langle \log_{10} f\rangle} = 4.592$ d$^{-1}$, was tested
+and not adopted.  It reduces the sample correlation between amplitude and $\alpha$ from
+$0.870$ to $0.682$ but does not remove it: an intercept taken at the centroid is
+uncorrelated with the slope only in a single fit's \emph{sampling} distribution, whereas
+the residual here is \emph{population} covariance across objects --- redder spectra
+genuinely carry more low-frequency power.  Since downstream analysis must handle
+correlated features regardless, the simpler $f = 1$ intercept is retained.}
+
+\subsection{Significance threshold}
+
+Following Vaughan (2005) Eq.~16, with a Bonferroni-style correction over the $N_f$
+independent bins:
+%
+\begin{equation}
+  \gamma = -\ln\!\left[1 - (1-\mathrm{FAP})^{1/N_f}\right],
+  \qquad
+  P_{\rm thresh}(f) = P_{\rm model}(f)\,\gamma .
+  \label{eq:rnthresh}
+\end{equation}
+%
+The white-noise floor is deliberately \emph{not} added to \eqref{eq:pmodel}. Over this
+frequency range the two conventions are numerically indistinguishable --- the location
+of the maximum in \eqref{eq:peakrn} is identical and the ratio shifts by $\sim2\%$ ---
+and omitting it matches the existing GP peak-detection code exactly.
+
+% ===========================================================================
+\section{Peak summary statistics}
+% ===========================================================================
+
+Let $j^{\ast} = \arg\max_j P_j$ and $j^{\ast}_{\rm rn} = \arg\max_j P_j/P_{\rm thresh}(f_j)$.
+
+\begin{align}
+  \texttt{LSP\_peak\_power}  &= P_{j^{\ast}}
+  \label{eq:peakpow}\\[3pt]
+  \texttt{LSP\_peak\_freq}   &= f_{j^{\ast}}
+  \label{eq:peakfreq}\\[3pt]
+  \texttt{LSP\_peak\_period} &= 1/f_{j^{\ast}}
+  \label{eq:peakper}\\[6pt]
+  \texttt{LSP\_peak\_snr\_rn}    &= \max_j \frac{P_j}{P_{\rm thresh}(f_j)}
+  \label{eq:peakrn}\\[3pt]
+  \texttt{LSP\_peak\_period\_rn} &= 1/f_{j^{\ast}_{\rm rn}}
+  \label{eq:peakperrn}
+\end{align}
+
+\paragraph{The two peak periods are not interchangeable.}
+\eqref{eq:peakper} is the rotation-period candidate. \eqref{eq:peakperrn} is generally
+\emph{not} a rotation period: dividing by a monotonically falling continuum
+($\alpha \simeq 1$ typically) boosts high frequencies, so the normalised maximum lands at
+systematically shorter periods. On test rows it fell at $0.350$\,d and $0.234$\,d against
+a raw-peak median of $2.58$\,d over the table, and $0/1250$ rows have it at the
+long-period boundary --- by construction, not by improvement. It measures ``most
+significant peak relative to the continuum''. Both are stored so they can be compared.
+
+% ===========================================================================
+\section{Band powers (computed, not stored)}
+% ===========================================================================
+
+\begin{equation}
+  \mathcal{S}(P_{\rm lo}, P_{\rm hi})
+    = \int_{1/P_{\rm hi}}^{1/P_{\rm lo}} P(f) \dd f
+    \;\;\approx\;\; \texttt{np.trapezoid}\!\left(P_j, f_j\right)_{\,P_{\rm lo} \le 1/f_j \le P_{\rm hi}}
+  \label{eq:band}
+\end{equation}
+%
+over the four hardcoded bands $(7,10)$, $(4,7)$, $(1,4)$, $(0.5,1)$ days; $0$ is returned
+if fewer than two bins fall in the band.
+
+The integral is essential: the previous implementation summed grid points, which is
+proportional to $1/\Delta f$ and therefore to $T_{\rm eff}$. Measured on one band, the
+ratio of the old sum to the new integral is $279$, $538$, $775$ for $n_{\rm sec} = 1,2,3$
+--- exactly the corresponding $1/\Delta f$ --- so identical spectra would have yielded
+band powers differing by a factor $\sim2.8$ purely from baseline. These values are not
+currently written to the table.
+
+% ===========================================================================
+\section{Diagnostics}
+% ===========================================================================
+
+\subsection{Long-period boundary}
+
+Two framings are reported because neither alone suffices. A fixed period cut such as
+$P > 0.99\,P_{\max}$ spans \emph{exactly one} frequency bin at every $n_{\rm sec}$
+(bin $0$ is $10.00$\,d, bin $1$ is $9.65$\,d at $1$ sector and $9.87$\,d at $3$), while a
+looser fixed cut spans differing bin counts per baseline and is thus a stricter test on
+short baselines. Hence:
+%
+\begin{equation}
+  \text{grid-aware:}\;\; \frac{1}{N_{\rm row}}\#\left\{ j^{\ast} < k \right\},
+  \qquad
+  \text{fixed:}\;\; \frac{1}{N_{\rm row}}\#\left\{ 1/f_{j^{\ast}} > \phi\,P_{\max}\right\}
+  \label{eq:boundary}
+\end{equation}
+%
+with defaults $k \in \{1,3,10\}$ and $\phi \in \{0.95, 0.90, 0.80\}$, reported for both
+peak-period columns and split by $n_{\rm sec}$.
+
+\subsection{Harmonic contamination}
+
+For each suspect period $P_s$ (momentum dump $13.7$\,d and sub-harmonics
+$13.7/n$; scattered light $1$\,d; aliases $0.5$, $2$\,d) count the peaks within a
+fractional tolerance and compare against a local background from windows displaced
+$\pm 3\epsilon$ either side:
+%
+\begin{align}
+  n_{\rm in}(P_s) &= \#\left\{ \left| P/P_s - 1 \right| < \epsilon \right\},
+  \label{eq:harmin}\\[3pt]
+  n_{\rm bg}(P_s) &= \tfrac{1}{2}\left[
+      n_{\rm in}\!\left(P_s(1-3\epsilon)\right) + n_{\rm in}\!\left(P_s(1+3\epsilon)\right)
+    \right],
+  \label{eq:harmbg}\\[3pt]
+  \mathcal{R}(P_s) &= n_{\rm in}(P_s) \,/\, n_{\rm bg}(P_s)
+  \label{eq:harmratio}
+\end{align}
+%
+with $\epsilon = 0.02$ by default. $\mathcal{R} \gg 1$ indicates a genuine pileup on an
+instrumental period. Measured on the current table all suspects return
+$\mathcal{R} \in [0.33, 1.6]$, i.e.\ consistent with the ambient period distribution; no
+contamination is detected. ($13.7$\,d returns undefined, being outside
+$P_{\max} = 10$\,d.)
+
+% ===========================================================================
+\section{Emitted columns}
+% ===========================================================================
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+Column & Equation & Note \\
+\midrule
+\texttt{LSP\_freq}, \texttt{LSP\_power} & \eqref{eq:grid}, \eqref{eq:lsp} & arrays \\
+\texttt{LSP\_FAP}                & \eqref{eq:fap}       & threshold; diagnostic \\
+\texttt{LSP\_WN\_threshold}      & \eqref{eq:wnthresh}  & threshold; tracks $N_f$, not the star \\
+\texttt{rn\_log10\_N}            & \eqref{eq:log10N}    & amplitude at $f = 1$ \\
+\texttt{rn\_alpha}               & \eqref{eq:rnfit}     & strongest LSP age correlate ($\rho = -0.25$) \\
+\texttt{LSP\_peak\_power}        & \eqref{eq:peakpow}   & \\
+\texttt{LSP\_peak\_freq}         & \eqref{eq:peakfreq}  & \\
+\texttt{LSP\_peak\_period}       & \eqref{eq:peakper}   & rotation-period candidate \\
+\texttt{LSP\_peak\_snr\_rn}      & \eqref{eq:peakrn}    & red-noise-normalised significance \\
+\texttt{LSP\_peak\_period\_rn}   & \eqref{eq:peakperrn} & \textbf{not} a rotation period \\
+\midrule
+\multicolumn{3}{l}{\emph{Removed --- constant and unused downstream}}\\
+\texttt{rn\_P\_empirical}        & \eqref{eq:pnemp}     & now warning-only \\
+\texttt{rn\_P\_theoretical}      & \eqref{eq:null}      & was hardcoded $1.0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
