@@ -75,6 +75,21 @@ def add_gp_fits(
     gp_sho_omegas                object     list of fitted omega per component (length m)
     gp_sho_Qs                    object     list of fitted Q per component (length m)
     gp_initial_lsp_peak_periods  object     LSP seed periods used to initialise fit
+    gp_rn_sigma, gp_rn_period, gp_rn_Q
+                                 float64    red-noise SHO parameters (rn_model='sho' only)
+    gp_rn_alpha                  float64    fitted red-noise slope (rn_model='powerlaw' only)
+    gp_rn_alpha_band             float64    in-band log-log slope of the fitted RN PSD ('powerlaw');
+                                            compare THIS to measured slopes
+    gp_rn_log10_S0               float64    log10 one-sided RN PSD at 1 /day ('powerlaw')
+    gp_rn_rms_band               float64    sqrt of RN PSD integrated over the band ('powerlaw')
+    gp_rn_basis_freqs            object     fixed OU basis break frequencies ('powerlaw')
+    gp_rn_exposure_days          float64    exposure filter built into the RN basis (NaN = none)
+    gp_n_peaks_found             float64    significant LSP peaks found, before max_components
+    gp_components_capped         object     True when more peaks were found than max_components:
+                                            leftover oscillator power biases gp_rn_alpha steep
+    gp_rn_wn_ratio               float64    RN PSD / white-noise PSD at 1 /day ('powerlaw')
+    gp_rn_near_white_noise       object     True when that ratio < rn_wn_flag_ratio: no detectable
+                                            red noise, so gp_rn_alpha is undefined ('powerlaw')
     gp_kspace_*                  float64    flat spectral columns for plot_summary_stats
     """
     min_period = 1.0 / freq_lim[1]
@@ -92,6 +107,12 @@ def add_gp_fits(
     gp_rn_sigma_vals  = pd.Series(np.nan, index=idx, dtype=float)
     gp_rn_period_vals = pd.Series(np.nan, index=idx, dtype=float)
     gp_rn_Q_vals      = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_alpha_vals  = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_alpha_band_vals = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_log10_S0_vals = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_rms_band_vals = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_wn_ratio_vals = pd.Series(np.nan, index=idx, dtype=float)
+    gp_rn_near_wn_vals  = pd.Series([None] * n_rows, index=idx, dtype=object)
 
     # Object columns
     gp_result_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
@@ -104,6 +125,10 @@ def add_gp_fits(
     gp_sho_omegas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_Qs_vals     = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_init_lsp_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_rn_basis_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_rn_exposure_vals = pd.Series(np.nan, index=idx, dtype=float)
+    gp_n_peaks_vals     = pd.Series(np.nan, index=idx, dtype=float)
+    gp_capped_vals      = pd.Series([None] * n_rows, index=idx, dtype=object)
 
     # For add_gp_summary_stats we need aligned lists
     results_for_stats = []
@@ -202,6 +227,17 @@ def add_gp_fits(
                 gp_rn_sigma_vals[label]   = result.features.get("rn_sigma",       np.nan)
                 gp_rn_period_vals[label]  = result.features.get("rn_period_days", np.nan)
                 gp_rn_Q_vals[label]       = result.features.get("rn_Q",           np.nan)
+                gp_rn_alpha_vals[label]   = result.features.get("rn_alpha",       np.nan)
+                gp_rn_alpha_band_vals[label] = result.features.get("rn_alpha_band", np.nan)
+                gp_rn_log10_S0_vals[label] = result.features.get("rn_log10_S0",   np.nan)
+                gp_rn_rms_band_vals[label] = result.features.get("rn_rms_band",   np.nan)
+                gp_rn_wn_ratio_vals[label] = result.features.get("rn_wn_ratio",   np.nan)
+                gp_rn_near_wn_vals[label]  = result.features.get("rn_near_white_noise")
+                gp_rn_basis_vals[label]   = result.final_fit.get("rn_basis_freqs")
+                _e = result.final_fit.get("rn_exposure_days")
+                gp_rn_exposure_vals[label] = np.nan if _e is None else float(_e)
+                gp_n_peaks_vals[label]     = result.features.get("lsp_n_peaks_found", np.nan)
+                gp_capped_vals[label]      = result.features.get("components_capped")
 
                 results_for_stats.append(result)
                 results_index.append(label)
@@ -248,6 +284,16 @@ def add_gp_fits(
     table["gp_rn_sigma"]                 = gp_rn_sigma_vals
     table["gp_rn_period"]                = gp_rn_period_vals
     table["gp_rn_Q"]                     = gp_rn_Q_vals
+    table["gp_rn_alpha"]                 = gp_rn_alpha_vals
+    table["gp_rn_alpha_band"]            = gp_rn_alpha_band_vals
+    table["gp_rn_log10_S0"]              = gp_rn_log10_S0_vals
+    table["gp_rn_rms_band"]              = gp_rn_rms_band_vals
+    table["gp_rn_wn_ratio"]              = gp_rn_wn_ratio_vals
+    table["gp_rn_near_white_noise"]      = gp_rn_near_wn_vals
+    table["gp_rn_basis_freqs"]           = gp_rn_basis_vals
+    table["gp_rn_exposure_days"]         = gp_rn_exposure_vals
+    table["gp_n_peaks_found"]            = gp_n_peaks_vals
+    table["gp_components_capped"]        = gp_capped_vals
 
     # Flat gp_kspace_* columns for plot_summary_stats
     if results_for_stats:
@@ -323,7 +369,9 @@ def recompute_gp_psd_columns(table, freq_lim=(0.1, 12.0), n_bins=10, verbose=Tru
     ----------
     table : pd.DataFrame
         Must have ``gp_sho_sigmas``, ``gp_sho_omegas``, ``gp_sho_Qs``.  The red-noise
-        term is included when ``gp_rn_sigma`` / ``gp_rn_period`` are present and finite.
+        term is included when ``gp_rn_alpha`` / ``gp_rn_log10_S0`` / ``gp_rn_basis_freqs``
+        (power-law model) or ``gp_rn_sigma`` / ``gp_rn_period`` (SHO model) are present
+        and finite.
     freq_lim : (float, float)
         Frequency range in 1/day.  Use the same values as the original ``add_gp_fits``
         call, or the band definitions will not line up.
@@ -343,7 +391,7 @@ def recompute_gp_psd_columns(table, freq_lim=(0.1, 12.0), n_bins=10, verbose=Tru
     table : pd.DataFrame
         Same object, columns replaced in-place.
     """
-    from .gp_fit import sho_psd
+    from .gp_fit import sho_psd, powerlaw_rn_psd
 
     f_min, f_max = freq_lim
     freq = np.linspace(f_min, f_max, 1000)        # matches kspace_true default
@@ -373,6 +421,16 @@ def recompute_gp_psd_columns(table, freq_lim=(0.1, 12.0), n_bins=10, verbose=Tru
             out = np.zeros_like(grid)
             for s_, o_, q_ in zip(sig, om, Qs):
                 out += sho_psd(grid, s_, o_, q_)
+            rn_a, rn_S0 = row.get('gp_rn_alpha'), row.get('gp_rn_log10_S0')
+            rn_fj = row.get('gp_rn_basis_freqs')
+            if (rn_a is not None and rn_S0 is not None and rn_fj is not None
+                    and np.isfinite(rn_a) and np.isfinite(rn_S0)):
+                rn_e = row.get('gp_rn_exposure_days')
+                out += powerlaw_rn_psd(grid, np.asarray(rn_fj, dtype=float),
+                                       10.0 ** float(rn_S0), float(rn_a),
+                                       exposure_days=(float(rn_e) if rn_e is not None
+                                                      and np.isfinite(rn_e) else None))
+                return out
             rn_s, rn_p = row.get('gp_rn_sigma'), row.get('gp_rn_period')
             rn_q = row.get('gp_rn_Q')
             if (rn_s is not None and rn_p is not None
@@ -423,4 +481,95 @@ def recompute_gp_psd_columns(table, freq_lim=(0.1, 12.0), n_bins=10, verbose=Tru
     if verbose:
         print(f"[recompute_gp_psd_columns] ok={n_ok}  skipped={n_skip}  "
               f"freq_lim={freq_lim}  n_bins={n_bins}")
+    return table
+
+
+def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered', verbose=True):
+    """Prune low-amplitude / incoherent GP components, post hoc.
+
+    The fit is deliberately generous (``max_components=16``): a peak finder run without
+    harmonic masking reports sidelobes and harmonics of a strong signal as separate peaks, so
+    several seeds can belong to the same physical signal.  The GP handles that gracefully --
+    on the synthetic set a duplicate component is fitted at a median 4% of the amplitude of
+    the component that holds the real signal, and at Q ~ 40 against Q ~ 500 for a real match
+    -- so duplicates waste budget rather than corrupting the fit.  That makes pruning a
+    post-processing choice instead of something baked into the fit.
+
+    Keeps components with ``sigma >= sigma_rel_min * max(sigma)`` in their own row AND
+    ``Q >= Q_min``.  Measured on the synthetic set (611 detectable injections, max_comp=16):
+
+        cut                       components   purity   completeness
+        none                          1689      0.665       0.974
+        sigma >= 5%                    754      0.862       0.926
+        sigma >= 10%                   652      0.862       0.894
+        Q >= 100                       667      0.895       0.841
+        sigma >= 10% and Q >= 20       549      0.947       0.863
+        sigma >= 10% and Q >= 100      454      0.954       0.802
+
+    That table is measured on PURE SINUSOID injections, which are driven to the Q cap, and it
+    over-sells the Q cut: real components sit in Q = 2-20 far more often (24% of real
+    components vs 17% synthetic), because spot modulation is quasi-periodic.  On the real
+    table Q_min=20 discarded clearly real signals -- e.g. NGC2136, an obvious 4.4 d modulation
+    fitted at Q ~ 14.  Hence the default Q_min=5: it removes the broad continuum-like
+    components while keeping finite-coherence signals.  Raise it only if purity matters more
+    than completeness, and check what it cuts.
+
+    Parameters
+    ----------
+    table : pd.DataFrame
+        Needs ``gp_periods``, ``gp_sho_sigmas``, ``gp_sho_Qs`` (and ``gp_sho_omegas`` if present).
+    sigma_rel_min : float
+        Amplitude floor, as a fraction of the row's strongest component.
+    Q_min : float
+        Quality-factor floor.
+    suffix : str
+        Added to the new column names.
+
+    New columns
+    -----------
+    gp_periods{suffix}, gp_sho_sigmas{suffix}, gp_sho_Qs{suffix}, gp_sho_omegas{suffix}
+    gp_n_components{suffix}   number of components kept
+    gp_component_kept         list of bools aligned with ``gp_periods`` -- which components survived,
+                              so a plot can draw kept and cut components differently
+    """
+    cols = ['gp_periods', 'gp_sho_sigmas', 'gp_sho_Qs', 'gp_sho_omegas']
+    present = [c for c in cols if c in table.columns]
+    idx = table.index
+    out = {c + suffix: pd.Series([None] * len(table), index=idx, dtype=object) for c in present}
+    n_kept = pd.Series(np.nan, index=idx, dtype=float)
+    kept_mask = pd.Series([None] * len(table), index=idx, dtype=object)
+
+    for label, row in table.iterrows():
+        sig = row.get('gp_sho_sigmas')
+        Q = row.get('gp_sho_Qs')
+        if sig is None or Q is None:
+            continue
+        sig = np.atleast_1d(np.asarray(sig, dtype=float))
+        Q = np.atleast_1d(np.asarray(Q, dtype=float))
+        if len(sig) != len(Q):
+            continue
+        if len(sig) == 0:
+            # red-noise-only fit (no significant peaks): zero components, not "unknown"
+            for c in present:
+                out[c + suffix][label] = []
+            n_kept[label] = 0
+            kept_mask[label] = []
+            continue
+        smax = np.nanmax(sig)
+        keep = np.isfinite(sig) & (sig >= sigma_rel_min * smax) & (Q >= Q_min) if smax > 0 else np.zeros(len(sig), bool)
+        for c in present:
+            v = np.atleast_1d(np.asarray(row.get(c), dtype=float))
+            out[c + suffix][label] = list(v[keep]) if len(v) == len(keep) else None
+        n_kept[label] = int(keep.sum())
+        kept_mask[label] = [bool(k) for k in keep]      # aligned with gp_periods, for plotting
+
+    for c, v in out.items():
+        table[c] = v
+    table['gp_n_components' + suffix] = n_kept
+    table['gp_component_kept'] = kept_mask
+    if verbose:
+        tot = pd.to_numeric(table.get('gp_n_components'), errors='coerce').sum()
+        print(f"[filter_gp_components] sigma_rel >= {sigma_rel_min}, Q >= {Q_min}: "
+              f"kept {int(n_kept.sum())} of {int(tot)} components "
+              f"({n_kept.sum() / max(tot, 1):.0%}) across {int(n_kept.notna().sum())} rows")
     return table

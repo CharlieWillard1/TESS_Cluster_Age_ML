@@ -1,0 +1,963 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Fixing the Red-Noise Fits:\\
+       A Power-Law GP Kernel and a Peak-Masked Continuum}
+\author{\texttt{GenerateTable\_CGW}}
+\date{2026 September 16}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The pipeline fits red noise twice: once as a power-law continuum to the Lomb--Scargle
+periodogram (the Vaughan fit, \code{rn\_alpha}, \code{rn\_log10\_N}), which sets the
+peak-detection threshold that seeds the GP, and once as a kernel term inside the GP.
+The synthetic injection--recovery set showed both are broken. The periodogram fit is
+biased steep by the periodic signals it is supposed to sit underneath, and the GP term
+--- a fixed-$Q$ SHO --- cannot represent a power law at all: its effective slope is
+uncorrelated with the true one. This note documents the two fixes: (i) a GP red-noise
+term built from a fixed basis of Ornstein--Uhlenbeck (OU) kernels whose weights are tied
+to a fitted slope $\alpha$, keeping two free parameters; and (ii) an iteratively
+peak-masked continuum fit. On the synthetic set the GP red-noise slope goes from
+uncorrelated with the truth ($r=-0.07$, median error 2.09) to $r=0.73$ (median error 0.38),
+and the number of detectable-but-missed oscillators falls from 157 to 42.
+\end{abstract}
+
+% ===========================================================================
+\section{The two problems}
+% ===========================================================================
+
+\subsection{The periodogram continuum is biased by the peaks}
+
+\code{\_fit\_red\_noise\_vaughan} regresses $\log_{10}P$ on $\log_{10}f$ over
+\emph{every} bin of the periodogram, then adds the Exp(1) log-bias
+$-\mathbb{E}[\log_{10}X] = \gamma_E/\ln 10 = 0.25068$. Nothing removes the peaks. Injected
+periods are uniform in $P \in [0.1, 9]$\,d, which concentrates them at low frequency,
+so the excess power steepens the fitted slope. On the synthetic MW set (246 rows,
+\code{02\_compare\_to\_truth.ipynb} \S4.5):
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+injected oscillators & 0 & 1--3 & 4--6 & 7--10 \\
+\midrule
+median $\alpha_\mathrm{fit} - \alpha_\mathrm{inj}$ & $-0.146$ & $+0.170$ & $+0.453$ & $+0.712$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This propagates: a steep continuum raises the $\gamma C(f)$ detection threshold at low
+frequency, so real low-frequency peaks are never seeded into the GP.
+
+\subsection{The GP red-noise SHO has no slope}
+
+The GP red-noise term was \code{quasisep.SHO} with $Q$ fixed at $1/\sqrt{2}$,
+free in $(\sigma, P_\mathrm{rn})$. Its PSD is a broken power law: flat below
+$1/P_\mathrm{rn}$ and $\propto f^{-4}$ above. The only freedom is the break position,
+so a least-squares slope over $0.1$--$12$\,d$^{-1}$ is a one-to-one function of
+$P_\mathrm{rn}$ and saturates at 4. On the synthetic set, that effective slope had
+correlation $-0.07$ with the injected $\alpha$ and sat $\approx +2.1$ above it. It is not
+a biased estimate of $\alpha$; it carries no information about it.
+
+% ===========================================================================
+\section{Fix 1: a power-law GP red-noise kernel}
+% ===========================================================================
+
+\subsection{Construction}
+
+A power law is approximated by a sum of Lorentzians with \emph{fixed}, log-spaced break
+frequencies $f_j$ and weights tied to $\alpha$:
+\begin{equation}
+S_\mathrm{RN}(f) = \sum_{j=1}^{N} \frac{c_j}{1 + (f/f_j)^2},
+\qquad c_j = K\, f_j^{-\alpha}.
+\end{equation}
+In the continuum limit, $\int f'^{-\alpha}\,[1+(f/f')^2]^{-1}\,d\ln f' \propto f^{-\alpha}$
+(substitute $u = f/f'$; the $u$-integral converges for $0<\alpha<2$), so the sum is a power
+law away from the basis edges.
+
+Each Lorentzian is a \code{quasisep.Exp} (OU) kernel,
+$k_j(\tau) = \sigma_j^2 e^{-|\tau|/\ell_j}$ with $\ell_j = 1/(2\pi f_j)$. Its one-sided
+PSD, in the same convention as \code{sho\_psd} ($\int_0^\infty S\,df = \sigma^2$), is
+\begin{equation}
+S_j(f) = \frac{2\sigma_j^2}{\pi f_j}\,\frac{1}{1+(f/f_j)^2},
+\end{equation}
+verified by numerically Fourier-transforming the kernel. Hence
+$\sigma_j^2 = \tfrac{\pi}{2} K f_j^{1-\alpha}$. The overall level is set by the PSD at a
+pivot $f_0 = 1$\,d$^{-1}$:
+\begin{equation}
+K = \frac{S_0}{\sum_j f_j^{-\alpha}\,/\,[1 + (f_0/f_j)^2]},
+\qquad\text{so that } S_\mathrm{RN}(f_0) = S_0.
+\end{equation}
+The free parameters are $\theta_\mathrm{RN} = (\ln S_0,\ \alpha)$ --- two, as for the
+SHO, whatever $N$ is --- so BIC parameter counts are unchanged. Everything is closed-form
+and differentiable, so the JAX gradient path is unaffected.
+
+\textbf{Why $S_0$ and not the total variance.} An earlier prototype
+(\code{rn\_kernel\_demo/}) normalised to the total process variance
+$\sum_j\sigma_j^2$. For $\alpha<1$ that variance is dominated by the highest basis
+terms, which sit above the 24\,d$^{-1}$ Nyquist frequency and are indistinguishable from
+white noise, so the amplitude parameter would be degenerate with the jitter. $S_0$ is
+set by in-band power only. (That prototype's \code{rn\_psd} was also a factor of 2 low;
+slopes were unaffected.)
+
+\subsection{Basis layout}
+
+Accuracy is limited by truncation at the basis edges, not by term density. At fixed
+padding, adding terms does not help; extending the basis does, and at 1.2 decades of
+padding, 1.5 terms per decade is as good as 6. The default is 1.2 decades beyond each end
+of the fitted band at 2 terms per decade: for $0.1$--$12$\,d$^{-1}$ this gives $N=9$,
+$f_j \in [6.3\times10^{-3},\,190]$\,d$^{-1}$.
+
+In-band accuracy of that basis (half peak-to-peak log deviation from a pure power law, and
+the least-squares slope of the summed PSD over the band):
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+$\alpha$ (parameter) & 0.25 & 0.5 & 1.0 & 1.5 & 1.75 \\
+\midrule
+ripple (dex)          & 0.087 & 0.034 & 0.004 & 0.034 & 0.087 \\
+in-band slope         & 0.329 & 0.530 & 1.000 & 1.470 & 1.671 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Truncation pulls the in-band slope toward 1 at the extremes. The parameter $\alpha$ and
+the slope of the spectrum it produces therefore differ by up to 0.08 near the bounds, so
+both are reported (next section); \code{rn\_alpha\_band} is the one to compare with a
+slope measured from data. $\alpha$ is bounded to $[0.05, 1.95]$, inside the convergence
+range. Above 2 the lowest basis term dominates and the in-band shape saturates at
+$f^{-2}$, so a slope steeper than 2 is not representable. Rows pinned at the upper
+bound should be read as ``$\geq 1.95$''.
+
+\subsection{Code changes}
+
+\begin{description}
+\item[\code{gp\_pipeline/gp\_fit.py}]
+  New \code{rn\_basis\_frequencies}, \code{\_powerlaw\_rn\_sigmas} (JAX),
+  \code{powerlaw\_rn\_psd}, \code{\_unpack\_rn\_powerlaw}, and \code{rn\_psd\_from\_fit},
+  which returns the red-noise PSD of any fit dict whichever model it used.
+  \code{build\_multi\_sho\_gp}, \code{neg\_log\_likelihood}, \code{make\_initial\_theta},
+  \code{make\_bounds}, \code{fit\_multi\_sho\_gp} and \code{iterative\_sho\_gp\_fit} take
+  \code{rn\_model} $\in$ \{\code{'powerlaw'}, \code{'sho'}\}, default
+  \code{'powerlaw'}, plus \code{rn\_pad\_decades}, \code{rn\_per\_decade}. The fit dict
+  now records \code{rn\_model}, \code{rn\_basis\_freqs} and \code{rn\_band}. Initial
+  values: $\alpha = 1$, and $S_0$ such that the in-band RN variance is
+  $(0.3\,\mathrm{std}(y))^2$, the same fraction the SHO seeding uses.
+  \code{summarize\_components} emits \code{rn\_alpha}, \code{rn\_alpha\_band},
+  \code{rn\_log10\_S0} and \code{rn\_rms\_band} $= (\int_\mathrm{band} S\,df)^{1/2}$.
+\item[\code{gp\_pipeline/gp\_fit\_result.py}]
+  \code{kspace\_true}, \code{kspace\_compare\_allfits} and \code{\_\_setstate\_\_} route
+  through \code{rn\_psd\_from\_fit} / \code{rn\_model}. Pickles without
+  \code{rn\_model} rebuild as SHO, so old results still load.
+\item[\code{gp\_pipeline/gp\_table\_io.py}]
+  New columns \code{gp\_rn\_alpha}, \code{gp\_rn\_alpha\_band}, \code{gp\_rn\_log10\_S0},
+  \code{gp\_rn\_rms\_band}, \code{gp\_rn\_basis\_freqs}; \code{gp\_rn\_sigma/period/Q}
+  are NaN under the power-law model. \code{recompute\_gp\_psd\_columns} handles both.
+\item[\code{gp\_pipeline/visualize\_gp\_afterfit.py}]
+  PSD panels use \code{rn\_psd\_from\_fit}; the component table shows
+  $\alpha$ and $S_0$ for a power-law RN term.
+\end{description}
+
+\subsection{Checks}
+
+\begin{itemize}
+\item Kernel vs.\ analytic PSD: $4\int_0^\infty k(\tau)\cos(2\pi f\tau)\,d\tau$ of the built
+  kernel matches \code{powerlaw\_rn\_psd} to $<2\times10^{-6}$ relative at
+  $f = 0.1, 1, 5$\,d$^{-1}$; $S_\mathrm{RN}(1) = S_0$ exactly.
+\item Regression: \code{rn\_model='sho'} reproduces the stored BIC of the Aug-21 synthetic
+  table exactly on the rows tested.
+\item Cost: a full 10-component fit takes about the same time with 9 OU terms as with one SHO
+  (17 vs.\ 15\,s on a 1-sector row, 19 vs.\ 18\,s on a 2-sector row, JIT included).
+\end{itemize}
+
+% ===========================================================================
+\section{Fix 2: a peak-masked continuum}
+% ===========================================================================
+
+\subsection{Procedure}
+
+\code{\_fit\_red\_noise\_vaughan\_masked} iterates:
+\begin{enumerate}
+\item fit $\log_{10}P = a + b\log_{10}f$ on the unmasked bins, $C(f) = 10^{a-\beta_k} f^{b}$;
+\item flag bins with $P > k\,C(f)$, and mask every bin within $\Delta f = 1/T_\mathrm{eff}$
+  of a flagged bin (the periodogram's resolution, i.e.\ the peak's main lobe);
+\item repeat until the mask stops changing (cap 20 iterations; stop if fewer than 20\% of
+  bins would remain).
+\end{enumerate}
+The default clip is $k = \ln 100$. Under the null, $X = P/C \sim \mathrm{Exp}(1)$ and the
+clip removes $e^{-k} = 1\%$ of pure-noise bins. Because it sits at a fixed multiple of $C$
+at every frequency, truncation leaves the \emph{slope} unbiased and shifts only the
+intercept. That shift is corrected exactly by replacing $0.25068$ with
+\begin{equation}
+\beta_k = \mathbb{E}[\log_{10}X \mid X<k]
+ = \frac{-\gamma_E - E_1(k) - e^{-k}\ln k}{\ln 10\,(1-e^{-k})},
+\end{equation}
+which tends to $-0.25068$ as $k\to\infty$ ($\beta_{\ln 100} = -0.2607$). With
+$k = \infty$ the masked fit reproduces the old fit to machine precision.
+
+\subsection{Choosing $k$ and the mask width}
+
+Tested on the 246 stored synthetic periodograms (median $\alpha_\mathrm{fit} -
+\alpha_\mathrm{inj}$; last row: correlation with $\alpha_\mathrm{inj}$):
+
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+ & unmasked & $k=\gamma_{1\%}$ & $k=\gamma_{1\%}$, $2\Delta f$ & $k=\ln 100$ & $k=\ln 100$, $2\Delta f$ & $k=3$ \\
+\midrule
+0 osc.     & $-0.146$ & $-0.146$ & $-0.146$ & $-0.136$ & $-0.118$ & $-0.093$ \\
+1--3 osc.  & $+0.170$ & $+0.066$ & $+0.061$ & $-0.001$ & $-0.010$ & $-0.003$ \\
+4--6 osc.  & $+0.453$ & $+0.300$ & $+0.274$ & $+0.196$ & $+0.189$ & $+0.186$ \\
+7--10 osc. & $+0.712$ & $+0.556$ & $+0.444$ & $+0.444$ & $+0.447$ & $+0.353$ \\
+\midrule
+masked fraction & 0 & 0.015 & 0.023 & 0.093 & 0.155 & 0.337 \\
+corr.\ with truth & 0.40 & 0.50 & 0.51 & 0.56 & 0.56 & 0.52 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The global 1\% gate ($\gamma \approx 12.7$) masks too little. $k=3$ masks a third of the
+spectrum for no gain in correlation. Widening the mask to $2/T_\mathrm{eff}$, or to one or
+more single-segment widths ($1/L_\mathrm{seg}$, relevant for multi-sector rows), did not
+help consistently. $k = \ln 100$ at $1/T_\mathrm{eff}$ is the default.
+
+Two alternatives were rejected. A threshold-free fit to per-log-bin medians (10 or 20
+bins, 50th or 25th percentile) is \emph{worse} than no masking under crowding (+0.96 at
+7--10 oscillators): the low-frequency log bins span only a few peak widths, so the peaks
+set the median there.
+
+\subsection{How much of the bias is removable}
+
+On the synthetic table, masking removes the bias for sparse spectra but leaves $+0.2$ to
+$+0.45$ under crowding. Two controlled tests separate estimator failure from test
+design.
+
+\textbf{Idealised periodograms} (independent Exp(1) bins times $C(f)+S(f)$, with sinc$^2$
+lines at uniform periods, 1-sector grids): masking takes the bias from $+0.40$ to $+0.02$
+for 8 lines at $R = S/C \in [10,100]$, and from $+0.10$ to $+0.02$ for 8 sub-threshold
+lines at $R\in[1,3]$.
+
+\textbf{Real sampling.} Using the real timestamps and errors of 60 one-sector rows, red
+noise from the generator's \code{red\_noise\_series}, and oscillators drawn from the
+generator's own amplitude and period distributions, the shift in fitted $\alpha$
+\emph{caused by adding oscillators} (same realisation of red noise and white noise with
+and without them) is:
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+oscillators & 0 & 4 & 10 \\
+\midrule
+unmasked & 0 & $+0.110$ & $+0.231$ \\
+masked   & 0 & $+0.025$ & $+0.080$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Masking cuts the oscillator-induced bias about fourfold and adds none on its own. The
+larger leftover on the synthetic table is specific to that test (a different red-noise
+amplitude distribution, calibrated against the unmasked fit on the longest sector) and was
+not chased further.
+
+\subsection{Code changes}
+
+\begin{description}
+\item[\code{table\_pipeline/lc\_lsp.py}]
+  New \code{\_truncated\_exp\_log10\_mean} and \code{\_fit\_red\_noise\_vaughan\_masked}.
+  \code{load\_and\_process\_sectors} takes \code{rn\_mask\_peaks=True},
+  \code{rn\_mask\_k=ln 100}, and returns \code{(log10\_N, alpha, mask\_frac)}.
+  \code{\_fit\_red\_noise\_vaughan} is unchanged.
+\item[\code{table\_pipeline/sector\_expansion.py}]
+  \code{expand\_table} passes \code{rn\_mask\_peaks}, \code{rn\_mask\_k} through and emits
+  \code{rn\_mask\_frac}. \code{rn\_mask\_peaks=False} reproduces the stored Aug-21 values
+  exactly (checked on one cluster).
+\item[\code{table\_pipeline/lsp\_stats.py}]
+  New \code{refit\_red\_noise\_columns(table)}: the same masked fit from the stored
+  \code{LSP\_freq}/\code{LSP\_power}/\code{LC\_t}, without rerunning
+  \code{expand\_table}. Old values are kept as \code{rn\_alpha\_unmasked},
+  \code{rn\_log10\_N\_unmasked}. Rerun \code{add\_lsp\_metrics} afterwards, and the GP
+  fits too if they use \code{threshold\_mode='red\_noise'}.
+\end{description}
+
+% ===========================================================================
+\section{Results on the synthetic set}
+% ===========================================================================
+
+\subsection{Runs}
+
+The 246 synthetic MW rows (124 clusters, 1--3 sectors) were fitted three times with the
+\code{add\_gp\_fits} settings of \code{generate\_table.ipynb} (\code{max\_components=10},
+\code{fit\_full\_only}, \code{threshold\_mode='red\_noise'}, two-phase fitting, period and
+$Q$ priors):
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+config & GP red-noise term & continuum used to seed peaks \\
+\midrule
+\code{sho}            & fixed-$Q$ SHO (the Aug-21 table)     & unmasked \\
+\code{powerlaw}       & OU basis, \code{rn\_model='powerlaw'} & unmasked \\
+\code{powerlaw+mask}  & OU basis                              & masked (\code{refit\_red\_noise\_columns}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\code{powerlaw} vs.\ \code{sho} isolates the kernel; \code{powerlaw+mask} vs.\
+\code{powerlaw} isolates the continuum. Each run took $\sim$11\,min on 30 processes.
+Tables: \code{data/cluster\_table\_Sep16\_3sectorcombos\_synthetic\_gpPL\{,\_masked\}.pkl}.
+Analysis: \code{synth/compare.py} (\code{slope\_recovery\_table},
+\code{gp\_recovery\_table}, \code{bic\_comparison}, \code{plot\_slope\_recovery}),
+\S5 of \code{02\_compare\_to\_truth.ipynb}, figure
+\code{figs/rn\_fix\_slope\_recovery.png}.
+
+\subsection{Slope recovery}
+
+Median fitted $-$ injected $\alpha$. For the GP, the slope is \code{gp\_rn\_alpha\_band}
+(power law) or the break-derived effective slope (SHO).
+
+\begin{center}
+\begin{tabular}{llcccccc}
+\toprule
+config & estimator & 0 osc. & 1--3 & 4--6 & 7--10 & med.\ $|\Delta|$ & $r$ \\
+\midrule
+\code{sho}           & Vaughan & $-0.146$ & $+0.170$ & $+0.453$ & $+0.712$ & 0.287 & 0.40 \\
+\code{sho}           & GP      & $+2.373$ & $+2.066$ & $+1.984$ & $+2.039$ & 2.093 & $-0.07$ \\
+\code{powerlaw}      & GP      & $+0.208$ & $+0.410$ & $+0.672$ & $+0.494$ & 0.411 & 0.70 \\
+\code{powerlaw+mask} & Vaughan & $-0.136$ & $-0.001$ & $+0.195$ & $+0.444$ & 0.196 & 0.56 \\
+\code{powerlaw+mask} & GP      & $+0.208$ & $+0.407$ & $+0.535$ & $+0.459$ & 0.383 & 0.73 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The GP red-noise term goes from uncorrelated with the truth ($r=-0.07$) to $r = 0.73$, and
+its median error drops from 2.09 to 0.38. Unlike the unmasked Vaughan fit, its bias does
+not grow steadily with crowding: the SHO signal components absorb the peaks. The masked
+continuum removes the bias entirely for 1--3 oscillators and roughly halves it at 4--10.
+
+\subsection{Where the remaining GP slope bias comes from}
+
+The GP slope is still $+0.2$ to $+0.5$ too steep, including with zero oscillators. Split by
+injected slope (\code{powerlaw+mask}):
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+injected $\alpha$ & $\le 0.5$ & 0.5--1.0 & 1.0--1.5 & $>1.5$ \\
+\midrule
+GP bias               & $+0.69$ & $+0.51$ & $+0.30$ & $+0.14$ \\
+masked Vaughan bias   & $+0.75$ & $+0.04$ & $-0.05$ & $-0.03$ \\
+GP at upper $\alpha$ bound & 7\% & 6\% & 13\% & 67\% \\
+rows & 83 & 55 & 60 & 48 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three separate effects:
+
+\textbf{(a) Shallow injections are oscillator-dominated.} At $\alpha\le0.5$ \emph{both}
+estimators are $\sim+0.7$ steep. The generator draws $(\alpha, \log_{10}N)$ jointly with
+correlation $+0.87$, so shallow red noise is also faint. Those spectra are dominated by
+the oscillator forest, which is weighted to low frequency (uniform in period). The
+spectrum really is steeper than the injected red noise, so this is not a fitting error.
+
+\textbf{(b) The generator's 30-min interpolation grid steepens the time-domain slope.}
+For $0.5<\alpha<1.5$ the masked Vaughan fit is unbiased but the GP is not. The generator
+builds red noise on a 30-min grid and linearly interpolates it onto the timestamps, a
+triangle filter that suppresses power toward Nyquist. The time-domain likelihood sees that
+up to 24\,d$^{-1}$; the periodogram fit, capped at 12\,d$^{-1}$, mostly does not.
+Controlled test: GP fits with red noise only on the real sampling of 8 one-sector rows,
+median $\alpha_\mathrm{band}-\alpha$:
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+generation grid & $\alpha=0.5$ & 1.0 & 1.5 \\
+\midrule
+30 min (as the generator) & $+0.399$ & $+0.335$ & $+0.239$ \\
+2 min (near point sampling) & $-0.084$ & $-0.007$ & $-0.003$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The power-law kernel is unbiased for a point-sampled power law. \textbf{But real data is
+not point-sampled.} Each 30-min FFI exposure averages the signal (and \code{resample\_lc}
+block-averages 10-min and 200-s data into 30-min bins, so every row carries an effective
+30-min boxcar). Repeating the test with a 1-min grid averaged over a 30-min window around
+each timestamp (8 rows, amplitude normalised after sampling; interpolation re-run in the
+same setup for reference):
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+sampling & $\alpha=0.5$ & 1.0 & 1.5 \\
+\midrule
+point                        & $-0.149$ & $-0.040$ & $-0.008$ \\
+30-min exposure average      & $+0.356$ & $+0.379$ & $+0.277$ \\
+30-min grid + interpolation  & $+0.701$ & $+0.621$ & $+0.296$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+So exposure averaging \emph{alone} biases the GP slope by $\approx+0.3$. This is a
+real-data effect, not only a test artefact. (An earlier draft of this note called it
+mild; that was wrong.) The periodogram fit, capped at 12\,d$^{-1}$ where the averaging
+filter is $\geq 0.81$, is much less affected. The generator's interpolation adds a
+further, test-specific bias on top.
+
+\textbf{(c) The upper bound.} 67\% of rows with injected $\alpha>1.5$ are pinned at
+$\alpha = 1.95$, where the in-band slope saturates at $\approx1.80$ (the ceiling in
+the figure). The injected slopes reach 2.3, beyond what the construction can represent.
+If steep red noise matters, the options are more low-frequency padding (which raises the
+saturation slope) or adding an $f^{-4}$ SHO-like term; neither has been tried.
+
+\subsection{Effect on oscillator recovery}
+
+Detectability is judged against the \emph{masked} continuum in every column, so
+``detectable'' means the same thing throughout. That is why \code{sho}'s detectable
+recovery here (0.743) differs from the 0.957 in notebook \S4, which used its own unmasked
+continuum and so counted fewer oscillators as detectable (423 vs.\ 611).
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & \code{sho} & \code{powerlaw} & \code{powerlaw+mask} \\
+\midrule
+recovery, all injected            & 0.425 & 0.460 & 0.592 \\
+recovery, detectable (611)        & 0.743 & 0.771 & 0.931 \\
+recovery, not detectable          & 0.047 & 0.089 & 0.189 \\
+detectable but missed             & 157   & 140   & 42 \\
+GP components (total)             & 850   & 850   & 1342 \\
+component purity                  & 0.759 & 0.784 & 0.733 \\
+mean components per row           & 3.46  & 3.46  & 5.46 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The kernel change alone improves recovery modestly (+3\% detectable) and purity
+slightly. The masked continuum is the bigger lever. Its lower low-frequency threshold
+seeds more real peaks, cutting missed detectable oscillators from 140 to 42, at the cost
+of $\sim$2 more components per row and a 5-point drop in purity. The $Q$ filter from
+notebook \S4.4 is the natural way to recover that purity.
+
+\textbf{BIC.} Rows share their data across configs, so per-row BIC is comparable.
+\code{powerlaw} vs.\ \code{sho}: median $\Delta\mathrm{BIC} = -1.4$, better on 55\% of
+rows. That is a small likelihood gain, at the same parameter count, from a term that is
+finally the right shape. The \code{powerlaw+mask} BIC median ($+7.5$) mixes in different
+component counts. On the 93 rows with equal counts it is $-0.7$, better on 55\%.
+
+% ===========================================================================
+\section{Generator change: exposure-averaged sampling}
+% ===========================================================================
+
+Following \S4.3, \code{synth/generate.py} now builds $x(t)$ on a 1-min grid
+(\code{GRID\_CADENCE\_MIN}) and writes, for each real timestamp, the average of $x$ over
+that point's exposure $[t-E/2,\,t+E/2]$. $E$ is the sector's native cadence (median time
+step: 29.97, 10 or 3.33\,min), so mixed-cadence clusters are handled per sector
+(\code{exposure\_average}, \code{sector\_exposure\_days}). The average uses a running
+trapezoid integral, $O(N_\mathrm{grid})$. The red-noise amplitude calibration
+(\code{\_calibrate\_red\_scale}) applies the same averaging to the reference sector,
+so the calibrated $\log_{10}N$ refers to the data as written. Truth statistics use a
+point-sampled 30-min subgrid (\code{TRUTH\_CADENCE\_MIN}), so their definitions are
+unchanged.
+
+Checks: a $P=0.1$\,d sinusoid averaged over 30\,min is attenuated by 0.9300 against the
+analytic $\mathrm{sinc}(E/P) = 0.9301$ (the injected \code{amplitudes} stay intrinsic);
+generated files have identical HDU structure, timestamps and \code{flux\_err} to the real
+ones; about 0.5\,s per cluster. The existing \code{light\_curves\_synthetic/} and
+\code{ground\_truth.pkl} were \emph{not} regenerated, so the synthetic tables above use
+the old sampling. Regenerating means rerunning notebook 01 and then the pipeline.
+
+% ===========================================================================
+\section{The $\alpha < 2$ cap}
+% ===========================================================================
+
+\subsection{Why the OU basis cannot exceed $f^{-2}$}
+
+\textbf{A hard shape limit.} Each OU term has PSD $\propto [1+(f/f_j)^2]^{-1}$, whose
+local log-slope $d\ln S_j/d\ln f = -2(f/f_j)^2/[1+(f/f_j)^2]$ lies in $[-2, 0]$ at every
+frequency. The log-slope of a positive sum is a weighted average of the terms' log-slopes
+(weights $S_j/\sum S_j$), so it also lies in $[-2,0]$. \emph{No} choice of weights, number
+of terms or break frequencies makes a sum of OU kernels steeper than $f^{-2}$ anywhere.
+
+\textbf{An identifiability limit below that.} With $c_j\propto f_j^{-\alpha}$, each term
+contributes $c_j f_j^2 f^{-2} \propto f_j^{2-\alpha} f^{-2}$ above its break. For
+$\alpha<2$ the higher-frequency terms matter and the sum bends to $f^{-\alpha}$. For
+$\alpha\ge 2$ the lowest-frequency term dominates, the in-band shape is simply $f^{-2}$,
+and changing $\alpha$ no longer changes the spectrum. The likelihood goes flat and
+$\alpha$ drifts. Equivalently, the continuum-limit integral
+$\int_0^\infty u^{\alpha-1}/(1+u^2)\,du$ diverges at $\alpha=2$. Hence the bound at 1.95.
+With finite padding (1.2\,dec), the in-band slope at $\alpha=1.95$ is only $\approx 1.80$.
+
+\textbf{Raising it.} The limit comes from the OU kernel's $f^{-2}$ tail, not from the
+construction. A basis of Mat\'ern-3/2 kernels (\code{quasisep.Matern32}), with PSD
+$\propto[1+(f/f_j)^2]^{-2}$ and so log-slopes in $[-4,0]$, admits the same tied-weight
+construction for $0<\alpha<4$ (the integral $\int u^{\alpha-1}/(1+u^2)^2\,du$ converges
+there). The cost is two state dimensions per term instead of one. Not implemented.
+
+\subsection{Does the real data reach it?}
+
+\textbf{Periodogram slopes.} Refitting the continuum with masking on the two June real
+tables (\code{refit\_red\_noise\_columns}; the stored values are unmasked):
+
+\begin{center}
+\begin{tabular}{llccccc}
+\toprule
+table & fit & p50 & p95 & p99 & max & $>1.8$ \,/\, $>1.95$ \\
+\midrule
+3-sector combos (1250) & unmasked & 1.00 & 1.72 & 1.91 & 2.18 & 3.1\% / 0.9\% \\
+                       & masked   & 0.74 & 1.59 & 1.81 & 2.10 & 1.1\% / 0.6\% \\
+single sector (2204)   & unmasked & 1.00 & 1.74 & 1.90 & 2.18 & 3.2\% / 0.8\% \\
+                       & masked   & 0.74 & 1.62 & 1.86 & 2.10 & 1.8\% / 0.5\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Masking lowers the whole distribution (median $1.00\to0.74$). By this measure only
+$\sim$1--2\% of rows are steeper than the OU basis can represent. They are mostly MW
+(3.5\% of MW rows vs.\ $\le$1.6\% LMC, 0\% SMC), from 5--9 of 348 clusters.
+
+\textbf{GP slopes.} The GP's own slope is what the cap constrains, and it need not agree.
+Power-law GP fits with the notebook settings on 30 single-sector rows with masked
+$\alpha>1.5$, and on 30 random rows:
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+rows & pinned at 1.95 & at 0.05 & median Vaughan & median GP (in-band) & corr. \\
+\midrule
+masked $\alpha>1.5$ & 12/30 & 3/30 & 1.71 & 1.55 & --- \\
+random             & 8/30  & 1/30 & 0.89 & 1.44 & $-0.06$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{What the pins are.} Each of these 60 rows was refitted with $\alpha$ fixed at 1.0
+(everything else identical; the number of SHO components was the same in every pair), and
+the log-likelihoods compared, $\Delta\ln L = \ln L_\mathrm{free} - \ln L_{\alpha=1}$. The
+red-noise strength is measured as the red-noise PSD at 1\,d$^{-1}$ over the white-noise
+PSD $2\sigma^2\Delta t$. The 8 pinned random rows split into:
+
+\begin{center}
+\begin{tabular}{lcl}
+\toprule
+kind & rows & evidence \\
+\midrule
+no red noise at all       & 4 & RN/WN $\approx 0$, $\Delta\ln L = 0$: amplitude driven to zero, $\alpha$ irrelevant \\
+genuinely steep           & 2 & $\Delta\ln L = +14,\ +87$: the data prefer 1.95 over 1 \\
+weak preference           & 1 & $\Delta\ln L = +0.9$ \\
+optimiser failure         & 1 & $\Delta\ln L = -12.8$: the free fit is \emph{worse} than $\alpha=1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+So the real cap-limited rate in the random sample is $\sim$2--3 of 30, not 8. That is
+higher than the 1--2\% from periodogram slopes, as expected: exposure averaging adds
+$\approx+0.3$ to GP slopes, and 7--8\% of rows have masked periodogram $\alpha > 1.5$.
+In the steep sample, 5 of 12 pins are genuinely steep, 1 has no red noise and 6 are
+optimiser failures.
+
+\textbf{Lower bound.} Pins at $\alpha = 0.05$ are harmless. A flat red-noise spectrum is
+white noise, degenerate with the jitter term, and every such row had
+$|\Delta\ln L| < 7$.
+
+\textbf{Two real problems this exposed.}
+\begin{enumerate}
+\item \emph{White-noise-dominated rows} do not fit $\alpha \to 0$. The jitter already
+  describes the white noise, so the fit drives the red-noise amplitude to zero and
+  $\alpha$ floats, often to 1.95. For these rows $\alpha$ should be reported as undefined
+  (e.g.\ NaN when RN/WN at 1\,d$^{-1}$ is below a threshold), not read as steep.
+\item \emph{The $\alpha$ fit gets stuck.} In 4 of 30 random rows and 13 of 30 steep rows,
+  the free fit ends with $\ln L$ more than 1 below the $\alpha=1$ fit, which is impossible
+  at a true optimum since $\alpha=1$ is inside the bounds. Seven of these are interior, not
+  pinned (worst $\Delta\ln L = -152$). L-BFGS-B from $\alpha_0=1$ is leaving the good basin,
+  likely during the two-phase fit while the SHO periods are frozen. Candidate fixes:
+  starting $\alpha$ at the masked periodogram slope, or refitting from a second starting
+  $\alpha$ and keeping the better result. This also affects the synthetic results in
+  \S4.
+\end{enumerate}
+
+% ===========================================================================
+\section{White-noise flag and stuck $\alpha$ fits}
+% ===========================================================================
+
+\subsection{Flag: red noise indistinguishable from white noise}
+
+\code{rn\_white\_noise\_features} (called for every power-law fit) stores
+\code{rn\_wn\_ratio} $= S_\mathrm{RN}(1\,\mathrm{d}^{-1}) / [2\,\mathrm{median}(\sigma^2 +
+\sigma_\mathrm{jit}^2)\,\Delta t]$ and \code{rn\_near\_white\_noise} $=$ ratio $<$
+\code{rn\_wn\_flag\_ratio} (default 0.05). The table columns are \code{gp\_rn\_wn\_ratio} and
+\code{gp\_rn\_near\_white\_noise}. Where the flag is set, $\alpha$ is undefined. On the 60
+real rows, 16 fits were flagged, and in every one the log-likelihood with $\alpha$ free
+differed from $\alpha$ fixed at 1 by at most 2.1: the data do not constrain the slope there.
+Pins at the lower bound are not a problem: a flat red-noise spectrum is white noise.
+
+\subsection{Stuck fits: seeding does not help, releasing $\alpha$ last does}
+
+Four strategies on the same 60 real single-sector rows, notebook settings, identical
+component counts throughout. ``Fail'' means the final $\ln L$ is more than 1 below the fit
+with $\alpha$ fixed at 1. ``Below best'' is counted against the best $\ln L$ any variant
+reached for that row.
+
+\begin{center}
+\begin{tabular}{llcccc}
+\toprule
+rows & strategy & fail & worst $\Delta\ln L$ & below best by $>1$ & pinned at 1.95 \\
+\midrule
+random & free, $\alpha_0=1$ (default)              & 4  & $-16.4$  & 11 & 8 \\
+       & free, $\alpha_0$ = masked Vaughan slope    & 5  & $-28.1$  & 10 & 12 \\
+       & release last, $\alpha_0=1$                 & 0  & $-0.03$  & 6  & 1 \\
+       & release last, $\alpha_0$ = Vaughan         & 4  & $-7.3$   & 4  & 0 \\
+\midrule
+steep  & free, $\alpha_0=1$ (default)              & 13 & $-152.5$ & 17 & 12 \\
+       & free, $\alpha_0$ = Vaughan                 & 11 & $-30.9$  & 11 & 14 \\
+       & release last, $\alpha_0=1$                 & 0  & $0.00$   & 11 & 2 \\
+       & release last, $\alpha_0$ = Vaughan         & 8  & $-22.9$  & 11 & 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Seeding} with the measured slope (\code{rn\_alpha\_init='measured'}) rescues some
+rows (up to +152) but breaks as many (down to $-28$), and 8 failures are unchanged. The
+starting $\alpha$ is not the cause. With $\alpha$ held fixed, the oscillator terms and jitter
+settle into a better solution; with $\alpha$ free from the start, the joint fit drifts into
+a worse one.
+
+\textbf{Releasing $\alpha$ last} (\code{rn\_alpha\_release\_last=True}) holds $\alpha$ at its
+seed through the usual stages, then frees it in one extra L-BFGS-B stage started from that
+solution. Every stage is kept only if it does not worsen the objective, so the result can
+never be worse than the fixed-$\alpha$ fit. With $\alpha_0 = 1$ that guarantee holds (zero
+failures), and pins at 1.95 drop from 8 to 1 (random) and 12 to 2 (steep).
+
+\textbf{Correction: that drop is mostly $\alpha$ not moving.} In the final stage, $\alpha$
+stays within 0.02 of its seed in 15/30 random and 24/30 steep real rows, against 1/30 and
+0/30 for the free fit. The fewer pins came from the release stage stopping in the local
+optimum around $\alpha = 1$, not from better fits.
+
+\textbf{Synthetic rerun.} With release-last as the default, the full synthetic comparison
+(\code{+release}, same 246 rows, masked continuum) got \emph{worse} than
+\code{powerlaw+mask}:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+ & \code{powerlaw+mask} (free $\alpha$) & \code{+release} \\
+\midrule
+GP slope: corr.\ with truth / median $|\Delta\alpha|$ & 0.73 / 0.38 & 0.38 / 0.54 \\
+GP $\alpha$ pinned at 1.95 / within 0.02 of 1          & 20\% / 2\%  & 3\% / 40\% \\
+recovery of detectable oscillators                    & 0.931       & 0.900 \\
+detectable but missed                                 & 42          & 61 \\
+median $\Delta$BIC vs.\ \code{sho}, equal components  & $-0.7$      & $+5.4$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Per row, $\ln L_\mathrm{release} - \ln L_\mathrm{free}$ has median $-0.01$, but 31\% of rows are
+worse by $>1$ and 23\% better by $>1$ (range $-182$ to $+242$). The 99 rows stuck at
+$\alpha\approx1$ lose a median 6.3 in $\ln L$. Neither strategy dominates: the free fit
+sometimes ends below the fixed-$\alpha$ solution, and release-last usually cannot leave
+it. A version that is never worse than either is to run both and keep the higher objective,
+at roughly twice the fit cost; not yet tested.
+
+\code{fit\_multi\_sho\_gp}'s two-phase block was rewritten as a stage loop to support this.
+With \code{rn\_alpha\_release\_last=False} it reproduces the previous fits exactly
+($\Delta\ln L = 0$ on 6 regression rows). The default was switched to \texttt{True} for the
+synthetic rerun above and then reverted to \texttt{False} on that result; the run-both
+variant was not pursued. Table:
+\code{data/cluster\_table\_Sep16\_3sectorcombos\_synthetic\_gpPL\_masked\_release.pkl}.
+
+% ===========================================================================
+\section{Regenerated synthetic set: three ways to set the GP $\alpha$}
+% ===========================================================================
+
+The synthetic set was regenerated with exposure-averaged sampling (\S5). The seed was
+unchanged, so every injected period, amplitude and $(\alpha,\log_{10}N)$ is identical to the
+old set; the old truth is kept as \code{ground\_truth\_Aug20\_interp30.pkl}.
+\code{expand\_table} (masked continuum) gave the same 367 MW rows, and the notebook's row
+selection gave the same 246. Three GP configurations, all power-law RN, masked-continuum
+peak seeding, notebook settings:
+\code{free} ($\alpha_0=1$, the default); \code{vaughan\_release}
+(\code{rn\_alpha\_init='measured'}, \code{rn\_alpha\_release\_last=True}); and
+\code{vaughan\_fixed} (\code{rn\_alpha\_fixed=True}, new: $\alpha$ held at the masked
+Vaughan slope and not counted in the BIC). The 738 fits took 36\,min on 12 niced workers,
+each pinned to one core.
+Tables: \code{data/cluster\_table\_Sep17\_3sectorcombos\_synthetic\_expavg\_\{base,gp\_*\}.pkl}.
+Figures: \code{sytheticdata\_generate\_compare/figs/rn\_configs\_expavg\_\{1\_scatter,2\_bias,3\_loglike,4\_recovery\}.png}.
+
+Slope statistics are over the 217 rows where the free fit detects red noise
+(\code{gp\_rn\_near\_white\_noise} false):
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+estimator & med.\ bias & med.\ $|\Delta\alpha|$ & $r$ & bias, 0 osc. & bias, 7--10 osc. \\
+\midrule
+Vaughan (masked)                 & $+0.04$ & 0.20 & 0.55 & $-0.15$ & $+0.35$ \\
+GP, $\alpha$ free                & $+0.27$ & 0.27 & 0.71 & $+0.22$ & $+0.31$ \\
+GP, Vaughan seed, release last   & $+0.26$ & 0.27 & 0.64 & $+0.21$ & $+0.36$ \\
+GP, fixed at Vaughan             & $+0.04$ & 0.19 & 0.55 & $-0.14$ & $+0.30$ \\
+\midrule
+GP free $-$ constant offset (2-fold CV by cluster) & $+0.01$ & \textbf{0.10} & 0.71 & & \\
+GP free, linear calibration (CV)                  & $-0.09$ & 0.16 & 0.68 & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+\item \textbf{Regeneration removed the test artefact.} The free GP's bias went from $+0.38$
+  to $+0.27$, and to $+0.22$ with no oscillators, which matches the $\approx+0.3$
+  expected from 30-min exposure averaging alone.
+\item \textbf{Seeding changes nothing once $\alpha$ is released.} It returns to the free
+  fit's offset ($+0.26$) with more scatter ($r$ 0.64 vs.\ 0.71). The offset comes from the
+  likelihood itself, not the starting point.
+\item \textbf{Fixing $\alpha$ at Vaughan} reproduces the Vaughan numbers but fits worse:
+  $\ln L$ is more than 1 below the free fit in 73\% of rows (release-last: 26\% worse,
+  20\% better, 53\% within $\pm1$). The GP likelihood genuinely prefers a steeper
+  $\alpha$, because the kernel lacks the exposure filter.
+\item \textbf{Oscillator recovery does not depend on the strategy}: 92.1 / 92.3 /
+  91.3\% of detectable oscillators recovered (48 / 47 / 53 missed), purity 73.0 / 72.7 /
+  70.9\%.
+\item \textbf{The free GP is the best slope estimator after a constant offset}: median
+  error 0.10, half the Vaughan fit's, with the best correlation. A linear calibration is
+  worse, because the rows pinned at $\alpha=1.95$ (49 of 217; 36 of them with $\geq4$
+  oscillators) distort the fit.
+\end{itemize}
+
+% ===========================================================================
+\section{Correcting the GP slope: constant offset vs.\ exposure-filtered basis}
+% ===========================================================================
+
+\subsection{Why the unfiltered basis reads steep}
+
+Every pipeline flux value is an average over its exposure: \code{resample\_lc} puts all rows
+on 30-min bins whatever the native cadence, and the native 30-min FFI points are themselves
+30-min integrations. A boxcar average of length $E$ multiplies the spectrum by
+$\mathrm{sinc}^2(fE)$, which keeps 81\% of the power at 12\,d$^{-1}$ but only 41\% at the
+24\,d$^{-1}$ Nyquist frequency. So the data carry
+\begin{equation}
+S_\mathrm{data}(f) = S_0 (f/f_0)^{-\alpha}\,\mathrm{sinc}^2(fE),
+\end{equation}
+while the kernel offers only $S_0 (f/f_0)^{-\alpha}$. The likelihood has one way to imitate
+the missing roll-off --- tilt the whole power law --- so the fitted $\alpha$ comes out
+$\approx0.3$ steep and is an \emph{apparent} slope, part spectrum and part smoothing.
+
+\subsection{Exposure-filtered basis (option 2b), now the default}
+
+\code{iterative\_sho\_gp\_fit(rn\_exposure\_min=30)} --- the default since 2026-09-17 ---
+replaces the analytic basis weights with
+\code{exposure\_weight\_table}: per $\alpha$ (0.025 grid), log-weight corrections $u_j$ fitted
+so that $\sum_j f_j^{-\alpha}e^{u_j}/[1+(f/f_j)^2]$ matches $f^{-\alpha}\,\mathrm{sinc}^2(fE)$
+from $5 f_{j,\min}$ to Nyquist (weight 1), and the mean sinc$^2$ envelope up to
+$10\times$Nyquist (weight 0.1), with ridge 0.1 and warm starts along $\alpha$. Inside the
+likelihood the corrections are linearly interpolated in $\alpha$ (\code{jnp.interp}), so the
+kernel is still 9 OU terms:
+\begin{equation}
+c_j = S_0\,f_0^{\alpha}\,f_j^{-\alpha}\,e^{u_j(\alpha)},
+\qquad \sigma_j^2 = \tfrac{\pi}{2} c_j f_j .
+\end{equation}
+At $\alpha=1$ the corrections are $u \approx (-0.1, 0.0, -0.4, 0.0, -0.6, +0.3, -0.7,
+-4.3, -4.6)$: mild adjustments in band, and a $\sim$70-fold suppression of the two terms
+above Nyquist, which bends the model's high-frequency end down the way the exposure does.
+Cost and parameter count are unchanged --- 712\,s for 246 rows against 722\,s for the
+unfiltered fit, still two free parameters, so BIC comparisons still line up. $S_0$ and $\alpha$ now describe
+the \emph{intrinsic} spectrum; \code{rn\_alpha\_band} divides the filter back out. The table
+matches the filtered power law to 0.02--0.05\,dex over 0.1--12\,d$^{-1}$, and the kernel's
+Fourier transform matches its analytic PSD to $<3\times10^{-6}$. New column:
+\code{gp\_rn\_exposure\_days}.
+
+Controlled test (8 real one-sector samplings, red noise only, median fitted $-$ true $\alpha$):
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & $\alpha=0.5$ & 1.0 & 1.5 \\
+\midrule
+point samples, unfiltered basis     & $-0.22$ & $-0.04$ & $+0.03$ \\
+30-min averages, unfiltered basis   & $+0.35$ & $+0.40$ & $+0.42$ \\
+30-min averages, filtered basis     & $+0.03$ & $+0.08$ & $+0.08$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Synthetic comparison}
+
+Free $\alpha$ with the filtered basis on the 246 regenerated synthetic rows (246 fits,
+12\,min, 12 pinned workers), against the free fit without it. Option 1 subtracts a constant
+offset estimated with 2-fold cross-validation \emph{by cluster} (offsets 0.265 and 0.260).
+201 rows have red noise detected in both fits. Figures:
+\code{figs/rn\_option1\_vs\_2b\_\{1\_scatter,2\_bias,3\_error\_cdf,4\_fit\_and\_recovery\}.png}.
+
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+ & med.\ bias & med.\ $|\Delta\alpha|$ & p84 $|\Delta\alpha|$ & $r$ & bias $\alpha\le0.5$ & bias $\alpha>1.5$ \\
+\midrule
+Vaughan (masked)              & $+0.01$ & 0.18 & 0.72 & 0.59 & $+0.70$ & $-0.04$ \\
+GP free, raw                  & $+0.26$ & 0.26 & 0.47 & 0.78 & $+0.48$ & $+0.17$ \\
+option 1: free $-$ constant   & $-0.00$ & 0.08 & 0.33 & 0.78 & $+0.22$ & $-0.10$ \\
+option 2b: filtered basis     & $+0.07$ & 0.10 & 0.32 & 0.66 & $+0.19$ & $+0.10$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+\item \textbf{Both fix the offset}, with median errors of 0.08 and 0.10 against 0.18 for Vaughan
+  and 0.26 raw.
+\item \textbf{Option 2b is the better model}: $\ln L$ improves in 64\% of rows (median
+  $+2.6$) and worsens in 13\%. Its bias is flatter across $\alpha$, and it has no ceiling:
+  option 1 caps at $1.95_{\rm band}-0.26\approx1.53$, which biases steep rows low. It needs
+  no constant calibrated on synthetic data. Rows pinned at 1.95 fall from 43 to 20.
+\item \textbf{The lower $r$ for 2b comes from 18 outliers} ($|\Delta\alpha|>0.8$): shallow
+  injections (median $\alpha$ 0.24) in crowded rows (median 6 oscillators), fitted with the
+  maximum 10 GP components, half of them pinned at 1.95. Option 1 compresses the same rows to
+  $\approx1.53$, which flatters its $r$. Without them, $r$ is 0.94 (2b) vs.\ 0.92 (option 1),
+  and the median error 0.081 vs.\ 0.078. These rows ran out of components, so unmodelled
+  oscillator power leaks into the red-noise term; \code{gp\_n\_components == max\_components}
+  is a natural quality flag.
+\item Oscillator recovery is unchanged (92.1\% vs.\ 92.6\% of detectable; purity 73.0\% vs.\ 73.5\%).
+\end{itemize}
+
+\subsection{What is now the default}
+
+\code{rn\_exposure\_min=30.0} in \code{iterative\_sho\_gp\_fit} (and so through
+\code{add\_gp\_fits}), with the value also written explicitly in
+\code{generate\_table.ipynb}. Option 1 is \emph{not} applied anywhere: no constant is
+subtracted from any column. Pass \code{rn\_exposure\_min=None} for point-sampled data, or
+the true exposure if the light curves were not resampled --- the filter is only right for
+the exposure actually in the data.
+
+Limits to keep in mind: the table is accurate to 0.02--0.05\,dex over 0.1--12\,d$^{-1}$ but
+degrades near $\alpha \approx 1.9$ (0.27\,dex at Nyquist), where the OU tails cannot follow a
+steep spectrum and the filter cut-off at once; and the 18 crowded, shallow outliers above
+are unaffected by any of this, since they come from oscillator power leaking into the
+red-noise term once the fit runs out of components.
+
+% ===========================================================================
+\section{The white-noise limit: a prior on $\alpha$}
+% ===========================================================================
+
+\subsection{The problem}
+
+White noise is the $\alpha \to 0$ limit of red noise, so in principle a vanishing red-noise
+term should simply report a flat spectrum. It does not, because the kernel carries a
+separate jitter term, and a flat red-noise component is degenerate with it. Faced with a
+light curve holding no red noise, the fit therefore drives the red-noise \emph{amplitude}
+to zero and leaves $\alpha$ unconstrained.
+
+On the first real-data run (1250 rows) this affected the 417 rows flagged
+\code{gp\_rn\_near\_white\_noise}: red noise a factor $10^{-6}$ below the white noise at
+1\,d$^{-1}$, an in-band RMS $6\times10^{-4}$ of the flux error --- and a median fitted
+$\alpha$ of \textbf{1.76}, with half the rows piled between 1.8 and the 1.95 bound. Read
+naively that is a population of steep-spectrum clusters which does not exist, and it is
+\emph{anticorrelated} with the red-noise amplitude, so a flexible model could use the
+junk $\alpha$ as a proxy for "amplitude is small".
+
+\subsection{The prior}
+
+\code{\_rn\_alpha\_wn\_neg\_log\_prior} adds
+\begin{equation}
+-\ln p(\alpha) = w_{\rm pr}\,\alpha^2\;\sigma\!\left(-\frac{\log_{10}(r/r_0)}{\Delta}\right),
+\qquad r = \frac{S_0}{2\,\mathrm{med}(\sigma_i^2 + \sigma_{\rm jit}^2)\,\Delta t},
+\end{equation}
+with $\sigma$ the logistic function: $r$ is the red-noise PSD at the pivot over the
+white-noise PSD, the same quantity as \code{rn\_wn\_ratio}. Defaults
+$w_{\rm pr} = 1$, $r_0 = 0.1$, $\Delta = 0.5$ decades
+(\code{rn\_alpha\_wn\_prior\_weight/\_ratio/\_width}; weight 0 disables it). The switch is
+sharp enough to leave real red noise alone --- the penalty weight is 1.0 at $r = 10^{-6}$,
+0.5 at $r = 0.1$, and 0.04 at $r = 4$, where a typical detected row sits.
+
+Everything it needs is already in $\theta$, so it is differentiable and JIT-compatible
+like the period and $Q$ priors. Implementing it meant collapsing the four near-duplicate
+prior branches of \code{fit\_multi\_sho\_gp} into a single objective that sums whichever
+penalties apply.
+
+\subsection{Synthetic test}
+
+Same 246 rows, with and without the prior, everything else at the defaults.
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+white-noise rows (flagged) & no prior & with prior \\
+\midrule
+median $\alpha$              & 1.04 & \textbf{0.05} \\
+at the 1.95 bound            & 35\% & \textbf{4\%} \\
+at the flat limit (0.05)     & 11\% & \textbf{78\%} \\
+\midrule
+rows with real red noise (154, identical set) & & \\
+\midrule
+median bias                  & $+0.074$ & $+0.068$ \\
+median $|\Delta\alpha|$      & 0.087 & \textbf{0.078} \\
+$r$ with truth               & 0.798 & \textbf{0.828} \\
+$\alpha$ moved by $>0.05$    & --- & 8\% of rows \\
+median $\Delta\ln L$         & --- & $-0.000$ (9\% worse by $>1$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The arbitrary slopes collapse onto the flat limit, and the rows that carry a real slope are
+untouched or marginally better. On the white-noise rows $\ln L$ barely moves either
+(median 0.000), which is the point: the likelihood is flat in $\alpha$ there, so the prior
+picks a value the data do not constrain.
+
+\textbf{State this in any write-up:} $\alpha \approx 0$ in flagged rows is \emph{imposed},
+not measured. The defensible reading is "consistent with flat"; \code{gp\_rn\_wn\_ratio} and
+\code{gp\_rn\_near\_white\_noise} mark exactly which rows those are.
+
+\subsection{Why not the alternatives}
+
+Dropping the jitter term would also make $\alpha$ continuous through the limit --- white
+noise is then just $\alpha = 0$ --- but jitter absorbs underestimated \code{flux\_err}, and
+without it that excess is forced into the red-noise term, pulling $\alpha$ low wherever the
+errors are optimistic. Substituting the Vaughan slope in flagged rows works (it tends to 0
+on a flat spectrum, being an unbounded least-squares fit) but leaves one column with two
+definitions and two different biases. Dropping the GP red-noise term altogether is the
+worst option: red noise \emph{is} a covariance concept, and without that term the SHO
+components absorb the continuum --- the failure mode the $Q$ prior exists to fight.
+
+% ===========================================================================
+\section{Summary and follow-ups}
+% ===========================================================================
+
+\begin{itemize}
+\item \textbf{Defaults changed:} \code{iterative\_sho\_gp\_fit(rn\_model='powerlaw')} and
+  \code{expand\_table(rn\_mask\_peaks=True)}. Both old behaviours remain available
+  (\code{rn\_model='sho'}, \code{rn\_mask\_peaks=False}) and reproduce old outputs
+  exactly. Existing tables: \code{refit\_red\_noise\_columns} $\to$
+  \code{add\_lsp\_metrics} $\to$ \code{add\_gp\_fits}.
+\item GP red-noise slope: $r=-0.07 \to 0.73$ against the truth, median error $2.09\to0.38$.
+  What remains comes from 30-min exposure averaging ($\approx$+0.3, present in real data
+  too), the generator's interpolation, and oscillator-dominated shallow injections.
+\item Vaughan continuum: crowding bias removed for sparse spectra and about halved for
+  crowded ones. The oscillator-induced shift drops about 4$\times$ on real sampling.
+\item Oscillator recovery: detectable-but-missed $157 \to 42$.
+\item Generator now samples exposure averages from a 1-min grid (\S5); the synthetic set was
+  regenerated and rerun (\S8).
+\item Real data: masked periodogram slopes exceed 1.8 in 1--2\% of rows. Of the 27\% of
+  real GP fits pinned at 1.95, most are rows with no red noise ($\alpha$ undefined) or
+  optimiser failures; $\sim$2--3/30 are genuinely cap-limited (\S6.2).
+\item In the white-noise limit $\alpha$ is no longer unconstrained: a prior pulls it to the
+  flat limit exactly where the red noise is buried (\S10, on by default), which removes the
+  spurious pile-up at 1.95 without touching rows that carry a real slope.
+\item Exposure-filtered basis weights (\code{rn\_exposure\_min=30}, \S9) are the default:
+  the GP slope is unbiased to $+0.07$ with median error 0.10 (raw: $+0.26$, 0.26), and the
+  likelihood improves in 64\% of rows.
+\item \textbf{Follow-ups:} (1) --- done: the synthetic set was regenerated and rerun;
+  (2) --- done: the exposure bias is handled in the kernel rather than by calibration;
+  (3) the GP $\alpha$ offset is corrected by the exposure-filtered basis (\S9;
+  \code{rn\_exposure\_min=30}, not yet the default); flag rows that hit
+  \code{max\_components};
+  (4) Mat\'ern-3/2 basis only if the genuinely steep rows matter;
+  (5) rerun the real-data table with the new defaults.
+\end{itemize}
+
+\end{document}

@@ -514,10 +514,93 @@ def _fit_red_noise_vaughan(freqs, power, P_N):
     return (float(log10_N), float(alpha), float(P_N))
 
 
+def _truncated_exp_log10_mean(k):
+    """E[log10 X | X < k] for X ~ Exp(1); -> -0.25068 as k -> inf.
+
+    Closed form: integral_0^k ln(x) e^-x dx = -gamma_E - E1(k) - e^-k ln(k).
+    """
+    from scipy.special import exp1
+    if not np.isfinite(k):
+        return -np.euler_gamma / np.log(10.0)
+    num = -np.euler_gamma - exp1(k) - np.exp(-k) * np.log(k)
+    return float(num / np.log(10.0) / (1.0 - np.exp(-k)))
+
+
+def _fit_red_noise_vaughan_masked(freqs, power, P_N, peak_halfwidth,
+                                  mask_k=np.log(100.0), max_iter=20, min_keep=0.2):
+    """Vaughan (2005) power-law continuum fit with iterative peak masking.
+
+    ``_fit_red_noise_vaughan`` fits every bin, so periodic signals pull the continuum
+    steep and high (on the synthetic set, median alpha bias +0.17 with 1-3 injected
+    oscillators, +0.71 with 7-10).  Here the fit is repeated with bins near excesses
+    removed:
+
+    1. fit log10 P vs log10 f on the unmasked bins;
+    2. flag bins with P > mask_k * C(f), and mask everything within
+       ``peak_halfwidth`` (in 1/day) of a flagged bin -- the peak's main lobe;
+    3. repeat until the mask stops changing.
+
+    Under H0, P/C ~ Exp(1), so a clip at mask_k removes a fraction e^-mask_k of pure-noise
+    bins (1% for the default ln 100).  That truncation leaves the SLOPE unbiased (the clip
+    is at a fixed multiple of C at every frequency) and shifts only the intercept, which
+    is corrected exactly with E[log10 X | X < k] instead of -0.25068.
+
+    Parameters
+    ----------
+    freqs, power : ndarray
+        LSP grid (1/day) and psd-normalised power.
+    P_N : float
+        Passed through, as in ``_fit_red_noise_vaughan``.
+    peak_halfwidth : float
+        Half-width of the mask around each flagged bin, 1/day.  Use 1/T_eff (the
+        periodogram's resolution); wider windows were tested and did not help.
+    mask_k : float
+        Clip level in units of the continuum.  ln(100) was the best of
+        {gamma_1%, ln 100, 3}: the 1%-global gamma (~12.7) leaves most of the bias, 3
+        masks a third of the spectrum.
+    max_iter : int
+        Iteration cap.
+    min_keep : float
+        Stop (keeping the previous mask) if fewer than this fraction of bins would remain.
+
+    Returns
+    -------
+    (log10_N, alpha, P_N, mask_frac) : tuple of float
+        As ``_fit_red_noise_vaughan`` plus the fraction of valid bins masked.
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    power = np.asarray(power, dtype=float)
+    good = np.isfinite(freqs) & (freqs > 0) & np.isfinite(power) & (power > 0)
+    if good.sum() < 3:
+        return (np.nan, np.nan, float(P_N), np.nan)
+    bias = _truncated_exp_log10_mean(mask_k)
+    log_f, log_I = np.log10(np.where(good, freqs, 1.0)), np.log10(np.where(good, power, 1.0))
+
+    use = good.copy()
+    for _ in range(max_iter):
+        b, a = np.polyfit(log_f[use], log_I[use], 1)
+        C = 10.0 ** (a - bias) * freqs ** b
+        hot = good & (power > mask_k * C)
+        new = good.copy()
+        if hot.any():
+            f_hot = freqs[hot]
+            j = np.clip(np.searchsorted(f_hot, freqs), 1, len(f_hot) - 1) if len(f_hot) > 1 \
+                else np.zeros(len(freqs), dtype=int)
+            dist = np.abs(freqs - f_hot[j])
+            if len(f_hot) > 1:
+                dist = np.minimum(dist, np.abs(freqs - f_hot[j - 1]))
+            new &= dist > peak_halfwidth
+        if new.sum() < min_keep * good.sum() or np.array_equal(new, use):
+            break
+        use = new
+    b, a = np.polyfit(log_f[use], log_I[use], 1)
+    return (float(a - bias), float(-b), float(P_N), float(1.0 - use.sum() / good.sum()))
+
+
 def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
                               P_min=0.1, P_max=10.0, alpha=5,
                               n_wn_boot=200, wn_percentile=99.0,
-                              nsigma=None):
+                              nsigma=None, rn_mask_peaks=True, rn_mask_k=np.log(100.0)):
     """
     Load, resample, normalize, concatenate, compute LSP, and compute the
     white-noise bootstrap threshold for a list of sector HDUs.
@@ -554,7 +637,7 @@ def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
         Output of ``compute_lsp``.
     wn_threshold : float
         White-noise bootstrap power threshold at ``wn_percentile`` (global max).
-    red_noise_params : tuple (log10_N, alpha)
+    red_noise_params : tuple (log10_N, alpha, mask_frac)
         Vaughan (2005) power-law continuum fit. Model: P̂(f) = 10**log10_N * f**(-alpha).
         The white-noise floor is no longer returned: P_N_theoretical was a hardcoded
         1.0 and P_N_empirical was constant to ~0.3%, and neither is used downstream
@@ -628,10 +711,19 @@ def load_and_process_sectors(hdul, sector_indices, cadence_bin_min=30.0,
             RuntimeWarning, stacklevel=2,
         )
 
-    log10_N, alpha, _ = _fit_red_noise_vaughan(
-        lsp_dict['freqs'], lsp_dict['power'], P_N_empirical,
-    )
-    red_noise_params = (log10_N, alpha)
+    if rn_mask_peaks:
+        # Peak-masked continuum (docs/fixing_RN_fitting.tex): mask the main lobe, 1/T_eff,
+        # around every bin above rn_mask_k * C and refit until the mask converges.
+        log10_N, alpha, _, mask_frac = _fit_red_noise_vaughan_masked(
+            lsp_dict['freqs'], lsp_dict['power'], P_N_empirical,
+            peak_halfwidth=1.0 / _effective_baseline(t_arr), mask_k=rn_mask_k,
+        )
+    else:
+        log10_N, alpha, _ = _fit_red_noise_vaughan(
+            lsp_dict['freqs'], lsp_dict['power'], P_N_empirical,
+        )
+        mask_frac = 0.0
+    red_noise_params = (log10_N, alpha, mask_frac)
 
     return t_arr, flux_arr, err_arr, lsp_dict, wn_threshold, red_noise_params
 

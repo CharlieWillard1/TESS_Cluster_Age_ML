@@ -198,7 +198,7 @@ def gp_recovery(df, tol=0.10):
 # each one by how far its LSP peak rises above the fitted red-noise continuum at its own
 # frequency.  That is the quantity that decides whether recovery was ever possible.
 
-def per_oscillator_table(df, tol=0.10, window=0.02):
+def per_oscillator_table(df, tol=0.10, window=0.02, continuum=None):
     """Explode the joined table to one row per (pipeline row x injected oscillator).
 
     For each injected oscillator, measure the observed LSP power near its frequency and
@@ -214,6 +214,11 @@ def per_oscillator_table(df, tol=0.10, window=0.02):
         Fractional half-width around the injected frequency in which to take the local
         maximum of the periodogram.  The peak can sit a bin or two off the exact
         frequency, so reading a single bin would understate it.
+    continuum : pd.DataFrame or None
+        Optional ``rn_log10_N`` / ``rn_alpha`` columns (same index as ``df``) to judge
+        detectability with instead of the row's own.  Use one fixed continuum when
+        comparing pipeline configurations whose continuum fits differ, or "detectable"
+        changes meaning between them.
 
     Returns
     -------
@@ -225,14 +230,15 @@ def per_oscillator_table(df, tol=0.10, window=0.02):
         n_gp                               -- components fitted for that row
     """
     rows = []
-    for _, r in df.iterrows():
+    for label, r in df.iterrows():
+        cr = continuum.loc[label] if continuum is not None else r
         P = np.atleast_1d(np.asarray(r.get('periods', []), float))
         A = np.atleast_1d(np.asarray(r.get('amplitudes', []), float))
         if len(P) == 0:
             continue
         f = np.asarray(r['LSP_freq'], float)
         p = np.asarray(r['LSP_power'], float)
-        C = 10.0 ** float(r['rn_log10_N']) * f ** (-float(r['rn_alpha']))
+        C = 10.0 ** float(cr['rn_log10_N']) * f ** (-float(cr['rn_alpha']))
         gam = -np.log(1 - 0.99 ** (1 / len(f)))
         gp = r.get('gp_periods')
         gp = np.atleast_1d(np.asarray(gp, float)) if gp is not None else np.array([])
@@ -493,12 +499,23 @@ def gp_rn_effective_alpha(period, Q=1.0 / np.sqrt(2.0), f_lo=0.1, f_hi=12.0, n=4
 
 
 def gp_rn_bias(df, f_lo=0.1, f_hi=12.0):
-    """GP red-noise component vs the injected red noise, per pipeline row."""
-    out = df[['name', 'n_osc', 'gp_rn_sigma', 'gp_rn_period', 'gp_rn_Q',
-              'rn_rms_realized', 'inj_rn_alpha', 'rn_alpha']].copy()
-    out['gp_rn_alpha_eff'] = [gp_rn_effective_alpha(p, q if np.isfinite(q) else 1/np.sqrt(2),
-                                                    f_lo, f_hi)
-                              for p, q in zip(out['gp_rn_period'], out['gp_rn_Q'])]
+    """GP red-noise component vs the injected red noise, per pipeline row.
+
+    Works for both GP red-noise models.  With ``rn_model='powerlaw'`` the slope is
+    fitted directly and ``gp_rn_alpha_band`` (the in-band slope of the fitted PSD) is used
+    as ``gp_rn_alpha_eff``; with the legacy SHO it is derived from the break period.  The
+    amplitude column is ``gp_rn_rms_band`` (power law) or ``gp_rn_sigma`` (SHO).
+    """
+    cols = ['name', 'n_osc', 'rn_rms_realized', 'inj_rn_alpha', 'rn_alpha']
+    out = df[cols].copy()
+    for c in ('gp_rn_sigma', 'gp_rn_period', 'gp_rn_Q', 'gp_rn_alpha_band', 'gp_rn_rms_band'):
+        out[c] = pd.to_numeric(df[c], errors='coerce') if c in df.columns else np.nan
+    powerlaw = np.isfinite(out['gp_rn_alpha_band'])
+    sho_eff = [gp_rn_effective_alpha(p, q if np.isfinite(q) else 1/np.sqrt(2), f_lo, f_hi)
+               if not pl else np.nan
+               for p, q, pl in zip(out['gp_rn_period'], out['gp_rn_Q'], powerlaw)]
+    out['gp_rn_alpha_eff'] = np.where(powerlaw, out['gp_rn_alpha_band'], sho_eff)
+    out['gp_rn_sigma'] = np.where(powerlaw, out['gp_rn_rms_band'], out['gp_rn_sigma'])
     out['d_alpha_gp'] = out['gp_rn_alpha_eff'] - out['inj_rn_alpha']
     out['d_alpha_vaughan'] = out['rn_alpha'] - out['inj_rn_alpha']
     out['amp_ratio'] = out['gp_rn_sigma'] / out['rn_rms_realized']
@@ -532,7 +549,7 @@ def plot_gp_rn_bias(df, bins=((0, 1), (1, 4), (4, 7), (7, 11)), f_lo=0.1, f_hi=1
     axs[0].legend(fontsize=8); axs[0].grid(alpha=.3)
 
     ctr = [(lo + hi - 1) / 2 for lo, hi in bins]
-    for col, c, lbl in [('d_alpha_gp', 'darkorange', 'GP SHO effective slope'),
+    for col, c, lbl in [('d_alpha_gp', 'darkorange', 'GP red-noise slope'),
                         ('d_alpha_vaughan', 'darkred', 'standalone Vaughan fit')]:
         med = [a[(a['n_osc'] >= lo) & (a['n_osc'] < hi)][col].median() for lo, hi in bins]
         axs[1].plot(ctr, med, 'o-', color=c, label=lbl)
@@ -543,3 +560,178 @@ def plot_gp_rn_bias(df, bins=((0, 1), (1, 4), (4, 7), (7, 11)), f_lo=0.1, f_hi=1
     axs[1].legend(fontsize=8); axs[1].grid(alpha=.3)
     plt.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Red-noise fix: compare pipeline configurations (docs/fixing_RN_fitting.tex)
+# ---------------------------------------------------------------------------
+
+_CROWD_BINS = ((0, 1), (1, 4), (4, 7), (7, 11))
+
+
+def _crowding_label(n):
+    for lo, hi in _CROWD_BINS:
+        if lo <= n < hi:
+            return f'{lo}-{hi - 1}'
+    return 'other'
+
+
+def slope_recovery_table(configs):
+    """Median (fitted - injected) alpha by crowding, for every slope estimate available.
+
+    Parameters
+    ----------
+    configs : dict
+        label -> joined table (output of ``join``).  All must hold the same rows.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (config, estimator): median bias per crowding bin, median |bias|,
+        and Pearson correlation with the injected alpha.  Estimators: ``vaughan`` (the
+        table's ``rn_alpha``) and ``gp`` (``gp_rn_bias``'s slope, whichever RN model).
+    """
+    rows = []
+    for label, df in configs.items():
+        a = gp_rn_bias(df)
+        crowd = a['n_osc'].map(_crowding_label)
+        powerlaw = 'gp_rn_alpha' in df.columns and np.isfinite(
+            pd.to_numeric(df['gp_rn_alpha'], errors='coerce')).any()
+        for est, col in (('vaughan', 'rn_alpha'), ('gp', 'gp_rn_alpha_eff')):
+            fit = pd.to_numeric(a[col], errors='coerce')
+            d = fit - a['inj_rn_alpha']
+            m = np.isfinite(d)
+            row = dict(config=label, estimator=est)
+            for lo, hi in _CROWD_BINS:
+                k = f'{lo}-{hi - 1}'
+                row[f'bias n_osc {k}'] = float(d[m & (crowd == k)].median())
+            row['median |bias|'] = float(d[m].abs().median())
+            row['corr w/ truth'] = float(np.corrcoef(fit[m], a.loc[m, 'inj_rn_alpha'])[0, 1])
+            if est == 'gp' and powerlaw:
+                p = pd.to_numeric(df['gp_rn_alpha'], errors='coerce')
+                row['frac at alpha bound'] = float(((p <= 0.051) | (p >= 1.949)).mean())
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def gp_recovery_table(configs, reference):
+    """Oscillator recovery and component purity per configuration.
+
+    Detectability is judged against ONE continuum for every config (``reference``'s
+    ``rn_log10_N``/``rn_alpha``), so "detectable" means the same thing in each row.
+    Pass the peak-masked table: its continuum is the closer one to the truth.
+    """
+    rows = []
+    ref = reference[['rn_log10_N', 'rn_alpha']]
+    for label, df in configs.items():
+        osc = per_oscillator_table(df, continuum=ref)
+        s = recovery_summary(osc)
+        qs = gp_component_purity(df)
+        rows.append(dict(
+            config=label,
+            recovery_overall=s['recovery_overall'],
+            recovery_detectable=s['recovery_detectable'],
+            recovery_undetectable=s['recovery_undetectable'],
+            n_detectable=s['n_detectable'],
+            n_detectable_but_missed=s['n_detectable_but_missed'],
+            n_gp_components=len(qs),
+            component_purity=float(qs['matches_injected'].mean()),
+            mean_n_components=float(pd.to_numeric(df['gp_n_components'], errors='coerce').mean()),
+        ))
+    return pd.DataFrame(rows)
+
+
+def bic_comparison(configs, baseline):
+    """Per-row BIC difference of each config against ``baseline`` (negative = better).
+
+    Rows share their light curves across configs, so the log-likelihoods are directly
+    comparable; red-noise terms have 2 parameters in both models.  Restricting to rows
+    with the same number of SHO components isolates the red-noise term itself.
+    """
+    b = pd.to_numeric(configs[baseline]['gp_bic'], errors='coerce')
+    mb = pd.to_numeric(configs[baseline]['gp_n_components'], errors='coerce')
+    rows = []
+    for label, df in configs.items():
+        if label == baseline:
+            continue
+        d = pd.to_numeric(df['gp_bic'], errors='coerce') - b
+        same_m = pd.to_numeric(df['gp_n_components'], errors='coerce') == mb
+        rows.append(dict(config=label, vs=baseline,
+                         median_dBIC=float(d.median()),
+                         frac_better=float((d < 0).mean()),
+                         n_same_n_components=int(same_m.sum()),
+                         median_dBIC_same_n=float(d[same_m].median()),
+                         frac_better_same_n=float((d[same_m] < 0).mean())))
+    return pd.DataFrame(rows)
+
+
+def plot_slope_recovery(configs):
+    """Fitted vs injected alpha: top row the Vaughan continuum, bottom row the GP term."""
+    import matplotlib.pyplot as plt
+    fig, axs = plt.subplots(2, len(configs), figsize=(4.6 * len(configs), 8.6), squeeze=False)
+    sc = None
+    for j, (label, df) in enumerate(configs.items()):
+        a = gp_rn_bias(df)
+        for i, (what, col) in enumerate((('Vaughan continuum', 'rn_alpha'),
+                                         ('GP red-noise term', 'gp_rn_alpha_eff'))):
+            ax = axs[i, j]
+            x = a['inj_rn_alpha']
+            y = pd.to_numeric(a[col], errors='coerce')
+            m = np.isfinite(y)
+            sc = ax.scatter(x[m], y[m], s=10, alpha=.5, c=a.loc[m, 'n_osc'],
+                            cmap='viridis', vmin=0, vmax=10)
+            ax.plot([0, 2.4], [0, 2.4], 'k--', lw=1)
+            r = np.corrcoef(x[m], y[m])[0, 1] if m.sum() > 2 else np.nan
+            ax.set(xlim=(-0.1, 2.5), ylim=(-0.1, 4.1), xlabel='injected α', ylabel='fitted α',
+                   title=f'{label}: {what}\nmedian bias {np.median(y[m] - x[m]):+.2f},  '
+                         f'r = {r:.2f}')
+            ax.grid(alpha=.3)
+    fig.subplots_adjust(hspace=0.4)
+    fig.colorbar(sc, ax=axs, label='n_osc', shrink=0.6)
+    return fig
+
+
+def component_filter_scan(df, cuts=((0, 0), (0.05, 0), (0.10, 0), (0.20, 0), (0, 20), (0, 100),
+                                    (0.10, 20), (0.10, 100), (0.20, 100)), tol=0.10, window=0.02):
+    """Purity and completeness of the GP component list under amplitude / Q cuts.
+
+    Companion to ``gp_table_io.filter_gp_components``: it measures what a given cut costs.
+    Purity is the fraction of surviving components matching an injected period; completeness
+    is the fraction of DETECTABLE injections (LSP peak above the row's significance threshold)
+    still matched by a surviving component.  ``cuts`` are (sigma_rel_min, Q_min) pairs.
+    """
+    comps, det_map, n_det = [], {}, 0
+    for i, r in df.iterrows():
+        P = np.atleast_1d(np.asarray(r.get('gp_periods', []), float))
+        S = np.atleast_1d(np.asarray(r.get('gp_sho_sigmas', []), float))
+        Q = np.atleast_1d(np.asarray(r.get('gp_sho_Qs', []), float))
+        inj = np.atleast_1d(np.asarray(r.get('periods', []), float))
+        f = np.asarray(r['LSP_freq'], float); p = np.asarray(r['LSP_power'], float)
+        cont = 10.0 ** float(r['rn_log10_N']) * f ** (-float(r['rn_alpha']))
+        gam = -np.log(1 - 0.99 ** (1 / len(f)))
+        det = []
+        for Pi in inj:
+            fi = 1.0 / Pi
+            if fi < f[0] or fi > f[-1]:
+                continue
+            w = np.abs(f / fi - 1) < window
+            if w.any() and np.nanmax(p[w]) > gam * np.interp(fi, f, cont):
+                det.append(Pi)
+        det_map[i] = det; n_det += len(det)
+        if len(P) == 0 or not (len(P) == len(S) == len(Q)):
+            continue
+        smax = np.nanmax(S) if len(S) else np.nan
+        for per, sig, q in zip(P, S, Q):
+            comps.append(dict(row=i, period=per, sigma_rel=sig / smax if smax > 0 else np.nan, Q=q,
+                              real=bool(len(inj)) and bool(np.any(np.abs(inj / per - 1) < tol))))
+    comps = pd.DataFrame(comps)
+    rows = []
+    for smin, qmin in cuts:
+        keep = comps[(comps['sigma_rel'] >= smin) & (comps['Q'] >= qmin)]
+        by_row = {k: g['period'].to_numpy() for k, g in keep.groupby('row')}
+        found = sum(1 for i, det in det_map.items() for Pi in det
+                    if len(by_row.get(i, [])) and np.any(np.abs(by_row[i] / Pi - 1) < tol))
+        rows.append(dict(sigma_rel_cut=smin, Q_cut=qmin, components=len(keep),
+                         purity=keep['real'].mean() if len(keep) else np.nan,
+                         completeness=found / n_det if n_det else np.nan, detectable=n_det))
+    return pd.DataFrame(rows)

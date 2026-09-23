@@ -72,11 +72,21 @@ from step 2.
 
 ## Generative model
 
-On a regular 30-min grid spanning each cluster's full (multi-year) baseline:
+On a regular 1-min grid spanning each cluster's full (multi-year) baseline:
 
 ```
 x(t) = 1 + red(t; alpha, rms) + sum_i A_i sin(2 pi t / P_i + phi_i)
 ```
+
+Each written flux value is the **average of x(t) over that point's exposure**
+(`[t - E/2, t + E/2]`, E = the sector's native cadence: 30, 10 or 3.33 min), which is what
+the detector records. Truth statistics use a point-sampled 30-min subgrid, as before.
+
+> Changed 2026-09-16. The set was previously built on a 30-min grid and linearly
+> interpolated onto the timestamps. That triangle filter suppresses high-frequency power
+> much more than a real exposure, and biased GP red-noise slopes by up to +0.4 on top of
+> the ~+0.3 that exposure averaging alone causes (`docs/fixing_RN_fitting.tex`). Tables
+> generated before this date come from the old sampling.
 
 | parameter | distribution | rationale |
 |---|---|---|

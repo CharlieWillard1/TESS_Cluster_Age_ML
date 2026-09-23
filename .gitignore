@@ -17,3 +17,7 @@ GenerateTable_CGW/scratch/
 # NOTE: the real light_curves/ is deliberately TRACKED -- do not widen this to a
 # wildcard, or a rename would silently start ignoring it.
 light_curves_synthetic/
+
+# Collaborator tarball drop (177 GB: 87 GB elk tesscut cache, per-sector corrected LCs,
+# figures).  Regenerable from the original archive; nothing in the pipeline reads it yet.
+light_curves_AmayaDownload/

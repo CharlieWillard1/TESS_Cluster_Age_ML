@@ -152,7 +152,7 @@ class GPFitResult:
         -------
         dict with keys: freq (1/day), power (analytic PSD)
         """
-        from .gp_fit import unpack_theta, _unpack_rn_comp, sho_psd  # deferred — avoids circular import at module load
+        from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd  # deferred — avoids circular import at module load
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
@@ -167,12 +167,7 @@ class GPFitResult:
 
             power += sho_psd(freq, sigma, omega0, Q)
 
-        if self.final_fit.get("has_red_noise", False):
-            rn     = _unpack_rn_comp(jnp.asarray(self.final_fit["theta"]), self.n_components)
-            sigma  = float(rn["sigma"])
-            omega0 = float(rn["omega"])
-            Q      = float(rn["Q"])
-            power += sho_psd(freq, sigma, omega0, Q)
+        power += rn_psd_from_fit(freq, self.final_fit)   # zeros when no RN term
 
         return {"freq": freq, "power": power}
 
@@ -186,7 +181,7 @@ class GPFitResult:
         Pass the result to visualize_gp_afterfit.plot_kspace_compare_allfits
         to overlay them all in a single figure.
         """
-        from .gp_fit import unpack_theta, _unpack_rn_comp, sho_psd  # deferred
+        from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd  # deferred
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
@@ -203,12 +198,7 @@ class GPFitResult:
                 Q      = float(comp["Q"])
                 power += sho_psd(freq, sigma, omega0, Q)
 
-            if fit.get("has_red_noise", False):
-                rn     = _unpack_rn_comp(jnp.asarray(fit["theta"]), m)
-                sigma  = float(rn["sigma"])
-                omega0 = float(rn["omega"])
-                Q      = float(rn["Q"])
-                power += sho_psd(freq, sigma, omega0, Q)
+            power += rn_psd_from_fit(freq, fit)
 
             entries.append({
                 "n_components": m,
@@ -259,6 +249,9 @@ class GPFitResult:
                 jnp.asarray(self.yerr),
                 fit["n_components"],
                 fit.get("has_red_noise", False),
+                fit.get("rn_model") or "sho",       # pickles predating rn_model are SHO
+                fit.get("rn_basis_freqs"),
+                fit.get("rn_exposure_days"),
             )
             return {**fit, "gp": gp}
         self.final_fit = _rebuild(self.final_fit)

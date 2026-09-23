@@ -194,7 +194,7 @@ def _cluster_color_map(table_rows):
 
 def _analytic_psd(fit, freq_min, freq_max, n_freq):
     """Analytic SHO kernel PSD for a single fit dict."""
-    from .gp_fit import unpack_theta, _unpack_rn_comp, sho_psd
+    from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd
     import jax.numpy as jnp
     freq  = np.linspace(freq_min, freq_max, n_freq)
     omega = 2.0 * np.pi * freq
@@ -205,12 +205,7 @@ def _analytic_psd(fit, freq_min, freq_max, n_freq):
         omega0 = float(comp["omega"])
         Q      = float(comp["Q"])
         power += sho_psd(freq, sigma, omega0, Q)
-    if fit.get("has_red_noise", False):
-        rn     = _unpack_rn_comp(jnp.asarray(fit["theta"]), fit["n_components"])
-        sigma  = float(rn["sigma"])
-        omega0 = float(rn["omega"])
-        Q      = float(rn["Q"])
-        power += sho_psd(freq, sigma, omega0, Q)
+    power += rn_psd_from_fit(freq, fit)
     return freq, power
 
 
@@ -714,12 +709,21 @@ def plot_noise_gp(data, period_lim=(1/24, 10.0), save_path=None):
             if truncated:
                 cell_data.append(['...', '...', '...', '...'])
             if res.final_fit.get("has_red_noise", False):
-                cell_data.append([
-                    'RN',
-                    f"{res.features['rn_period_days']:.3f}",
-                    f"{res.features['rn_Q']:.2f}*",  # * = fixed
-                    f"{res.features['rn_sigma']:.1e}",
-                ])
+                if res.features.get('rn_model') == 'powerlaw':
+                    # power-law RN has no period/Q: show slope and PSD level at 1 /day
+                    cell_data.append([
+                        'RN',
+                        f"α={res.features['rn_alpha']:.2f}",
+                        '—',
+                        f"S0={10**res.features['rn_log10_S0']:.1e}",
+                    ])
+                else:
+                    cell_data.append([
+                        'RN',
+                        f"{res.features['rn_period_days']:.3f}",
+                        f"{res.features['rn_Q']:.2f}*",  # * = fixed
+                        f"{res.features['rn_sigma']:.1e}",
+                    ])
             cell_data.append(['jitter', '—', '—', f"{res.features['sho_jitter']:.1e}"])
 
             tbl = ax_tab.table(

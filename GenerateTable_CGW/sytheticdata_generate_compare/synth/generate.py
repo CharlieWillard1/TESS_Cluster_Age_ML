@@ -19,9 +19,18 @@ slug transform (lowercase, strip spaces/hyphens/brackets) is not invertible.
 
 Generative model
 ----------------
-Per cluster, on a regular 30-min grid spanning the full multi-year baseline::
+Per cluster, on a regular fine grid (``GRID_CADENCE_MIN``, 1 min) spanning the full
+multi-year baseline::
 
     x(t) = 1 + red(t; alpha, rms) + sum_i A_i * sin(2*pi*t/P_i + phi_i)
+
+Sampling: each written flux value is the AVERAGE of x(t) over that point's exposure,
+[t - E/2, t + E/2] with E the sector's native cadence (30, 10 or 3.33 min) -- what the
+detector records.  An earlier version built x(t) on a 30-min grid and linearly
+interpolated it onto the timestamps; that is a triangle filter much stronger than a real
+exposure, and it biased GP red-noise slopes by up to +0.4 beyond what exposure averaging
+alone does (docs/fixing_RN_fitting.tex).  Averaging attenuates the injected sinusoids by
+sinc(E/P) (~0.93 for P = 0.1 d at E = 30 min); ``amplitudes`` records the intrinsic value.
 
 with ``N ~ Uniform{0..10}`` oscillators, ``log10(A_i) ~ U(-4.5, -2.5)`` fractional
 amplitude, ``P_i ~ Uniform(0.1, 9)`` days (linear, entirely inside the pipeline's
@@ -55,7 +64,39 @@ N_OSC_MAX      = 10
 # median fractional error (2.7e-4) and undetectable, 1e-3 is far above and obvious.
 LOG10_AMP_RANGE = (-5.0, -3.0)
 PERIOD_RANGE    = (0.1, 9.0)
-GRID_CADENCE_MIN = 30.0
+GRID_CADENCE_MIN = 1.0      # generation grid; must be well below the shortest exposure
+TRUTH_CADENCE_MIN = 30.0    # truth statistics use a point-sampled subgrid at this spacing,
+                            # so their definitions (e.g. the von Neumann ratio) are unchanged
+
+
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
+
+def exposure_average(t_grid, x_grid, t_obs, exposure_days):
+    """Average of ``x_grid`` over [t - E/2, t + E/2] for each ``t_obs``.
+
+    Uses the running trapezoid integral of the regular fine grid, so each window is exact
+    to grid resolution and the cost is O(len(t_grid) + len(t_obs)).  Windows are clipped to
+    the grid; NaN times give NaN.
+    """
+    t_obs = np.asarray(t_obs, dtype=float)
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (x_grid[1:] + x_grid[:-1]) * np.diff(t_grid))])
+    lo = np.clip(t_obs - 0.5 * exposure_days, t_grid[0], t_grid[-1])
+    hi = np.clip(t_obs + 0.5 * exposure_days, t_grid[0], t_grid[-1])
+    width = hi - lo
+    with np.errstate(invalid='ignore', divide='ignore'):
+        avg = (np.interp(hi, t_grid, cum) - np.interp(lo, t_grid, cum)) / width
+    # A zero-width window (exposure below grid resolution, or clipped to a point) is a
+    # point sample.
+    return np.where(width > 0, avg, np.interp(t_obs, t_grid, x_grid))
+
+
+def sector_exposure_days(t):
+    """Exposure length of a sector, taken as its native cadence (median time step)."""
+    t = np.asarray(t, dtype=float)
+    t = t[np.isfinite(t)]
+    return float(np.median(np.diff(t))) if len(t) > 1 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +126,7 @@ def red_noise_series(t_grid, alpha, rng, n_fft=None):
 
 
 def _calibrate_red_scale(t_grid, unit_series, t_ref, err_ref, log10_N_target,
-                         P_min, P_max, lsp_alpha):
+                         P_min, P_max, lsp_alpha, exposure_ref):
     """Scale factor putting this realisation's SECTOR-level ``log10_N`` on target.
 
     The calibration must use the *same realisation and the same normalisation* as the
@@ -96,12 +137,13 @@ def _calibrate_red_scale(t_grid, unit_series, t_ref, err_ref, log10_N_target,
     realisation therefore under-scales the red noise badly, and the steeper the slope the
     worse it gets.
 
-    Instead: interpolate the actual full-baseline realisation onto the reference sector,
-    measure what ``log10_N`` it produces there, and rescale.  Periodogram power goes as
+    Instead: sample the actual full-baseline realisation onto the reference sector with
+    the same exposure averaging as the written data, measure what ``log10_N`` it produces
+    there, and rescale.  Periodogram power goes as
     amplitude^2, so one measurement fixes the scale exactly.
     """
     work = 1e-3                                   # arbitrary small working amplitude
-    x_ref = np.interp(t_ref, t_grid, unit_series)
+    x_ref = exposure_average(t_grid, unit_series, t_ref, exposure_ref)
     flux = 1.0 + x_ref * work
     try:
         _, x, ex = normalize_flux(t_ref, flux, err_ref)
@@ -198,14 +240,15 @@ def generate_cluster(name, origin, real_lc_dir, out_lc_dir, params, rng,
         err_frac_med = float(np.nanmedian(e_ref[m] / max(med_f, 1e-30))) if m.any() else np.nan
         rms = _calibrate_red_scale(t_grid, unit_red, t_ref[m],
                                    e_ref[m] / max(med_f, 1e-30),
-                                   params['rn_log10_N_target'], P_min, P_max, lsp_alpha)
+                                   params['rn_log10_N_target'], P_min, P_max, lsp_alpha,
+                                   sector_exposure_days(t_ref))
 
         x_grid = add_oscillators(t_grid, 1.0 + unit_red * rms, params)
 
         out = fits.HDUList([hdul[0].copy()])
         for i, tt, ee, ff in sectors:
             good = np.isfinite(tt)
-            x = np.interp(tt, t_grid, x_grid)              # clean fractional flux
+            x = exposure_average(t_grid, x_grid, tt, sector_exposure_days(tt))  # clean flux
             med = np.nanmedian(ff[good & np.isfinite(ff)]) if good.any() else 1.0
             if not np.isfinite(med) or med == 0:
                 med = 1.0
@@ -220,8 +263,11 @@ def generate_cluster(name, origin, real_lc_dir, out_lc_dir, params, rng,
 
         out.writeto(dst, overwrite=True)
 
+    # Truth is computed on a point-sampled TRUTH_CADENCE_MIN subgrid (see module constants).
+    step = max(1, int(round(TRUTH_CADENCE_MIN / grid_cadence_min)))
     return dict(name=name, origin=origin, path=dst, rn_rms_realized=rms,
-                err_frac_med=err_frac_med, t_grid=t_grid, x_grid=x_grid, **params)
+                err_frac_med=err_frac_med, t_grid=t_grid[::step], x_grid=x_grid[::step],
+                **params)
 
 
 def copy_layout_extras(real_lc_dir, out_lc_dir):

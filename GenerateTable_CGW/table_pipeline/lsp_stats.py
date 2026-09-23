@@ -271,3 +271,59 @@ def check_lsp_harmonics(table, tol=0.02, period_cols=('LSP_peak_period',
               f"({len(table)} rows)  excess_ratio >> 1 indicates a real pileup")
         print(out.to_string(index=False))
     return out
+
+
+def refit_red_noise_columns(table, mask_k=np.log(100.0), keep_unmasked=True, verbose=True):
+    """Refit ``rn_log10_N`` / ``rn_alpha`` with peak masking, from the stored LSP.
+
+    Post-hoc equivalent of ``expand_table(..., rn_mask_peaks=True)`` for tables built
+    before the masked fit existed: identical numbers, no LC reloading.  The masking
+    half-width is 1/T_eff from ``LC_t``, as in ``load_and_process_sectors``.
+
+    Anything derived from the continuum is stale afterwards -- rerun ``add_lsp_metrics``
+    and, for ``threshold_mode='red_noise'``, the GP fits (their peak seeds change).
+
+    Parameters
+    ----------
+    table : pd.DataFrame
+        Needs ``LSP_freq``, ``LSP_power``, ``LC_t``, ``rn_log10_N``, ``rn_alpha``.
+    mask_k : float
+        Clip level in units of the continuum (see ``_fit_red_noise_vaughan_masked``).
+    keep_unmasked : bool
+        Copy the previous values to ``rn_log10_N_unmasked`` / ``rn_alpha_unmasked`` first
+        (skipped if those columns already exist, so re-running is safe).
+
+    New / replaced columns
+    ----------------------
+    rn_log10_N, rn_alpha   float64  masked fit
+    rn_mask_frac           float64  fraction of LSP bins masked
+    """
+    from .lc_lsp import _fit_red_noise_vaughan_masked, _effective_baseline
+
+    if keep_unmasked and 'rn_alpha_unmasked' not in table.columns:
+        table['rn_log10_N_unmasked'] = table['rn_log10_N'].astype(float)
+        table['rn_alpha_unmasked'] = table['rn_alpha'].astype(float)
+
+    idx = table.index
+    new = {c: pd.Series(np.nan, index=idx, dtype=float)
+           for c in ('rn_log10_N', 'rn_alpha', 'rn_mask_frac')}
+    n_ok = n_failed = 0
+    for label, row in table.iterrows():
+        try:
+            f = np.asarray(row['LSP_freq'], dtype=float)
+            p = np.asarray(row['LSP_power'], dtype=float)
+            hw = 1.0 / _effective_baseline(np.asarray(row['LC_t'], dtype=float))
+            l10, a, _, frac = _fit_red_noise_vaughan_masked(f, p, 1.0, hw, mask_k=mask_k)
+            new['rn_log10_N'][label], new['rn_alpha'][label] = l10, a
+            new['rn_mask_frac'][label] = frac
+            n_ok += 1
+        except Exception as e:
+            if verbose:
+                print(f"  WARNING row {label}: {e}")
+            n_failed += 1
+    for c, v in new.items():
+        table[c] = v
+    if verbose:
+        print(f"[refit_red_noise_columns] ok={n_ok} failed={n_failed}  mask_k={mask_k:.3f}  "
+              f"median mask_frac={table['rn_mask_frac'].median():.3f}")
+    return table

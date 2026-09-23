@@ -1,0 +1,310 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{The GP Fit: Model, Priors, Fitting, and What Comes Out}
+\author{\texttt{GenerateTable\_CGW}}
+\date{2026 September 21}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Reference for the Gaussian-process stage of the pipeline (\code{gp\_pipeline/}): the kernel,
+how components are seeded from the periodogram, the priors, the staged optimisation, the
+columns it writes, and the quality flags attached to them. Validation numbers quoted here
+come from the synthetic injection--recovery set; the derivations and the history of the
+red-noise term live in \code{docs/fixing\_RN\_fitting.tex}, and the peak-finding statistics
+in \code{docs/peak\_finders.tex}.
+\end{abstract}
+
+% ===========================================================================
+\section{What the GP is for}
+% ===========================================================================
+
+Each row of the table is one light curve: a cluster observed in one sector combination,
+resampled to 30-min bins and normalised per sector. The GP models it as a sum of
+quasi-periodic oscillators sitting on a red-noise continuum, plus white noise:
+\begin{equation}
+k(\tau) = \underbrace{\sum_{i=1}^{m} k_{\rm SHO}(\tau;\sigma_i, P_i, Q_i)}_{\text{signals}}
+\;+\; \underbrace{k_{\rm RN}(\tau; S_0, \alpha)}_{\text{continuum}}
+\;+\; \underbrace{(\sigma_{\rm phot}^2 + \sigma_{\rm jit}^2)\,\delta_\tau}_{\text{white noise}} .
+\end{equation}
+All terms are \code{tinygp} quasiseparable kernels, so the likelihood costs $O(N)$ rather
+than $O(N^3)$ and a 1300-point row fits in tens of seconds.
+
+The red-noise term earns its place: without it the SHO components drift into modelling the
+continuum, which corrupts the periods that the science actually wants. That failure is what
+the $Q$ prior (\S4) and the red-noise term exist to prevent.
+
+% ===========================================================================
+\section{The kernel}
+% ===========================================================================
+
+\subsection{Signal components}
+
+Each is a simple harmonic oscillator, \code{quasisep.SHO}, free in amplitude $\sigma_i$,
+period $P_i$ and quality factor $Q_i$. Its PSD peaks at $1/P_i$ with width set by $Q_i$:
+a coherent sinusoid drives $Q$ to the cap, spot modulation with a finite lifetime does not.
+Periods are bounded to the search band (0.083--10\,d) and $Q \in [1/\sqrt2, 500]$. The
+lower bound is physical rather than arbitrary: an SHO's PSD has a peak at non-zero frequency
+only for $Q > 1/\sqrt2$, so below that the component is a continuum, not an oscillator --- the
+same value the old fixed-$Q$ red-noise SHO used. It binds rarely (1.4\% of components in rows
+that found peaks); the soft $Q$ prior below $Q=2$ does the real work.
+
+\subsection{Red noise: a power law built from OU terms}
+
+A single fixed-$Q$ SHO cannot represent $S(f) \propto f^{-\alpha}$ --- it is flat below its
+break and $f^{-4}$ above, so its effective slope carries no information about $\alpha$
+(measured correlation with truth: $-0.07$). Instead the continuum is a fixed basis of $N=9$
+Ornstein--Uhlenbeck (\code{quasisep.Exp}) terms at log-spaced frequencies $f_j$ spanning the
+band plus 1.2 decades of padding at each end, with weights tied to a single slope:
+\begin{equation}
+S_{\rm RN}(f) = \sum_j \frac{c_j}{1 + (f/f_j)^2},
+\qquad c_j = S_0\,f_0^{\alpha} f_j^{-\alpha} e^{u_j(\alpha)},
+\qquad \sigma_j^2 = \tfrac{\pi}{2} c_j f_j .
+\end{equation}
+Only $S_0$ (the PSD at the pivot $f_0 = 1$\,d$^{-1}$) and $\alpha$ are free, whatever $N$ is,
+so the parameter count matches the old SHO term and BIC comparisons still line up.
+
+The corrections $u_j(\alpha)$ carry the \textbf{exposure filter}. Every flux value is an
+average over its 30-min bin, so the data hold $S(f)\,\mathrm{sinc}^2(fE)$, not $S(f)$. A
+kernel that ignores this fits $\alpha$ about 0.3 too steep. \code{exposure\_weight\_table}
+solves once per (basis, exposure) for the $u_j$ that reproduce the filtered power law, and
+\code{jnp.interp} reads them at the current $\alpha$ inside the likelihood. Accuracy is
+0.02--0.05\,dex over 0.1--12\,d$^{-1}$; the kernel stays a sum of OU terms, so fits cost the
+same. $S_0$ and $\alpha$ then describe the \emph{intrinsic} spectrum.
+
+\textbf{Limits.} A sum of OU terms cannot fall faster than $f^{-2}$ anywhere, so
+$\alpha$ is bounded to $[0.05, 1.95]$ and the in-band slope saturates near 1.8. On real data
+only 1--2\% of rows have a periodogram slope steeper than 1.8, so this rarely binds; a
+Mat\'ern-3/2 basis would lift it if that changes.
+
+% ===========================================================================
+\section{Seeding: which peaks become components}
+% ===========================================================================
+
+The GP does not search for periods. It is seeded from the stored periodogram, and a bad seed
+is never recovered, so seeding matters as much as the fit.
+
+\code{find\_all\_significant\_peaks} walks the periodogram greedily, taking the largest
+excess over the red-noise continuum $C(f)$, masking $\pm5\%$ in frequency around it, and
+repeating while any bin stays above the significance threshold $\gamma C(f)$ (Vaughan 1\%).
+\code{threshold\_mode='red\_noise'} is the pipeline default; \code{'red\_noise\_subtracted'}
+orders candidates by $P - C$ rather than $P - \gamma C$, which is unbiased in period
+(\code{peak\_finders.tex}).
+
+$C(f)$ comes from the \textbf{peak-masked} continuum fit
+(\code{lc\_lsp.\_fit\_red\_noise\_vaughan\_masked}). Fitting every bin lets the signals bias
+the continuum steep --- median $\alpha$ error $+0.71$ with 7--10 injected oscillators --- which
+lifts the threshold at low frequency and hides real peaks. Masking cut the
+detectable-but-missed oscillator count from 157 to 42 on the synthetic set.
+
+\textbf{Harmonics and sidelobes are not suppressed} (\code{harmonic\_masking=False}): a
+harmonic is a real feature of the light curve. The cost is that one physical signal can
+produce several seeds --- in crowded rows only about a third of the peaks found are distinct
+injections, a third are harmonics and a third are sidelobes of a peak already found. Hence
+\S6.
+
+% ===========================================================================
+\section{Priors}
+% ===========================================================================
+
+All three are smooth penalties added to the negative log-likelihood, resolved at Python
+level into one objective (so JIT sees a fixed structure). BIC uses the bare log-likelihood,
+not the penalised objective.
+
+\begin{description}
+\item[Period (log-normal, \code{use\_lognormal\_period\_prior})] keeps each component near its
+  seed, $0.5\,[(\ln P_i - \ln P_i^{\rm seed})/\sigma_{\rm ln}]^2$ with $\sigma = 0.3$ dex by
+  default. Without it components wander off their peak during the free pass.
+\item[$Q$ floor (\code{use\_q\_prior})] penalises $Q < 2$ quadratically in $\log Q$. A
+  low-$Q$ SHO is broad, and a broad component is a continuum in disguise; this is what stops
+  signal components from eating the red noise.
+\item[Red-noise slope in the white-noise limit] --- see \S5.
+\end{description}
+
+% ===========================================================================
+\section{The white-noise limit}
+% ===========================================================================
+
+White noise is the $\alpha \to 0$ limit of red noise, but the kernel also has a jitter term,
+and a flat red-noise component is degenerate with it. Given a light curve with no red noise
+the fit therefore zeroes the red-noise \emph{amplitude} and leaves $\alpha$ floating --- on the
+first real run, 33\% of rows ended that way with a median $\alpha$ of 1.76 and half piled at
+the upper bound, an artefact that correlates with amplitude and could easily be mistaken for
+signal.
+
+\code{\_rn\_alpha\_wn\_neg\_log\_prior} adds $w_{\rm pr}\alpha^2\,\sigma(-\log_{10}(r/r_0)/\Delta)$
+with $r = S_0 / \mathrm{WN\ PSD}$, defaults $w_{\rm pr}=1$, $r_0 = 0.1$, $\Delta = 0.5$
+decades. Where red noise is real the weight is negligible (0.04 at $r=4$); where it is
+absent, $\alpha$ is pulled to the flat limit. On the synthetic set the flagged rows moved
+from a median $\alpha$ of 1.04 (35\% at the bound) to 0.05 (4\% at the bound), while rows with
+real red noise were unchanged: median error $0.087 \to 0.078$, $r$ with truth
+$0.798 \to 0.828$.
+
+\textbf{This is an imposed value, not a measurement.} Report those rows as "consistent with
+flat" and keep \code{gp\_rn\_wn\_ratio} beside them.
+
+% ===========================================================================
+\section{Component budget and pruning}
+% ===========================================================================
+
+Because harmonics and sidelobes each produce seeds, \code{max\_components} is spent on
+duplicates in crowded rows. The GP handles a duplicate gracefully --- it is fitted at a median
+\textbf{4\%} of the amplitude of the component holding the real signal, at $Q \sim 40$ against
+$Q \sim 500$ for a real match --- so duplicates waste budget rather than corrupt the fit.
+
+Two changes follow, and they work together:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+ & \code{max\_components}=10 & =16 \\
+\midrule
+rows at the cap (of 246)                       & 69 & \textbf{39} \\
+rows with neither quality flag                 & 160 & \textbf{187} \\
+$\alpha$ error, all rows with red noise        & 0.097 & \textbf{0.091} \\
+raw purity / completeness                      & 0.736 / 0.928 & 0.665 / \textbf{0.974} \\
+filtered ($\sigma \geq 10\%$, $Q \geq 5$)      & 0.938 / 0.846 & 0.964 / \textbf{0.887} \\
+mean fit time per row                          & 33\,s & 41\,s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At matched purity the larger budget buys 3.8 points of completeness for 24\% more fit time.
+Note that BIC does \emph{not} prefer the bigger models (median $\Delta$BIC $= 0$, better in
+4\% of rows): the extra components are redundant, and the point is only that duplicates stop
+crowding out real peaks.
+
+\code{gp\_table\_io.filter\_gp\_components(table)} does the pruning afterwards, writing
+\code{gp\_periods\_filtered} and friends; \code{synth/compare.py:component\_filter\_scan}
+measures what a cut costs. Keeping this post hoc means the trade stays a knob rather than a
+decision baked into the fit. \textbf{Caveat:} the injections are pure sinusoids, driven to
+the $Q$ cap, so the $Q$ separation is sharper on synthetic data than it will be for
+quasi-periodic spot modulation. The default is therefore $Q_{\min} = 5$, not the 20 that the
+synthetic numbers alone would suggest: on the real table $Q_{\min} = 20$ discarded obvious
+signals --- NGC2136 shows a clear 4.4\,d modulation by eye, fitted with three components at
+$Q \approx 14$, all of which that cut removed. Real components sit in $Q = 2$--20 far more
+often than synthetic ones (24\% vs 17\%), which is exactly what finite coherence looks like.
+
+% ===========================================================================
+\section{Fitting}
+% ===========================================================================
+
+L-BFGS-B with JAX gradients, in stages, each warm-started from the previous one and kept only
+if it does not worsen the objective:
+\begin{enumerate}
+\item \textbf{periods frozen} at their seeds, so $\sigma$, $Q$, the red-noise term and jitter
+  find their level while the period is pinned;
+\item \textbf{everything free}.
+\end{enumerate}
+With \code{fit\_full\_only=False} the search runs $m = 1 \ldots n$ components and keeps the
+best BIC; the pipeline sets \code{fit\_full\_only=True} and fits the full seed list once.
+
+\textbf{The optimisation is multimodal} and this is not fully solved. On real rows the free
+fit sometimes ends below a fit with $\alpha$ held at 1 (4/30 random rows, 13/30 steep rows),
+which cannot happen at a true optimum. Seeding $\alpha$ from the periodogram slope did not
+help; releasing $\alpha$ in a final stage
+(\code{rn\_alpha\_release\_last}) guarantees no-worse-than-fixed but leaves $\alpha$ stuck at
+its seed in 40\% of rows and was worse overall, so it is off by default. Running both and
+keeping the better objective would cost roughly twice the fit time and has not been tested.
+
+\subsection{When no peak is significant}
+
+If the peak search returns nothing, there is nothing to seed. The fit then uses
+\textbf{zero SHO components} --- red noise plus jitter only --- rather than inventing one.
+
+This replaced a fallback that fitted a single SHO seeded at $P=1$\,d, and the change is not
+cosmetic. That filler component landed at the $Q$ bound and \emph{absorbed the continuum}:
+across the 300 affected rows of the real table (24\% of it), the median \code{gp\_rn\_alpha}
+read 0.05 against 0.96 for rows that found peaks, and the median red-noise-to-white-noise
+power ratio read $4\times10^{-6}$. After the change those rows report $\alpha = 1.07$ and a
+ratio of 0.98, i.e. ordinary red noise, and 20 units of BIC are recovered per row while the
+log-likelihood falls by only 0.5 --- the discarded component was contributing nothing but
+parameters. The share of rows flagged \code{gp\_rn\_near\_white\_noise} fell from 32\% to
+23\%, because two thirds of that flag was this artefact rather than genuine white noise.
+
+Rows fitted this way have \code{gp\_n\_components = 0} and empty component lists; nothing
+downstream needs special handling. Without a red-noise term in the kernel the old fallback is
+kept, since the kernel would otherwise be empty.
+
+% ===========================================================================
+\section{What it writes}
+% ===========================================================================
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+column & meaning \\
+\midrule
+\code{gp\_n\_components}, \code{gp\_bic}, \code{gp\_log\_likelihood} & model size and fit quality \\
+\code{gp\_periods}, \code{gp\_sho\_sigmas}, \code{gp\_sho\_omegas}, \code{gp\_sho\_Qs} & per-component parameters \\
+\code{gp\_jitter} & fitted white-noise term \\
+\code{gp\_rn\_alpha} & fitted intrinsic red-noise slope \\
+\code{gp\_rn\_alpha\_band} & in-band slope of the fitted spectrum --- \emph{compare this to measured slopes} \\
+\code{gp\_rn\_log10\_S0}, \code{gp\_rn\_rms\_band} & red-noise level at 1\,d$^{-1}$; in-band RMS \\
+\code{gp\_rn\_wn\_ratio} & red-noise / white-noise power at 1\,d$^{-1}$ \\
+\code{gp\_rn\_exposure\_days}, \code{gp\_rn\_basis\_freqs} & exposure filter and basis actually used \\
+\code{GP\_freq}, \code{GP\_PSD}, \code{gp\_kspace\_*} & analytic PSD of the fitted kernel, and band statistics \\
+\code{gp\_initial\_lsp\_peak\_periods}, \code{gp\_n\_peaks\_found} & seeds used, peaks available \\
+\code{gp\_rn\_near\_white\_noise} & \textbf{flag}: no detectable red noise, $\alpha$ undefined \\
+\code{gp\_components\_capped} & \textbf{flag}: more peaks than \code{max\_components} \\
+\code{gp\_*\_filtered}, \code{gp\_component\_kept} & written by \code{filter\_gp\_components};
+   the second is a per-component boolean aligned with \code{gp\_periods}, so a plot can draw
+   kept and cut components differently \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\code{gp\_rn\_sigma} / \code{gp\_rn\_period} / \code{gp\_rn\_Q} appear only under the legacy
+\code{rn\_model='sho'} and are NaN otherwise.
+
+\subsection{How to use the flags}
+
+\code{gp\_rn\_near\_white\_noise} is a hard exclusion for $\alpha$: that row has no slope to
+measure, and the reported value is the prior's. \code{gp\_components\_capped} is softer ---
+those rows fit $\alpha$ nearly as well as clean rows (median error 0.12 vs 0.09) and mostly
+signal a crowded periodogram. \textbf{Do not drop flagged rows from a population analysis}:
+the capped fraction correlates with age ($\rho = -0.18$ on the real table), so cutting on it
+selects on the target.
+
+% ===========================================================================
+\section{Validation summary}
+% ===========================================================================
+
+From the synthetic injection--recovery set (246 rows, exposure-averaged sampling; figure
+\code{sytheticdata\_generate\_compare/figs/synthetic\_evaluation.png}):
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+quantity & result & note \\
+\midrule
+red-noise slope, GP            & bias $+0.09$, median error 0.09, $r = 0.82$ & clean rows (187 of 246) \\
+red-noise slope, periodogram   & bias $+0.00$, median error 0.17, $r = 0.59$ & same rows \\
+red-noise amplitude, GP        & Spearman 0.82 & in-band vs full-baseline: offset by construction \\
+detectable oscillators found   & \textbf{98.4\%} & 601 of 611, 10 missed \\
+component purity               & 68.4\% raw, \textbf{96.4\%} filtered & completeness 88.7\% after the cut \\
+rows fitted with no components & 57 of 246 & no significant peak; red noise + jitter only \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Against age on the real table, the red-noise \emph{amplitude} correlates
+($\rho = -0.31$ at cluster level) while the \emph{slope} does not ($\rho \approx 0$), so
+$\alpha$ is currently a diagnostic rather than a feature.
+
+\textbf{Known open items.} The optimiser multimodality above; the $\alpha < 2$ ceiling; the
+crowded shallow-$\alpha$ rows where leftover oscillator power still biases the continuum; and
+the fact that the synthetic injections are pure sinusoids, which flatters both the $Q$
+separation and the period recovery relative to real quasi-periodic variability.
+
+\end{document}
