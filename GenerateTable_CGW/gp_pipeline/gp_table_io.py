@@ -74,6 +74,16 @@ def add_gp_fits(
     gp_sho_sigmas                object     list of fitted sigma per component (length m)
     gp_sho_omegas                object     list of fitted omega per component (length m)
     gp_sho_Qs                    object     list of fitted Q per component (length m)
+    gp_sho_taus                  object     list of decay times Q P / pi in days (length m);
+                                            capped at gp_sho_tau_cap, so a value at the cap
+                                            means "coherent for the whole window", not a
+                                            measurement
+    gp_sho_coherence             object     list of coherence fractions s in [0, 1] (length m):
+                                            where Q sits between its floor 1/sqrt(2) and its
+                                            period-dependent ceiling pi * tau_cap / P, in log.
+                                            1 = pinned at the cap (gp_fit.q_from_coherence)
+    gp_sho_tau_cap               float64    decay-time cap applied to this row in days
+                                            (min(tau_cap_days, baseline); NaN = legacy flat Q box)
     gp_initial_lsp_peak_periods  object     LSP seed periods used to initialise fit
     gp_rn_sigma, gp_rn_period, gp_rn_Q
                                  float64    red-noise SHO parameters (rn_model='sho' only)
@@ -124,6 +134,9 @@ def add_gp_fits(
     gp_sho_sigmas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_omegas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_Qs_vals     = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_taus_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_coh_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_tau_cap_vals = pd.Series(np.nan, index=idx, dtype=float)
     gp_init_lsp_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_rn_basis_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_rn_exposure_vals = pd.Series(np.nan, index=idx, dtype=float)
@@ -223,6 +236,9 @@ def add_gp_fits(
                 gp_sho_sigmas_vals[label] = [result.features[f"sho_{i}_sigma"] for i in range(1, m + 1)]
                 gp_sho_omegas_vals[label] = [result.features[f"sho_{i}_omega"] for i in range(1, m + 1)]
                 gp_sho_Qs_vals[label]     = [result.features[f"sho_{i}_Q"]     for i in range(1, m + 1)]
+                gp_sho_taus_vals[label]   = [result.features.get(f"sho_{i}_tau_days", np.nan) for i in range(1, m + 1)]
+                gp_sho_coh_vals[label]    = [result.features.get(f"sho_{i}_coherence", np.nan) for i in range(1, m + 1)]
+                gp_sho_tau_cap_vals[label] = result.features.get("sho_tau_cap_days", np.nan)
                 gp_init_lsp_vals[label]   = result.features["initial_lsp_peak_periods"]
                 gp_rn_sigma_vals[label]   = result.features.get("rn_sigma",       np.nan)
                 gp_rn_period_vals[label]  = result.features.get("rn_period_days", np.nan)
@@ -280,6 +296,9 @@ def add_gp_fits(
     table["gp_sho_sigmas"]               = gp_sho_sigmas_vals
     table["gp_sho_omegas"]               = gp_sho_omegas_vals
     table["gp_sho_Qs"]                   = gp_sho_Qs_vals
+    table["gp_sho_taus"]                 = gp_sho_taus_vals
+    table["gp_sho_coherence"]            = gp_sho_coh_vals
+    table["gp_sho_tau_cap"]              = gp_sho_tau_cap_vals
     table["gp_initial_lsp_peak_periods"] = gp_init_lsp_vals
     table["gp_rn_sigma"]                 = gp_rn_sigma_vals
     table["gp_rn_period"]                = gp_rn_period_vals
@@ -484,8 +503,16 @@ def recompute_gp_psd_columns(table, freq_lim=(0.1, 12.0), n_bins=10, verbose=Tru
     return table
 
 
-def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered', verbose=True):
+def filter_gp_components(table, sigma_rel_min=0.10, Q_min=None, n_cycles_min=1.6,
+                         suffix='_filtered', verbose=True):
     """Prune low-amplitude / incoherent GP components, post hoc.
+
+    The coherence cut is expressed in CYCLES, ``tau_d / P = Q / pi``, not in Q.  Since
+    2026-11 the fit caps Q at pi * tau_cap / P (decay time at most one sector), so at
+    P = 10 d the ceiling is Q = 8.5 and a flat ``Q >= 5`` would sit almost on the cap while
+    at P = 0.1 d it would be 1% of it.  A cycles cut means the same thing at every period.
+    The default ``n_cycles_min=1.6`` is exactly the old ``Q >= 5`` (5 / pi = 1.59).  Pass
+    ``Q_min`` instead to cut on Q directly (then ``n_cycles_min`` is ignored).
 
     The fit is deliberately generous (``max_components=16``): a peak finder run without
     harmonic masking reports sidelobes and harmonics of a strong signal as separate peaks, so
@@ -520,8 +547,10 @@ def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered
         Needs ``gp_periods``, ``gp_sho_sigmas``, ``gp_sho_Qs`` (and ``gp_sho_omegas`` if present).
     sigma_rel_min : float
         Amplitude floor, as a fraction of the row's strongest component.
-    Q_min : float
-        Quality-factor floor.
+    n_cycles_min : float
+        Coherence floor in cycles, Q / pi >= n_cycles_min.  Default 1.6 (= Q >= 5).
+    Q_min : float or None
+        Quality-factor floor; overrides ``n_cycles_min`` when given.
     suffix : str
         Added to the new column names.
 
@@ -532,7 +561,9 @@ def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered
     gp_component_kept         list of bools aligned with ``gp_periods`` -- which components survived,
                               so a plot can draw kept and cut components differently
     """
-    cols = ['gp_periods', 'gp_sho_sigmas', 'gp_sho_Qs', 'gp_sho_omegas']
+    q_floor = float(Q_min) if Q_min is not None else float(n_cycles_min) * np.pi
+    cut_label = f"Q >= {Q_min}" if Q_min is not None else f"cycles Q/pi >= {n_cycles_min} (Q >= {q_floor:.2f})"
+    cols = ['gp_periods', 'gp_sho_sigmas', 'gp_sho_Qs', 'gp_sho_omegas', 'gp_sho_taus', 'gp_sho_coherence']
     present = [c for c in cols if c in table.columns]
     idx = table.index
     out = {c + suffix: pd.Series([None] * len(table), index=idx, dtype=object) for c in present}
@@ -556,7 +587,7 @@ def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered
             kept_mask[label] = []
             continue
         smax = np.nanmax(sig)
-        keep = np.isfinite(sig) & (sig >= sigma_rel_min * smax) & (Q >= Q_min) if smax > 0 else np.zeros(len(sig), bool)
+        keep = np.isfinite(sig) & (sig >= sigma_rel_min * smax) & (Q >= q_floor) if smax > 0 else np.zeros(len(sig), bool)
         for c in present:
             v = np.atleast_1d(np.asarray(row.get(c), dtype=float))
             out[c + suffix][label] = list(v[keep]) if len(v) == len(keep) else None
@@ -569,7 +600,7 @@ def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered
     table['gp_component_kept'] = kept_mask
     if verbose:
         tot = pd.to_numeric(table.get('gp_n_components'), errors='coerce').sum()
-        print(f"[filter_gp_components] sigma_rel >= {sigma_rel_min}, Q >= {Q_min}: "
+        print(f"[filter_gp_components] sigma_rel >= {sigma_rel_min}, {cut_label}: "
               f"kept {int(n_kept.sum())} of {int(tot)} components "
               f"({n_kept.sum() / max(tot, 1):.0%}) across {int(n_kept.notna().sum())} rows")
     return table

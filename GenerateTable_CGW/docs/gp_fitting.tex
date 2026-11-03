@@ -11,7 +11,7 @@
 
 \title{The GP Fit: Model, Priors, Fitting, and What Comes Out}
 \author{\texttt{GenerateTable\_CGW}}
-\date{2026 September 21}
+\date{2026 November 3}
 
 \begin{document}
 \maketitle
@@ -53,11 +53,71 @@ the $Q$ prior (\S4) and the red-noise term exist to prevent.
 Each is a simple harmonic oscillator, \code{quasisep.SHO}, free in amplitude $\sigma_i$,
 period $P_i$ and quality factor $Q_i$. Its PSD peaks at $1/P_i$ with width set by $Q_i$:
 a coherent sinusoid drives $Q$ to the cap, spot modulation with a finite lifetime does not.
-Periods are bounded to the search band (0.083--10\,d) and $Q \in [1/\sqrt2, 500]$. The
-lower bound is physical rather than arbitrary: an SHO's PSD has a peak at non-zero frequency
-only for $Q > 1/\sqrt2$, so below that the component is a continuum, not an oscillator --- the
-same value the old fixed-$Q$ red-noise SHO used. It binds rarely (1.4\% of components in rows
-that found peaks); the soft $Q$ prior below $Q=2$ does the real work.
+Periods are bounded to the search band (0.083--10\,d).
+
+\subsubsection{Bounds on $Q$: a decay-time cap, not a $Q$ cap}
+\label{sec:qbounds}
+
+For $Q > 1/2$ the SHO kernel is an envelope times a cosine,
+$k(\tau) \propto e^{-\omega_0 \tau / 2Q}\cos(\ldots)$ (Foreman-Mackey et al.\ 2017, eq.~23),
+so the amplitude e-folds on the \textbf{decay time}
+\begin{equation}
+\tau_d = \frac{2Q}{\omega_0} = \frac{Q\,P}{\pi},
+\qquad\text{i.e.}\qquad Q = \pi\,\frac{\tau_d}{P},
+\end{equation}
+which is the $(\rho, \tau)$ parameterisation \code{celerite2} offers for \code{SHOTerm}.
+$Q/\pi$ is the number of coherent cycles before the signal forgets its phase.
+
+\textbf{Upper bound.} Once $\tau_d$ exceeds the length of the light curve the likelihood is
+flat in $Q$: a component coherent for 27\,d and one coherent for ever are the same thing in
+27\,d of data, and the optimiser drifts to whatever edge it was given. Nicholson \& Aigrain
+(2022) show, on spot-model simulations, that the recovered evolution timescale of a
+quasi-periodic GP tracks the truth only up to about half the baseline and scatters freely
+beyond it. The cap is therefore on $\tau_d$, and in $Q$ it is \emph{period-dependent}:
+\begin{equation}
+\tau_d \le \tau_{\rm cap}
+\quad\Longleftrightarrow\quad
+Q \le Q_{\max}(P) = \frac{\pi\,\tau_{\rm cap}}{P},
+\qquad \tau_{\rm cap} = \min(27\,\mathrm{d},\ \text{baseline}).
+\end{equation}
+(The frequency-domain statement is the same: the SHO line, FWHM $\simeq f_0/Q$, must not be
+narrower than the Rayleigh resolution $1/T$, which gives $Q < T/P$ --- the same scaling, a
+factor $\pi$ tighter.) At the defaults this is $Q_{\max} = 1020$ at $P = 0.083$\,d, 85 at
+1\,d, 17 at 5\,d and 8.5 at 10\,d.
+
+$\tau_{\rm cap}$ is pinned to \textbf{one TESS sector for every row}, including multi-sector
+combinations. A stitching offset between sectors can only be absorbed as an 80-day coherent
+signal if the box allows an 80-day decay time, and the $Q$ feature should mean the same thing
+whatever the sector count. Rows shorter than a sector use their own baseline.
+
+Before 2026-11 the box was a flat $Q \in [1/\sqrt2, 500]$. That equals the baseline cap at
+exactly one period (0.17\,d for a sector), so below it the box cut off decay times the data
+could resolve, and above it the box allowed decay times far beyond the data: on the
+2026-09-21 real table 38\% of components sat on the 500 cap, 43\% had $\tau_d$ longer than
+their own light curve, and above $P = 2$\,d the \emph{median} component already exceeded
+$\pi T/P$. The new cap \emph{loosens} the bound below $\sim 0.5$\,d (where the pile-up at 500
+was mostly the flat cap biting) and \emph{tightens} it above $\sim 2$\,d. A component at the
+cap now reads ``coherent for the whole window'', which is at least an interpretable
+statement; it is still not a measurement.
+
+\textbf{Lower bound.} Physical rather than arbitrary: an SHO's PSD has a peak at non-zero
+frequency only for $Q > 1/\sqrt2$, so below that the component is a continuum, not an
+oscillator --- the same value the old fixed-$Q$ red-noise SHO used. It is a hard bound. The
+soft prior (\S4) does the real work above it.
+
+\textbf{How the bounds are enforced.} L-BFGS-B takes only box bounds fixed before the fit,
+and both limits on $Q$ move with the period. So the parameter vector carries, per
+component, a \emph{coherence fraction} $s \in [0,1]$ instead of $\log Q$, and
+\begin{equation}
+\log Q = \log Q_{\min} + s\,\bigl[\log Q_{\max}(P) - \log Q_{\min}\bigr]
+\end{equation}
+is evaluated inside \code{unpack\_theta} from the current period
+(\code{gp\_fit.q\_from\_coherence}). The box on $s$ is $[0,1]$, so both limits are exact hard
+walls; $s = 0$ is the continuum limit and $s = 1$ is ``coherent for the whole cap''. The
+kernel, the soft prior and every reported feature use the derived $Q$; nothing downstream
+sees $s$ except the \code{gp\_sho\_coherence} column, which is the cleanest ``is it at the
+cap?'' diagnostic. Fits pickled before the change carry no \code{tau\_cap} key and unpack in
+the old $\log Q$ layout (\code{gp\_fit.q\_layout\_kwargs}), so old tables still load.
 
 \subsection{Red noise: a power law built from OU terms}
 
@@ -125,9 +185,15 @@ not the penalised objective.
 \item[Period (log-normal, \code{use\_lognormal\_period\_prior})] keeps each component near its
   seed, $0.5\,[(\ln P_i - \ln P_i^{\rm seed})/\sigma_{\rm ln}]^2$ with $\sigma = 0.3$ dex by
   default. Without it components wander off their peak during the free pass.
-\item[$Q$ floor (\code{use\_q\_prior})] penalises $Q < 2$ quadratically in $\log Q$. A
-  low-$Q$ SHO is broad, and a broad component is a continuum in disguise; this is what stops
-  signal components from eating the red noise.
+\item[$Q$ floor (\code{use\_q\_prior})] penalises $Q < \pi$ quadratically in $\log Q$
+  (\code{q\_prior\_threshold}). $Q = \pi$ is a decay time of exactly one period
+  (\S\ref{sec:qbounds}): Angus et al.\ (2018) argue that the evolution timescale of a
+  rotating spotted star should exceed its period, $l > P$, and the spot simulations behind
+  Aigrain et al.\ (2015) and Nicholson \& Aigrain (2022) use lifetimes of $1$--$10\,P$, i.e.\
+  $Q \approx 3$--$30$. A low-$Q$ SHO is broad, and a broad component is a continuum in
+  disguise; this is what stops signal components from eating the red noise. The threshold
+  was 2 ($\tau_d = 0.64\,P$) before 2026-11. The prior acts on the \emph{derived} $Q$, so it
+  is unchanged by the coherence-fraction parameterisation.
 \item[Red-noise slope in the white-noise limit] --- see \S5.
 \end{description}
 
@@ -189,11 +255,20 @@ crowding out real peaks.
 measures what a cut costs. Keeping this post hoc means the trade stays a knob rather than a
 decision baked into the fit. \textbf{Caveat:} the injections are pure sinusoids, driven to
 the $Q$ cap, so the $Q$ separation is sharper on synthetic data than it will be for
-quasi-periodic spot modulation. The default is therefore $Q_{\min} = 5$, not the 20 that the
+quasi-periodic spot modulation. The default was therefore $Q_{\min} = 5$, not the 20 that the
 synthetic numbers alone would suggest: on the real table $Q_{\min} = 20$ discarded obvious
 signals --- NGC2136 shows a clear 4.4\,d modulation by eye, fitted with three components at
 $Q \approx 14$, all of which that cut removed. Real components sit in $Q = 2$--20 far more
 often than synthetic ones (24\% vs 17\%), which is exactly what finite coherence looks like.
+
+\textbf{The cut is now in cycles.} With the period-dependent cap of \S\ref{sec:qbounds} a
+flat $Q \ge 5$ means different things at different periods: at $P = 10$\,d the ceiling is
+$Q = 8.5$, so the cut would sit almost on it, while at $P = 0.1$\,d it is 1\% of the ceiling.
+\code{filter\_gp\_components} therefore cuts on $\tau_d / P = Q/\pi \ge$
+\code{n\_cycles\_min}, default 1.6, which is exactly the old $Q \ge 5$ and so leaves the
+numbers above unchanged; \code{Q\_min} is still accepted and overrides it. The table and the
+numbers in this section were measured under the old flat cap and have not yet been
+re-measured under the decay-time cap (see \S9).
 
 % ===========================================================================
 \section{Fitting}
@@ -247,6 +322,12 @@ column & meaning \\
 \midrule
 \code{gp\_n\_components}, \code{gp\_bic}, \code{gp\_log\_likelihood} & model size and fit quality \\
 \code{gp\_periods}, \code{gp\_sho\_sigmas}, \code{gp\_sho\_omegas}, \code{gp\_sho\_Qs} & per-component parameters \\
+\code{gp\_sho\_taus} & per-component decay time $\tau_d = QP/\pi$ in days; at
+   \code{gp\_sho\_tau\_cap} it means ``coherent for the whole window'', not a measurement \\
+\code{gp\_sho\_coherence} & per-component $s \in [0,1]$, where $Q$ sits between its floor and
+   its period-dependent ceiling in log; $s=1$ is at the cap (\S\ref{sec:qbounds}) \\
+\code{gp\_sho\_tau\_cap} & the decay-time cap applied to the row, $\min(27\,\mathrm{d}, T)$;
+   NaN for fits made under the old flat $Q$ box \\
 \code{gp\_jitter} & fitted white-noise term \\
 \code{gp\_rn\_alpha} & fitted intrinsic red-noise slope \\
 \code{gp\_rn\_alpha\_band} & in-band slope of the fitted spectrum --- \emph{compare this to measured slopes} \\
@@ -306,5 +387,14 @@ $\alpha$ is currently a diagnostic rather than a feature.
 crowded shallow-$\alpha$ rows where leftover oscillator power still biases the continuum; and
 the fact that the synthetic injections are pure sinusoids, which flatters both the $Q$
 separation and the period recovery relative to real quasi-periodic variability.
+
+\textbf{Not yet re-validated after the $Q$ bound change (2026-11).} Every number in this
+document was measured with the flat $Q \in [1/\sqrt2, 500]$ box and the soft floor at $Q=2$.
+The decay-time cap (\S\ref{sec:qbounds}) and the soft floor at $Q=\pi$ change where
+components land --- looser below $P \sim 0.5$\,d, tighter above $\sim 2$\,d --- so the
+synthetic purity/completeness table, the $Q = 2$--20 fractions and the real-table
+\code{gp\_sho\_Qs} distribution all need re-running. The injections are pure sinusoids and
+will now pile at $s = 1$ rather than at $Q = 500$; the $Q$ separation between real and
+duplicate components should be read in \code{gp\_sho\_coherence} or in cycles, not in raw $Q$.
 
 \end{document}
