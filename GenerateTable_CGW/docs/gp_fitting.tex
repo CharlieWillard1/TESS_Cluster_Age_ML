@@ -173,6 +173,25 @@ produce several seeds --- in crowded rows only about a third of the peaks found 
 injections, a third are harmonics and a third are sidelobes of a peak already found. Hence
 \S6.
 
+\textbf{Where the raw impurity comes from} (\code{diagnose\_purity.py},
+\code{figs/purity\_diagnostics.png}). The GP fits every seed (\code{fit\_full\_only=True}), so
+raw component purity \emph{is} seed purity: on the capped synthetic fit, 1632 seeds for 1123
+in-band injections, 1.45 seeds per injection, purity 0.67. The extra seeds are not new
+periods. 74\% of the spurious components lie within 30\% of an injected period, and 71\%
+sit at an absolute frequency offset between $0.5/T_{\rm sector}$ and $2.5/T_{\rm orbit}$
+from the nearest injection --- the sidelobe spacings of a 27-day window with a 13.7-day gap.
+A loud sinusoid puts a comb of sidelobes above the Vaughan threshold, and the finder's
+mask is $\pm 5\%$ \emph{in frequency}: at $f < 1.5$\,d$^{-1}$ ($P > 0.7$\,d) that is narrower
+than one sidelobe spacing, so each sidelobe is accepted as its own peak. One row of IC\,2714
+with two injections received 13 seeds this way. Purity falls with crowding (0.38 at one
+injection per row, 0.85 at ten) and with sector count (0.69, 0.61, 0.59 for 1, 2, 3
+sectors, at 1.41, 1.53, 1.80 seeds per injection), both as expected for window sidelobes.
+The fit itself already separates them --- duplicate seeds are fitted with essentially no
+amplitude (\S6) --- so the delivered list is clean, but the seeds waste the component
+budget. The fix, not yet applied, is to mask in \emph{absolute} frequency, $\pm k/T_{\rm orbit}$
+with $k \sim 2$, around each accepted peak instead of (or in addition to) the fractional
+window.
+
 % ===========================================================================
 \section{Priors}
 % ===========================================================================
