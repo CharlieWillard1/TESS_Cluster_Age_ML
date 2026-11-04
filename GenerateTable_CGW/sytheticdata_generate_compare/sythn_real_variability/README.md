@@ -151,6 +151,37 @@ Every name resolves through `lc_lsp.get_lc_path` (asserted at generation time an
 `checks.py`).  Truth is one row per cluster; the pipeline emits one row per sector
 combination, so join on `name` many-to-one as in `../synth/compare.py`.
 
+### GP pipeline evaluation (`gp_eval_run.py`, `gp_eval_figs.py`, `results/gp_eval.png`)
+
+```bash
+cd GenerateTable_CGW/sytheticdata_generate_compare      # env tess_gp
+python -m sythn_real_variability.gp_eval_run rows       # 1- and 3-sector row per cluster (~1 min)
+python -m sythn_real_variability.gp_eval_run gp         # GP fit, prewhitened seeds (~9 min on 64 workers)
+python -m sythn_real_variability.gp_eval_figs           # scoring, CSVs and figure
+```
+
+The full `expand_table` would make 116,123 rows (≈ 15 sectors per template), so the
+evaluation fits two per cluster from the pipeline's own combination list: the first one-sector
+and the first three-sector combination of the largest cadence group (1,343 rows).  A cluster's
+signal is thousands of sinusoids, almost all far below the noise, so an injection counts as
+**detectable** when its predicted periodogram power, (a sinc(E/P))² Σσ⁻² / 4, puts the expected
+power above the Vaughan 1% threshold of the row (checked: measured / predicted median 0.97,
+94% of predicted-detectable injections clear the threshold).  429 injections are detectable in
+1,343 rows; most rows, and every row younger than log age 7.25, have none.
+
+| delivered-list filter (all with cycles ≥ 1.6) | purity | completeness |
+|---|---|---|
+| σ/WN ≥ 0.2 (current default) | 0.70 | 0.70 |
+| ΔlogL_seq ≥ 10, no amplitude cut | **0.83** | **0.82** |
+
+The amplitude cut ranks components the wrong way on this set: components with no signal
+behind them (red-noise absorbers at 3–10 d) have median σ/WN 0.69, matched ones 0.31.  On the
+clean-sinusoid set the same evidence cut gives purity 0.997 and completeness 0.90 (amplitude
+cut: 0.993, 0.94), see `gp_eval_filter_scan.csv`.  **Confound:** brightness falls with age in
+this set (Spearman 0.93 with integrated Tmag), so the template white noise (0.64) and the
+realised red-noise rms (0.43) correlate with age; any variability feature can pick up age
+through noise alone.
+
 ## Figures
 
 * `fig_lc_examples.png` — clean population signal (2-min grid) and the TESS-sampled noisy light
