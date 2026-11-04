@@ -21,3 +21,9 @@ light_curves_synthetic/
 # Collaborator tarball drop (177 GB: 87 GB elk tesscut cache, per-sector corrected LCs,
 # figures).  Regenerable from the original archive; nothing in the pipeline reads it yet.
 light_curves_AmayaDownload/
+
+# Synthetic-population LC set (sythn_real_variability): regenerable, ~3 GB.
+light_curves_synthetic_populations/
+GenerateTable_CGW/sytheticdata_generate_compare/sythn_real_variability/data/
+# ...but keep its small tracked results (figures, CSV summaries, checks report)
+!GenerateTable_CGW/sytheticdata_generate_compare/sythn_real_variability/results/*.png

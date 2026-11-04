@@ -1,0 +1,2 @@
+age,feh,fluxfrac_missing,fluxfrac_outside_grid,fluxfrac_unsampled_sparse,fluxfrac_unsampled_empty,fluxfrac_missing_hot_gt12500K,fluxfrac_missing_cool_lt12500K,lbolfrac_missing,fluxfrac_var,Tmag_syn,n_var,n_components,n_instances
+8.7500,0.0000,0.0440,0.0000,0.0440,0.0000,0.0000,0.0440,0.0364,0.8103,13.7370,5494.0000,12203.0000,1

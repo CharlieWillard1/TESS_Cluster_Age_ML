@@ -1,0 +1,15 @@
+{
+  "n_TF2026_var": 128046,
+  "n_TF2026_quiet": 114275,
+  "n_TF2023": 68983,
+  "dropped_nonfinite_teff_logl": 54130,
+  "dropped_duplicate_TIC": 33466,
+  "dropped_teff_above_catalog_max": 433,
+  "dropped_variables_failing_sanity": 19,
+  "dropped_variables_amp_gt_cap": 17,
+  "dropped_variables_period_lt_min": 2,
+  "n_with_second_component": 9580,
+  "n_final": 223256,
+  "n_final_var": 120642,
+  "n_final_quiet": 102614
+}
