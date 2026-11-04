@@ -757,21 +757,35 @@ def plot_slope_recovery(configs):
     return fig
 
 
+def row_white_noise(r):
+    """Median photometric error and fitted jitter in quadrature (= gp_table_io.row_white_noise)."""
+    err = r.get('LC_flux_err')
+    err = float(np.nanmedian(np.asarray(err, float))) if err is not None else np.nan
+    jit = r.get('gp_jitter', np.nan)
+    jit = float(jit) if jit is not None and np.isfinite(float(jit)) else 0.0
+    return float(np.sqrt(err ** 2 + jit ** 2))
+
+
 def component_filter_scan(df, cuts=((0, 0), (0.05, 0), (0.10, 0), (0.20, 0), (0, 20), (0, 100),
                                     (0.10, 20), (0.10, 100), (0.20, 100)), tol=0.10, window=0.02,
-                          by='Q'):
+                          by='Q', amp='rel'):
     """Purity and completeness of the GP component list under amplitude / coherence cuts.
 
     Companion to ``gp_table_io.filter_gp_components``: it measures what a given cut costs.
     Purity is the fraction of surviving components matching an injected period; completeness
     is the fraction of DETECTABLE injections (LSP peak above the row's significance threshold)
-    still matched by a surviving component.  ``cuts`` are (sigma_rel_min, coherence_min)
-    pairs, where the second element is a Q cut when ``by='Q'`` or a cycles (Q / pi) cut when
-    ``by='cycles'``; the output column is named ``Q_cut`` or ``cycles_cut`` accordingly.
+    still matched by a surviving component.  ``cuts`` are (amplitude_min, coherence_min)
+    pairs.  The first element is sigma / max(sigma in row) when ``amp='rel'`` or
+    sigma / white noise when ``amp='snr'`` (the pipeline default since 2026-11); the second
+    is a Q cut when ``by='Q'`` or a cycles (Q / pi) cut when ``by='cycles'``.  Output columns
+    are named ``sigma_rel_cut`` / ``snr_cut`` and ``Q_cut`` / ``cycles_cut`` accordingly.
     """
     if by not in ('Q', 'cycles'):
         raise ValueError(f"by must be 'Q' or 'cycles', got {by!r}")
+    if amp not in ('rel', 'snr'):
+        raise ValueError(f"amp must be 'rel' or 'snr', got {amp!r}")
     q_scale = np.pi if by == 'cycles' else 1.0
+    amp_col = 'sigma_rel' if amp == 'rel' else 'snr'
     comps, det_map, n_det = [], {}, 0
     for i, r in df.iterrows():
         P = np.atleast_1d(np.asarray(r.get('gp_periods', []), float))
@@ -793,17 +807,19 @@ def component_filter_scan(df, cuts=((0, 0), (0.05, 0), (0.10, 0), (0.20, 0), (0,
         if len(P) == 0 or not (len(P) == len(S) == len(Q)):
             continue
         smax = np.nanmax(S) if len(S) else np.nan
+        wn = row_white_noise(r)
         for per, sig, q in zip(P, S, Q):
-            comps.append(dict(row=i, period=per, sigma_rel=sig / smax if smax > 0 else np.nan, Q=q,
+            comps.append(dict(row=i, period=per, sigma_rel=sig / smax if smax > 0 else np.nan,
+                              snr=sig / wn if np.isfinite(wn) and wn > 0 else np.nan, Q=q,
                               real=bool(len(inj)) and bool(np.any(np.abs(inj / per - 1) < tol))))
     comps = pd.DataFrame(comps)
     rows = []
     for smin, qmin in cuts:
-        keep = comps[(comps['sigma_rel'] >= smin) & (comps['Q'] >= qmin * q_scale)]
+        keep = comps[(comps[amp_col] >= smin) & (comps['Q'] >= qmin * q_scale)]
         by_row = {k: g['period'].to_numpy() for k, g in keep.groupby('row')}
         found = sum(1 for i, det in det_map.items() for Pi in det
                     if len(by_row.get(i, [])) and np.any(np.abs(by_row[i] / Pi - 1) < tol))
-        rows.append({'sigma_rel_cut': smin, f'{by}_cut': qmin, 'components': len(keep),
+        rows.append({f'{amp_col}_cut': smin, f'{by}_cut': qmin, 'components': len(keep),
                      'purity': keep['real'].mean() if len(keep) else np.nan,
                      'completeness': found / n_det if n_det else np.nan, 'detectable': n_det})
     return pd.DataFrame(rows)
@@ -850,9 +866,13 @@ def _baseline_days(r):
     return float(np.ptp(t)) if t.size > 1 else np.nan
 
 
-def _classify_component(per, sig_rel, q, inj, T, tol, k_res, harmonics, harmonic_tol,
-                        q_floor, q_floor_tol, sigma_rel_min):
-    """The priority ladder; first match wins, so every component gets exactly one label."""
+def _classify_component(per, amp_low, q, inj, T, tol, k_res, harmonics, harmonic_tol,
+                        q_floor, q_floor_tol):
+    """The priority ladder; first match wins, so every component gets exactly one label.
+
+    ``amp_low`` is the caller's verdict on the amplitude (below the filter's floor), so the
+    same ladder serves the relative and the white-noise-referenced cut.
+    """
     if not len(inj):
         return 'no injection in row', np.nan, np.nan, np.nan
     frac = np.abs(per / inj - 1.0)
@@ -869,21 +889,33 @@ def _classify_component(per, sig_rel, q, inj, T, tol, k_res, harmonics, harmonic
         kind = 'harmonic of injection'
     elif np.isfinite(q) and q <= q_floor * (1.0 + q_floor_tol):
         kind = 'broadband (Q at floor)'
-    elif np.isfinite(sig_rel) and sig_rel < sigma_rel_min:
+    elif amp_low:
         kind = 'low amplitude'
     else:
         kind = 'unrelated frequency'
     return kind, nearest, offset, df_min
 
 
+def _amp_low(sig, srel, snr, snr_min, sigma_rel_min):
+    """True when the component fails the amplitude part of the filter."""
+    low = False
+    if snr_min is not None:
+        low |= not (np.isfinite(snr) and snr >= snr_min)
+    if sigma_rel_min is not None:
+        low |= not (np.isfinite(srel) and srel >= sigma_rel_min)
+    return bool(low)
+
+
 def false_positive_table(df, tol=0.10, k_res=2.0, harmonics=(2, 3, 4), harmonic_tol=0.05,
                          q_floor=1.0 / np.sqrt(2.0), q_floor_tol=0.02,
-                         sigma_rel_min=0.10, Q_min=None, n_cycles_min=1.6):
+                         snr_min=0.2, sigma_rel_min=None, Q_min=None, n_cycles_min=1.6):
     """One row per fitted GP component, classified by what it most likely is.
 
-    The coherence half of ``survives_filter`` is ``Q / pi >= n_cycles_min`` (default 1.6,
-    the same as the old ``Q >= 5``), mirroring ``filter_gp_components``; pass ``Q_min`` to
-    cut on Q directly instead.
+    ``survives_filter`` mirrors ``filter_gp_components``: amplitude sigma / white noise
+    >= ``snr_min`` (default 0.2; ``sigma_rel_min`` adds the old relative floor when given)
+    and coherence ``Q / pi >= n_cycles_min`` (default 1.6, the same as the old ``Q >= 5``;
+    pass ``Q_min`` to cut on Q directly instead).  The ``low amplitude`` class uses the same
+    amplitude verdict.
 
     Classes, in priority order:
 
@@ -895,7 +927,7 @@ def false_positive_table(df, tol=0.10, k_res=2.0, harmonics=(2, 3, 4), harmonic_
     ``harmonic of injection``   period ratio within ``harmonic_tol`` of an integer or its
                                 reciprocal.  Also real structure, wrong bookkeeping.
     ``broadband (Q at floor)``  Q pinned at the hard floor: absorbing continuum power.
-    ``low amplitude``           below ``sigma_rel_min`` of its row's strongest component.
+    ``low amplitude``           fails the amplitude floor (sigma / white noise < ``snr_min``).
     ``unrelated frequency``     none of the above -- **the only genuine false detection.**
     ``no injection in row``     the row had no oscillators at all, so every component is
                                 spurious by construction; these rows measure the false-alarm
@@ -916,20 +948,22 @@ def false_positive_table(df, tol=0.10, k_res=2.0, harmonics=(2, 3, 4), harmonic_
         inj = inj[np.isfinite(inj)]
         T = _baseline_days(r)
         smax = np.nanmax(S) if len(S) and np.isfinite(np.nanmax(S)) else np.nan
+        wn = row_white_noise(r)
 
         for per, sig, q in zip(P, S, Q):
             srel = sig / smax if (np.isfinite(smax) and smax > 0) else np.nan
+            snr = sig / wn if (np.isfinite(wn) and wn > 0) else np.nan
+            amp_low = _amp_low(sig, srel, snr, snr_min, sigma_rel_min)
             kind, nearest, offset, df_min = _classify_component(
-                per, srel, q, inj, T, tol, k_res, harmonics, harmonic_tol,
-                q_floor, q_floor_tol, sigma_rel_min)
+                per, amp_low, q, inj, T, tol, k_res, harmonics, harmonic_tol,
+                q_floor, q_floor_tol)
             rows.append(dict(name=r['name'], n_sectors=r.get('n_sectors', np.nan),
-                             baseline_days=T, period=per, sigma=sig, sigma_rel=srel, Q=q,
+                             baseline_days=T, period=per, sigma=sig, sigma_rel=srel, snr=snr, Q=q,
                              cycles=q / np.pi,
                              n_inj=len(inj), nearest_inj=nearest, offset=offset,
                              delta_f=df_min, res_elements=df_min * T if np.isfinite(T) else np.nan,
                              kind=kind, matched=(kind == 'matched'),
-                             survives_filter=bool(np.isfinite(srel) and srel >= sigma_rel_min
-                                                  and np.isfinite(q) and q >= q_keep)))
+                             survives_filter=bool(not amp_low and np.isfinite(q) and q >= q_keep)))
     out = pd.DataFrame(rows)
     if len(out):
         out['kind'] = pd.Categorical(out['kind'], categories=FP_ORDER, ordered=True)
@@ -963,14 +997,16 @@ def false_positive_null(df, n_draws=20, seed=0, p_range=None, **kw):
         inj = inj[np.isfinite(inj)]
         T = _baseline_days(r)
         smax = np.nanmax(S) if np.isfinite(np.nanmax(S)) else np.nan
+        wn = row_white_noise(r)
         for _ in range(n_draws):
             for per, sig, q in zip(10 ** rng.uniform(lo, hi, n), S, Q):
                 srel = sig / smax if (np.isfinite(smax) and smax > 0) else np.nan
+                snr = sig / wn if (np.isfinite(wn) and wn > 0) else np.nan
+                amp_low = _amp_low(sig, srel, snr, kw.get('snr_min', 0.2), kw.get('sigma_rel_min'))
                 kind, *_ = _classify_component(
-                    per, srel, q, inj, T, tol, kw.get('k_res', 2.0),
+                    per, amp_low, q, inj, T, tol, kw.get('k_res', 2.0),
                     kw.get('harmonics', (2, 3, 4)), kw.get('harmonic_tol', 0.05),
-                    kw.get('q_floor', 1.0 / np.sqrt(2.0)), kw.get('q_floor_tol', 0.02),
-                    kw.get('sigma_rel_min', 0.10))
+                    kw.get('q_floor', 1.0 / np.sqrt(2.0)), kw.get('q_floor_tol', 0.02))
                 counts[kind] += 1
     return pd.Series({k: v / n_draws for k, v in counts.items()}, name='expected_by_chance')
 
@@ -990,12 +1026,13 @@ def false_positive_summary(fp, null=None):
     return out
 
 
-def plot_false_positives(fp, null=None, sigma_rel_min=0.10, Q_min=None, n_cycles_min=1.6,
-                         q_floor=1.0 / np.sqrt(2.0), k_res=2.0):
+def plot_false_positives(fp, null=None, snr_min=0.2, sigma_rel_min=None, Q_min=None,
+                         n_cycles_min=1.6, q_floor=1.0 / np.sqrt(2.0), k_res=2.0):
     """Four panels: what the spurious components are, and which of them survive the filter.
 
-    ``Q_min`` / ``n_cycles_min`` only draw the cut that ``false_positive_table`` applied;
-    pass the same values to both.
+    The cut arguments only draw the cut that ``false_positive_table`` applied; pass the same
+    values to both.  Panel (b) is drawn in sigma / white noise when ``snr_min`` is set, else
+    in sigma / max(sigma).
     """
     import matplotlib.pyplot as plt
 
@@ -1004,6 +1041,10 @@ def plot_false_positives(fp, null=None, sigma_rel_min=0.10, Q_min=None, n_cycles
         cut_label = f'Q/π ≥ {n_cycles_min:g} (Q ≥ {Q_min:.1f})'
     else:
         cut_label = f'Q ≥ {Q_min:g}'
+    if snr_min is not None:
+        amp_col, amp_min, amp_label, amp_axis = 'snr', snr_min, f'σ/WN ≥ {snr_min:g}', 'σ / white noise (per-point error ⊕ jitter)'
+    else:
+        amp_col, amp_min, amp_label, amp_axis = 'sigma_rel', sigma_rel_min, f'σ_rel ≥ {sigma_rel_min:g}', 'σ / max σ in row'
     summ = false_positive_summary(fp, null)
     fig, axs = plt.subplots(2, 2, figsize=(14, 10.5))
 
@@ -1026,19 +1067,22 @@ def plot_false_positives(fp, null=None, sigma_rel_min=0.10, Q_min=None, n_cycles
 
     # (b) the plane the filter actually cuts in
     ax = axs[0, 1]
+    yv = fp[amp_col]
+    ylo = max(float(np.nanpercentile(yv[yv > 0], 0.5)) * 0.5, 1e-5) if (yv > 0).any() else 1e-3
+    yhi = float(np.nanmax(yv)) * 1.5 if np.isfinite(np.nanmax(yv)) else 1.5
     for kind in FP_ORDER:
         s = fp[fp.kind == kind]
         if len(s):
-            ax.scatter(s.Q.clip(upper=1e3), s.sigma_rel, s=15, alpha=.55, lw=0,
+            ax.scatter(s.Q.clip(upper=1e3), s[amp_col].clip(lower=ylo), s=15, alpha=.55, lw=0,
                        color=FP_COLOURS[kind])
     ax.axvline(Q_min, color='#5f5e5a', lw=1.2, ls='--')
-    ax.axhline(sigma_rel_min, color='#5f5e5a', lw=1.2, ls='--')
+    ax.axhline(amp_min, color='#5f5e5a', lw=1.2, ls='--')
     ax.axvline(q_floor, color='#b0a24a', lw=1, ls=':')
-    ax.fill_between([Q_min, 1e3], sigma_rel_min, 1.35, color='#1baf7a', alpha=.07, zorder=0)
-    ax.text(Q_min * 1.35, 1.12, 'kept by filter', fontsize=9, color='#1baf7a')
+    ax.fill_between([Q_min, 1e3], amp_min, yhi, color='#1baf7a', alpha=.07, zorder=0)
+    ax.text(Q_min * 1.35, yhi * 0.6, 'kept by filter', fontsize=9, color='#1baf7a')
     ax.set(xscale='log', yscale='log', xlabel='fitted Q (clipped at 1000)',
-           ylabel='σ / max σ in row', ylim=(1e-3, 1.5))
-    ax.set_title(f'(b) The filter cut: σ_rel ≥ {sigma_rel_min:g} and {cut_label}',
+           ylabel=amp_axis, ylim=(ylo, yhi))
+    ax.set_title(f'(b) The filter cut: {amp_label} and {cut_label}',
                  loc='left', fontweight='bold')
 
     # (c) counts per class, with the chance baseline and the effect of the filter

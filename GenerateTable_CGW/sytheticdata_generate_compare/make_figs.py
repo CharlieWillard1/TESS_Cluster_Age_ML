@@ -41,11 +41,13 @@ OLD_TABLE = os.path.join(ROOT, 'data',
 TRUTH_PATH = os.path.join(HERE, 'data', 'ground_truth.pkl')
 FIGDIR = os.path.join(HERE, 'figs')
 
-# The delivered-list filter (gp_table_io.filter_gp_components): amplitude >= 10% of the
-# row's strongest component and a decay time of >= 1.6 periods (Q / pi >= 1.6, i.e. the
-# old Q >= 5).  The cut is in cycles because the fit now caps Q at pi * 27 d / P, so a
+# The delivered-list filter (gp_table_io.filter_gp_components): amplitude >= 0.2 x the
+# row's white-noise level (per-point error and jitter in quadrature) and a decay time of
+# >= 1.6 periods (Q / pi >= 1.6, i.e. the old Q >= 5).  The amplitude cut is absolute, not
+# relative to the loudest component, so a faint but significant signal beside a loud one
+# is kept; the coherence cut is in cycles because the fit caps Q at pi * 27 d / P, so a
 # flat Q cut would mean something different at every period (docs/gp_fitting.tex S6).
-SIGMA_REL_MIN, N_CYCLES_MIN = 0.10, 1.6
+SNR_MIN, N_CYCLES_MIN = 0.2, 1.6
 Q_MIN = N_CYCLES_MIN * np.pi
 TAU_CAP_DAYS = 27.0
 WN_FLAG_RATIO = 0.05
@@ -186,11 +188,11 @@ def figure_evaluation(df, osc, comps_total, comps_spurious, scan, stamp):
         ax.text(i, v, f'{v}', ha='center', va='bottom', fontsize=10)
     ax.set(ylabel='injected oscillators / fitted components')
     ax.set_title('6 · Oscillator recovery', loc='left', fontweight='bold')
-    after = scan[(scan.sigma_rel_cut == SIGMA_REL_MIN) & (scan.cycles_cut == N_CYCLES_MIN)]
+    after = scan[(scan.snr_cut == SNR_MIN) & (scan.cycles_cut == N_CYCLES_MIN)]
     extra = ''
     if len(after):
         a = after.iloc[0]
-        extra = (f'after filter (σ≥{SIGMA_REL_MIN:.0%}, Q/π≥{N_CYCLES_MIN:g}): '
+        extra = (f'after filter (σ/WN≥{SNR_MIN:g}, Q/π≥{N_CYCLES_MIN:g}): '
                  f'purity {a.purity:.1%}, completeness {a.completeness:.1%}\n')
     ax.text(.03, .88,
             f'detectable recovery {n_rec_det / max(len(det), 1):.1%}  ({n_rec_det}/{len(det)})\n'
@@ -228,28 +230,27 @@ def main():
     print(f'pipeline table : {os.path.basename(args.table)}  ({len(pipe)} rows)')
 
     if not args.no_refilter or 'gp_component_kept' not in pipe.columns:
-        pipe = filter_gp_components(pipe, sigma_rel_min=SIGMA_REL_MIN, n_cycles_min=N_CYCLES_MIN)
+        pipe = filter_gp_components(pipe, snr_min=SNR_MIN, n_cycles_min=N_CYCLES_MIN)
         pipe.to_pickle(args.table)
-        print(f'applied filter_gp_components(sigma_rel_min={SIGMA_REL_MIN}, '
+        print(f'applied filter_gp_components(snr_min={SNR_MIN}, '
               f'n_cycles_min={N_CYCLES_MIN}) and re-saved the table')
 
     df = C.join(pipe, truth)
     df = C.add_ratio_period(df)
     stamp = (f'{os.path.basename(args.table)} | truth {os.path.basename(TRUTH_PATH)} | '
-             f'filter σ_rel≥{SIGMA_REL_MIN:g}, Q/π≥{N_CYCLES_MIN:g} | '
+             f'filter σ/WN≥{SNR_MIN:g}, Q/π≥{N_CYCLES_MIN:g} | '
              f'generated {datetime.now():%Y-%m-%d %H:%M}')
 
     osc, qs, scan = analyse(df)
-    fp = C.false_positive_table(df, sigma_rel_min=SIGMA_REL_MIN, n_cycles_min=N_CYCLES_MIN)
-    fp_null = C.false_positive_null(df, n_draws=20, sigma_rel_min=SIGMA_REL_MIN)
+    fp = C.false_positive_table(df, snr_min=SNR_MIN, n_cycles_min=N_CYCLES_MIN)
+    fp_null = C.false_positive_null(df, n_draws=20, snr_min=SNR_MIN)
 
     fig = figure_evaluation(df, osc, len(qs), int((~qs.matches_injected).sum()), scan, stamp)
     fig.savefig(os.path.join(figdir, 'synthetic_evaluation.png'), bbox_inches='tight')
     plt.close(fig)
     print('wrote synthetic_evaluation.png')
 
-    fig = C.plot_false_positives(fp, null=fp_null, sigma_rel_min=SIGMA_REL_MIN,
-                                 n_cycles_min=N_CYCLES_MIN)
+    fig = C.plot_false_positives(fp, null=fp_null, snr_min=SNR_MIN, n_cycles_min=N_CYCLES_MIN)
     fig.text(.006, .002, stamp, fontsize=7.5, color='#8f8e88')
     fig.savefig(os.path.join(figdir, 'false_positives.png'), bbox_inches='tight')
     plt.close(fig)
@@ -285,10 +286,10 @@ def main():
     if args.old_table:
         old = pd.read_pickle(args.old_table)
         if 'gp_component_kept' not in old.columns:
-            old = filter_gp_components(old, sigma_rel_min=SIGMA_REL_MIN, n_cycles_min=N_CYCLES_MIN)
+            old = filter_gp_components(old, snr_min=SNR_MIN, n_cycles_min=N_CYCLES_MIN)
         old_df = C.add_ratio_period(C.join(old, truth))
         old_osc, old_qs, old_scan = analyse(old_df)
-        old_fp = C.false_positive_table(old_df, sigma_rel_min=SIGMA_REL_MIN, n_cycles_min=N_CYCLES_MIN)
+        old_fp = C.false_positive_table(old_df, snr_min=SNR_MIN, n_cycles_min=N_CYCLES_MIN)
         heads.insert(0, headline(old_df, old_osc, old_qs, old_scan, old_fp,
                                  'flat Q box [1/sqrt2, 500], soft floor Q=2'))
         fig = figure_q_bounds_change(old_df, df, old_osc, osc, old_qs, qs, stamp)
@@ -306,9 +307,9 @@ def analyse(df):
     osc = C.per_oscillator_table(df)
     qs = C.gp_component_purity(df)
     scan = C.component_filter_scan(
-        df, by='cycles',
-        cuts=((0, 0), (0.05, 0), (SIGMA_REL_MIN, 0), (0, N_CYCLES_MIN),
-              (SIGMA_REL_MIN, N_CYCLES_MIN), (SIGMA_REL_MIN, 20 / np.pi), (SIGMA_REL_MIN, 100 / np.pi)))
+        df, by='cycles', amp='snr',
+        cuts=((0, 0), (0.1, 0), (SNR_MIN, 0), (0.5, 0), (0, N_CYCLES_MIN),
+              (SNR_MIN, N_CYCLES_MIN), (0.5, N_CYCLES_MIN), (SNR_MIN, 20 / np.pi), (SNR_MIN, 100 / np.pi)))
     return osc, qs, scan
 
 
@@ -341,7 +342,7 @@ def headline(df, osc, qs, scan, fp, label):
     out['detectable recovery'] = round(float(det.recovered.mean()), 4)
     out['components fitted'] = int(len(qs))
     out['purity raw'] = round(float(qs.matches_injected.mean()), 4)
-    a = scan[(scan.sigma_rel_cut == SIGMA_REL_MIN) & (scan.cycles_cut == N_CYCLES_MIN)].iloc[0]
+    a = scan[(scan.snr_cut == SNR_MIN) & (scan.cycles_cut == N_CYCLES_MIN)].iloc[0]
     out['components after filter'] = int(a.components)
     out['purity filtered'] = round(float(a.purity), 4)
     out['completeness filtered'] = round(float(a.completeness), 4)

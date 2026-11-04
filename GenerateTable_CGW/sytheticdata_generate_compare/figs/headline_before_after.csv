@@ -17,9 +17,9 @@ detectable recovered,601.0,597.0
 detectable recovery,0.9836,0.9771
 components fitted,1632.0,1632.0
 purity raw,0.6844,0.6844
-components after filter,556.0,537.0
-purity filtered,0.964,0.9832
-completeness filtered,0.8871,0.8871
+components after filter,765.0,625.0
+purity filtered,0.9359,0.9712
+completeness filtered,0.9476,0.9116
 components with Q >= 475,459.0,11.0
 components at cap (s > 0.99),,1332.0
 components Q in 2-20,0.1562,0.4884
@@ -27,4 +27,4 @@ median Q matched,158.6,21.1
 median Q spurious,26.4,18.5
 median cycles matched,50.5,6.72
 median cycles spurious,8.41,5.9
-delivered: genuinely unrelated,12.0,7.0
+delivered: genuinely unrelated,24.0,10.0
