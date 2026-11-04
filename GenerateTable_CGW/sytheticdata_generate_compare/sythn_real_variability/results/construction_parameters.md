@@ -1,6 +1,6 @@
 # Construction parameters
 
-Written by `sythn_real_variability.make_figs` on 2026-11-04 02:03; 675 clusters in the truth table.
+Written by `sythn_real_variability.make_figs` on 2026-11-04 03:14; 675 clusters in the truth table.
 
 ## grid
 
@@ -55,6 +55,7 @@ Written by `sythn_real_variability.make_figs` on 2026-11-04 02:03; 675 clusters 
 | `brightness_mode` | template |
 | `add_red_noise` | True |
 | `rn_origin` | LMC |
+| `rn_rms_max` | 0.02 |
 | `grid_cadence_min` | 1.0 |
 | `truth_cadence_min` | 30.0 |
 | `lsp_P_min` | 0.08333333333333333 |
