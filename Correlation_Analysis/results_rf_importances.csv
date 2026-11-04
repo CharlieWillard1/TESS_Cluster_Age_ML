@@ -1,0 +1,22 @@
+block,importance,sd,kind,members
+feature: sigma_mad,0.12516629347206418,0.07351826693369319,light curve,"excess_var, intrinsic_std, sigma_mad, intrinsic_rms, gp_sigma_max"
+nuisance: log_med_err_frac,0.025005650110259847,0.020190414477211607,nuisance,log_med_err_frac
+feature: stetson_j_gap_aware,0.021167095227701133,0.01799198370205343,light curve,"vn_ratio_gap_aware, stetson_j_gap_aware, rn_alpha, rn_log10_N"
+nuisance: cluster_radius,0.017117761889390744,0.018617345499382335,nuisance,cluster_radius
+nuisance: gal_b,0.014180937209252325,0.013432026460464283,nuisance,gal_b
+feature: gp_period_strongest,0.009274327440248399,0.0053940734463488035,light curve,gp_period_strongest
+feature: mean_median_offset,0.006687163843883602,0.016124781542685485,light curve,"gamma_p_sec, mean_median_offset"
+nuisance: dec,0.004701010829631397,0.005638068777434806,nuisance,dec
+nuisance: log_n_points,0.004532872131119234,0.009981176192229928,nuisance,log_n_points
+nuisance: n_sectors,0.003925633260675165,0.00862792623544619,nuisance,n_sectors
+feature: gp_jitter,0.0035985361038646663,0.008054794733621085,light curve,gp_jitter
+feature: gp_Q_strongest,0.0032059972404894083,0.0023880388818356166,light curve,gp_Q_strongest
+feature: gp_rn_wn_ratio,0.002018563266453313,0.006377088830670031,light curve,"gp_rn_alpha_band, gp_rn_wn_ratio"
+nuisance: origin,0.0018778570870696606,0.0034016902582234736,nuisance,"origin_MW, origin_SMC"
+feature: LSP_peak_snr_rn,0.0016323642434146247,0.020937684280952173,light curve,"LSP_peak_snr_at_diff, LSP_peak_snr_rn"
+feature: gp_rn_rms_band,0.0009485948770180345,0.00774795480772312,light curve,"gp_rn_log10_S0, gp_rn_rms_band"
+feature: LSP_peak_period_diff,0.0006263522656701867,0.005867942712585449,light curve,LSP_peak_period_diff
+nuisance: log_med_flux,2.2898349882893854e-16,3.8908575311691724e-16,nuisance,log_med_flux
+feature: gp_n_components_filtered,-5.877849845488392e-06,0.004825992263976799,light curve,gp_n_components_filtered
+feature: g1_int_sec,-0.0012569551403707317,0.01016954525938364,light curve,g1_int_sec
+nuisance: log_cadence,-0.001986764077214938,0.0014390920360819602,nuisance,log_cadence

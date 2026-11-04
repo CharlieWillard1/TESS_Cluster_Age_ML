@@ -1,0 +1,20 @@
+348 clusters, 23 features, 12 families
+                      family    n    rho  rho_lo  rho_hi  rho_partial  partial_lo  partial_hi  p_partial  p_perm_within_galaxy  p_partial_fdr  p_perm_fdr
+0                  sigma_mad  348 -0.374  -0.467  -0.282       -0.263      -0.365      -0.151      0.000                 0.000          0.000       0.003
+1        stetson_j_gap_aware  348 -0.062  -0.160   0.044       -0.206      -0.297      -0.113      0.000                 0.954          0.001       0.997
+2   gp_n_components_filtered  348 -0.163  -0.254  -0.063       -0.179      -0.274      -0.070      0.001                 0.001          0.004       0.004
+3            LSP_peak_snr_rn  348 -0.144  -0.239  -0.046       -0.167      -0.258      -0.069      0.002                 0.003          0.006       0.010
+4             gp_rn_rms_band  348 -0.217  -0.307  -0.126       -0.150      -0.247      -0.055      0.006                 0.000          0.014       0.003
+5                  gp_jitter  348 -0.102  -0.201   0.004       -0.125      -0.225      -0.026      0.021                 0.215          0.042       0.517
+6             gp_rn_wn_ratio  348  0.006  -0.094   0.109       -0.099      -0.206       0.003      0.069                 0.997          0.118       0.997
+7                 g1_int_sec  348 -0.000  -0.116   0.104        0.055      -0.065       0.174      0.317                 0.997          0.475       0.997
+8        gp_period_strongest  311 -0.152  -0.261  -0.044        0.050      -0.052       0.171      0.390                 0.624          0.477       0.997
+9         mean_median_offset  348 -0.004  -0.107   0.108        0.046      -0.053       0.171      0.397                 0.971          0.477       0.997
+10            gp_Q_strongest  311  0.011  -0.096   0.125        0.043      -0.078       0.165      0.453                 0.860          0.494       0.997
+11      LSP_peak_period_diff  348 -0.084  -0.189   0.033        0.035      -0.066       0.148      0.519                 0.457          0.519       0.915
+  reg  nuisance-only: CV R2 +0.154 +/- 0.141 | holdout +0.282
+  reg  features-only: CV R2 +0.131 +/- 0.109 | holdout +0.013
+  reg           full: CV R2 +0.200 +/- 0.099 | holdout +0.113
+  reg dR2 obs +0.058 | null +0.019 +/- 0.038
+  clf dAUC obs -0.004 | null +0.003 +/- 0.041
+wrote figures to /astro/users/cgwill/TESS_Cluster_Age_ML/Correlation_Analysis/summary

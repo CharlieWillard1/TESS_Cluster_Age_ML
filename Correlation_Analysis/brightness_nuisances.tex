@@ -1,0 +1,265 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\newcommand{\col}[1]{\texttt{\detokenize{#1}}}
+
+\title{Brightness and noise nuisances in the age-correlation analysis}
+\author{}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\section{Summary}
+
+\begin{itemize}
+  \item The nuisance \col{log_med_err_frac} (median fractional flux error) is, to within
+        a few per cent, a measure of aperture brightness: it scales as $F^{-1/2}$, as photon
+        noise should.
+  \item In the LMC aperture brightness is itself a strong age correlator (younger clusters
+        have brighter apertures, largely through the mass-to-light ratio). So
+        \col{log_med_err_frac} carries almost all of the nuisance-only age prediction in the
+        LMC, and conditioning on it removes real (but non-variability) age information.
+  \item The light-curve features that describe noise structure (red-noise normalisation and
+        slope, GP jitter, white-noise ratio, Stetson~$J$, von~Neumann ratio) correlate with
+        \col{log_med_err_frac} about as strongly as with age.
+  \item We reparameterise the noise term into a brightness term \col{log_F} and a noise term
+        that is (nearly) independent of brightness, \col{log_noise_perp}, so brightness can
+        be switched on and off. ``On'' measures age information beyond anything brightness
+        related (variability specific); ``off'' measures all physical correlators.
+  \item Separately: \col{log_med_flux} is identically zero (the light curves are normalised
+        before it is computed) and carries no information.
+\end{itemize}
+
+Unless stated otherwise, numbers are for one row per cluster (the median over all of a
+cluster's sector combinations; ``setup A'' in \col{08_simple_overview.ipynb}), LMC $n=118$,
+MW $n=124$, SMC $n=106$. Ridge $R^2$ values are 5-fold cross-validated, averaged over 20
+random fold assignments, with \texttt{StandardScaler} + \texttt{RidgeCV} as in the notebook.
+
+\section{What the original nuisances measure}
+
+\paragraph{\col{log_med_flux} is dead.}
+The pipeline divides every sector by its own median flux before storing the light curve
+(\col{normalize_flux} in \col{lc_lsp.py}), so the median of the stored flux is 1 and its
+logarithm is 0 for all 17\,233 rows. It never acted as a brightness control.
+
+\paragraph{\col{log_med_err_frac} is brightness.}
+It is the median of the normalised errors, $\sigma/F$, of the (30-min resampled) light curve.
+Normalising does not remove the brightness dependence; it creates it. For photon noise
+$\sigma \propto \sqrt{F}$, so
+\begin{equation}
+  \frac{\sigma}{F} \propto F^{-1/2}.
+\end{equation}
+Measured against the median raw ELK aperture flux $F$:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & MW & LMC & SMC \\
+\midrule
+slope $d\log(\sigma/F)/d\log F$ & $-0.524$ & $-0.512$ & $-0.496$ \\
+Spearman $\rho(\sigma/F,\ F)$ & $-0.980$ & $-0.997$ & $-0.997$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Why this matters: brightness is an age correlator}
+
+In the LMC (one distance) the aperture flux is $F = F_{\rm cl} + F_{\rm field} + F_{\rm sky}$, and
+the cluster light at fixed mass falls with age as the TESS-band mass-to-light ratio
+$\Upsilon_T$ rises. Hence $\rho(\log F, \text{age}) = -0.72$ and
+$\rho(\log\sigma/F, \text{age}) = +0.71$ in the LMC. (In the MW, brightness is driven mainly
+by distance and field and barely tracks age, $\rho = +0.13$.)
+
+LMC ridge regression of log age on nuisances only:
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+nuisance set & CV $R^2$ \\
+\midrule
+all original nuisances & 0.45 \\
+original without \col{log_med_err_frac} & 0.11 \\
+\col{log_med_err_frac} alone & 0.48 \\
+\bottomrule
+\end{tabular}
+\end{center}
+So essentially all of the nuisance-only age prediction in the LMC is ``younger clusters
+have brighter apertures''. This is real astrophysical signal (see also the cluster light
+fraction vs age analysis in \col{GenerateTable_CGW/crowding_analysis/}), but it is about
+brightness, not about variability.
+
+\paragraph{Two routes through brightness.}
+Brightness reaches the features in two ways:
+\begin{enumerate}
+  \item \emph{astrophysical}: age $\to$ cluster light $\to F$ (a real age correlator);
+  \item \emph{measurement}: $F \to$ photon-noise floor $\sigma/F \to$ measured noise-structure
+        features (detectability, continuum level, jitter).
+\end{enumerate}
+Both pass through the same variable $F$, so no choice of nuisances can separate them.
+Controlling for brightness removes both; not controlling keeps both.
+
+\section{The features already contain the brightness information}
+
+LMC, Spearman correlations (selected features; full table from the script in
+Section~\ref{sec:impl}). ``Partial'' columns residualise both feature and age on the
+nuisance set by OLS. ``base'' is the six nuisances with no brightness or noise term
+(cadence, $n_{\rm sectors}$, $n_{\rm points}$, radius, Dec, $b$).
+\begin{center}
+\begin{tabular}{lrrrrr}
+\toprule
+feature & $\rho(\sigma/F)$ & raw $\rho$(age) & base & brightness off & brightness on \\
+\midrule
+\col{gp_jitter}            & $-0.63$ & $-0.60$ & $-0.50$ & $-0.51$ & $-0.29$ \\
+\col{rn_log10_N}           & $-0.62$ & $-0.58$ & $-0.45$ & $-0.44$ & $-0.20$ \\
+\col{rn_alpha}             & $-0.58$ & $-0.59$ & $-0.47$ & $-0.47$ & $-0.24$ \\
+\col{stetson_j_gap_aware}  & $-0.54$ & $-0.49$ & $-0.35$ & $-0.34$ & $-0.16$ \\
+\col{gp_rn_wn_ratio}       & $-0.53$ & $-0.52$ & $-0.44$ & $-0.43$ & $-0.26$ \\
+\col{vn_ratio_gap_aware}   & $-0.48$ & $-0.47$ & $-0.26$ & $-0.25$ & $-0.15$ \\
+\col{gamma_p_sec}          & $+0.22$ & $+0.26$ & $+0.27$ & $+0.27$ & $-0.00$ \\
+\col{mean_median_offset}   & $+0.22$ & $+0.26$ & $+0.22$ & $+0.22$ & $-0.00$ \\
+\col{intrinsic_std}        & $-0.20$ & $-0.25$ & $-0.24$ & $-0.23$ & $-0.17$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Noise-structure features roughly halve when brightness is controlled, but stay
+        non-zero ($-0.15$ to $-0.29$).
+  \item Skewness/offset features vanish: their age trend is entirely brightness mediated.
+  \item Amplitude features (\col{intrinsic_std}, \col{excess_var}) barely depend on
+        brightness and move least ($-0.23 \to -0.17$).
+\end{itemize}
+
+LMC ridge, nuisances (N) vs nuisances + features (N+F):
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+nuisance set & N & N+F & gain \\
+\midrule
+original           & 0.45 & 0.47 & $+0.02$ \\
+brightness on      & 0.45 & 0.47 & $+0.02$ \\
+brightness off     & 0.10 & 0.46 & $+0.36$ \\
+base               & 0.11 & 0.46 & $+0.35$ \\
+features only      &      & 0.50 &  \\
+\bottomrule
+\end{tabular}
+\end{center}
+The total age information is the same ($R^2 \approx 0.46$--$0.50$) whichever nuisances are
+used; only its attribution moves. Features alone predict age as well as brightness alone
+(0.50 vs 0.48), and combining them adds nothing. In the MW and SMC all of these $R^2$ are
+$\lesssim 0.1$ and removing \col{log_med_err_frac} changes the partial correlations by at most
+$\sim 0.1$.
+
+\section{Reparameterisation}
+
+All three quantities are computed per sector combination (\col{add_brightness_nuisances} in
+\col{analysis_utils.py}).
+\begin{description}
+  \item[\col{log_F}] $\log_{10}$ of the median, over the combination's sectors, of each
+        sector's median raw (un-normalised) ELK flux [e/s]. Per cluster it reproduces
+        \col{F_meas} of the crowding analysis exactly.
+  \item[\col{log_noise_q}] $\log_{10}(\sigma/F) + \tfrac12\log_{10}F = \log_{10}(\sigma/\sqrt{F})$:
+        the noise in units of the photon noise expected for that flux. It uses the error of
+        the light curve actually analysed (after resampling), so it does not pick up the
+        cadence dependence of the raw, unbinned errors.
+  \item[\col{log_noise_perp}] $\log_{10}(\sigma/F) - (a + b\log_{10}F)$, with $a,b$ an OLS fit per
+        galaxy on the per-cluster medians, applied to every row. Fitted slopes:
+        $b = -0.524$ (MW), $-0.512$ (LMC), $-0.496$ (SMC). Linearly uncorrelated with
+        $\log F$ by construction. Coefficients can be fixed with \col{perp_slopes}.
+\end{description}
+For a linear model, $\{\log F, \text{noise term}\}$ spans the same space as
+$\{\log F, \log\sigma/F\}$, which is (to $\rho = -0.997$) the space of $\log\sigma/F$ alone.
+So \emph{brightness on} reproduces the original analysis (ridge LMC $R^2$ 0.45 vs 0.45; feature
+partial correlations differ by at most 0.016), while \emph{brightness off} drops the
+brightness direction only. The reparameterisation is a relabelling; its purpose is to make
+brightness a switch. Tree models (random forest) are not invariant to such recombinations,
+so for them ``on'' will be close to, but not identical to, ``original''.
+
+\section{How clean is the decorrelation?}
+
+\begin{center}
+\begin{tabular}{llccc}
+\toprule
+ & & MW & LMC & SMC \\
+\midrule
+\col{log_noise_q}    & $\rho(\cdot, \log F)$ & $-0.37$ & $-0.46$ & $+0.07$ \\
+                     & $\rho(\cdot, \text{age})$ & $-0.06$ & $+0.25$ & $+0.40$ \\
+                     & s.d.\ [dex] & 0.029 & 0.009 & 0.009 \\
+\midrule
+\col{log_noise_perp} & $\rho(\cdot, \log F)$ & $+0.11$ & $+0.17$ & $-0.05$ \\
+                     & $\rho(\cdot, \text{age})$ & $-0.01$ & $-0.26$ & $+0.38$ \\
+                     & s.d.\ [dex] & 0.028 & 0.008 & 0.009 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Why \col{log_noise_q} still tracks brightness.}
+With a sky term, $\sigma^2 \propto F + B$, so $\sigma/\sqrt{F} = \sqrt{1 + B/F}$: faint apertures
+are relatively more sky dominated. Any noise ratio defined against source flux alone will
+correlate with brightness. The effect is tiny in absolute terms: \col{log_noise_q} spreads by
+only $\sim$1--3\%, and the mismatch between the fitted slope ($-0.51$) and $-0.5$ over the
+$\sim$2 dex flux range is comparable to that whole spread, which is why a rank correlation
+looks large.
+
+\paragraph{\col{log_noise_perp} is only linearly orthogonal.}
+Its rank correlation with $\log F$ is $+0.17$ in the LMC. Quadratic and cubic fits do not
+reduce it, so it is not simple curvature. A sky-corrected version,
+$\sigma/\sqrt{F - F_{\rm sky}}$ with the zodiacal model, was worse ($\rho(\log F) = +0.78$) and is
+not used.
+
+\paragraph{Does the leak matter?}
+In the LMC, adding either noise term to the base nuisances changes nuisance-only ridge
+$R^2$ from 0.11 to 0.10 (\col{log_noise_perp}) or 0.14 (\col{log_noise_q}), and shifts the
+feature partial correlations by at most 0.02 (\col{log_noise_perp}) or 0.06
+(\col{log_noise_q}). The leak is negligible for the LMC.
+
+\paragraph{SMC caveat.}
+In the SMC the noise term correlates with age ($\rho \approx +0.4$) and raises nuisance-only
+ridge $R^2$ from $-0.04$ to $0.11$. This comes through the sky fraction
+($\rho(\text{noise}, F_{\rm sky}/F) \approx +0.8$): the SMC apertures are twice the intended
+radius (Bica diameters used as radii) and collect a lot of sky. So in the SMC the
+``brightness off'' specification still contains a small age-linked measurement nuisance.
+Report it.
+
+\section{Interpreting the switch}
+
+\begin{description}
+  \item[brightness on] (\col{NUIS_CHOICE = 'brightness_on'}): age information beyond anything
+        brightness related: the \emph{variability-specific} result.
+  \item[brightness off] (\col{'brightness_off'}): all age information, including what brightness
+        carries.
+\end{description}
+``Off minus on'' is \emph{brightness-mediated} information. It is not purely physical: it also
+contains the measurement route (photon-noise floor changing the noise-structure features).
+To show that the difference is astrophysical, a feature-level test is needed, e.g.\ inject
+white noise into bright LMC light curves to match the $\sigma/F$ of faint ones, recompute the
+features, and measure how far they move. That isolates the measurement part.
+
+\section{Caveats and next steps}
+\begin{itemize}
+  \item \textbf{Noise-injection test} (above) to split brightness-mediated information into
+        measurement and astrophysical parts.
+  \item \textbf{Dilution.} The cluster light fraction $f_{\rm cl}$ is also a brightness-type correlator
+        (it carries the mass-to-light ratio) but is not redundant with $F$. It could be a third
+        switch: measurement only $\to$ $+$brightness $\to$ $+$brightness$+$dilution. It shares the
+        over-control issue.
+  \item \textbf{Sky.} $F$ includes the zodiacal light, which carries no cluster information;
+        subtracting a reliable sky estimate would make \col{log_F} purely astrophysical.
+  \item \textbf{Galactic latitude} enters as signed $b$; $|b|$ is the crowding proxy in the MW.
+\end{itemize}
+
+\section{Implementation}\label{sec:impl}
+\begin{itemize}
+  \item \col{analysis_utils.py}: \col{BRIGHTNESS_SPEC}, \col{sector_raw_flux()} (reads the ELK
+        files once and caches per-sector raw medians in \col{sector_raw_flux.csv}), and
+        \col{add_brightness_nuisances(rows, perp_slopes=None)}. Not called by \col{load_rows},
+        so other notebooks are unchanged; \col{cluster_table} aggregates the new columns when
+        present.
+  \item \col{08_simple_overview.ipynb}: \col{NUIS_SETS} with \col{'original'},
+        \col{'brightness_on'}, \col{'brightness_off'} and the \col{_q} variants; choose with
+        \col{NUIS_CHOICE}. \col{load_combos} adds the new columns; \col{per_cluster} keeps every
+        candidate nuisance.
+\end{itemize}
+
+\end{document}

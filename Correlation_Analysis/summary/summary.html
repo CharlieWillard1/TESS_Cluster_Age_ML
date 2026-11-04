@@ -1,0 +1,143 @@
+<title>TESS Light Curves vs Cluster Age</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<style>
+/* Layout: one reading column (~70ch); figures break out to a wider column; numbers in a compact table. */
+:root {
+  --bg: #fbfbf9; --fg: #1b1c1e; --muted: #5d5f63; --rule: #e2e2dc; --panel: #f2f2ee;
+  --accent: #2a78d6; --flag: #c4521f;
+  --display: "Source Serif 4", Georgia, serif;
+  --body: "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #17181a; --fg: #ecebe6; --muted: #a9aaa6; --rule: #34353a; --panel: #212226;
+  --accent: #5b9cec; --flag: #e7804f; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #17181a; --fg: #ecebe6; --muted: #a9aaa6; --rule: #34353a; --panel: #212226;
+  --accent: #5b9cec; --flag: #e7804f; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--body); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-block: 40px 64px; padding-inline: 20px; }
+.col { max-width: 70ch; }
+.eyebrow { font: 500 12px var(--body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1 { font: 600 clamp(26px, 4vw, 36px)/1.15 var(--display); margin: 6px 0 14px; text-wrap: balance; }
+h2 { font: 600 21px/1.3 var(--display); margin: 40px 0 8px; text-wrap: balance; }
+p { margin: 0 0 12px; }
+.lede { font: 400 18px/1.55 var(--display); }
+.lede strong { font-weight: 600; }
+.verdict { background: var(--panel); border-left: 3px solid var(--accent); padding: 14px 18px; margin: 22px 0 8px; }
+.verdict p:last-child { margin: 0; }
+.num { font-family: var(--mono); font-size: .93em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tablewrap { overflow-x: auto; margin: 14px 0 6px; }
+table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 14px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font: 500 12px var(--body); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+td.n { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
+.pass { color: var(--accent); font-weight: 600; }
+.fail { color: var(--flag); font-weight: 600; }
+figure { margin: 18px 0 8px; }
+figure img { display: block; width: 100%; height: auto; border: 1px solid var(--rule); background: #fcfcfb; }
+figcaption { font-size: 14px; color: var(--muted); margin-top: 10px; max-width: 80ch; }
+figcaption b { color: var(--fg); font-weight: 600; }
+ul { padding-left: 20px; margin: 0 0 12px; }
+li { margin-bottom: 6px; }
+.small { font-size: 13.5px; color: var(--muted); }
+code { font-family: var(--mono); font-size: .9em; }
+</style>
+
+<div class="wrap">
+  <div class="col">
+    <div class="eyebrow">TESS cluster ages · correlation analysis · 348 clusters (MW 124, LMC 118, SMC 106)</div>
+    <h1>The light curves carry no age information beyond the nuisance parameters</h1>
+    <p class="lede">After removing galaxy and observing setup, the strongest light-curve statistic tracks age at
+      <strong>ρ = −0.26 [−0.37, −0.15]</strong>, about 7% of the rank variance. Adding all 23 light-curve features to a random
+      forest does not improve age prediction beyond a nuisance-only model, either for log age
+      (<span class="num">ΔR² = +0.06, p = 0.16</span>) or for young/old at 10⁸ yr
+      (<span class="num">ΔAUC = −0.004, p = 0.53</span>).</p>
+
+    <div class="verdict">
+      <p><b>How to state it.</b> There are weak, monotonic trends: younger clusters are somewhat more variable. These trends
+        are statistically detectable but small next to the cluster-to-cluster scatter. They give no predictive power that the
+        galaxy, cadence, sector count, noise floor, brightness, aperture and sky position do not already provide.</p>
+    </div>
+  </div>
+
+  <h2>Headline numbers</h2>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Test</th><th>Nuisances only</th><th>Nuisances + light curve</th><th>Gain (uncertainty)</th><th>Beats nuisances?</th></tr></thead>
+      <tbody>
+        <tr><td>Strongest partial correlation (variability amplitude)</td><td class="n">—</td><td class="n">ρ = −0.26 [−0.37, −0.15]</td><td class="n">ρ² ≈ 7%</td><td><span class="pass">weak trend</span></td></tr>
+        <tr><td>Families with a partial correlation (FDR &lt; 0.05)</td><td class="n">—</td><td class="n">6 of 12, all |ρ| ≤ 0.26</td><td class="n">4 of these 6 also pass the within-galaxy shuffle test</td><td><span class="pass">weak trend</span></td></tr>
+        <tr><td>Random forest, log age (5×5 CV, 278 clusters)</td><td class="n">R² 0.15 ± 0.14</td><td class="n">R² 0.20 ± 0.10</td><td class="n">+0.058 vs null +0.019 ± 0.038</td><td><span class="fail">no, p = 0.16</span></td></tr>
+        <tr><td>Random forest, log age (70 held-out clusters)</td><td class="n">R² 0.28</td><td class="n">R² 0.11</td><td class="n">−0.17</td><td><span class="fail">no</span></td></tr>
+        <tr><td>Random forest, young/old (CV)</td><td class="n">AUC 0.74 [0.68, 0.80]</td><td class="n">AUC 0.74 [0.67, 0.80]</td><td class="n">−0.004 [−0.064, +0.057]</td><td><span class="fail">no, p = 0.53</span></td></tr>
+        <tr><td>Random forest, young/old (70 held-out clusters)</td><td class="n">AUC 0.68</td><td class="n">AUC 0.80</td><td class="n">+0.12 (±~0.07 per AUC at n = 70)</td><td><span class="fail">not reproduced in CV</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small">± is the fold-to-fold standard deviation. Brackets are 95% cluster-bootstrap intervals. p values come from
+    100 re-runs of the full comparison with age shuffled <em>within each galaxy</em>, which keeps the galaxy–age link the
+    nuisance model can use.</p>
+
+  <h2>1 · Linear: trends exist, but they are small next to the scatter</h2>
+  <figure>
+    <img src="fig1_linear_correlations.png" alt="Left: Spearman correlation with age for 12 feature families, raw and after nuisance control, with 95% bootstrap intervals; all partial correlations lie between −0.26 and +0.06. Right: residual age rank against residual variability-amplitude rank for each cluster, coloured by galaxy, showing a weak negative slope inside a broad cloud.">
+    <figcaption><b>(a)</b> Spearman ρ between each feature family and log age. Open grey points are raw values. Blue points are
+      partial values, with ranks residualised on galaxy, cadence, sector count, light-curve length, noise floor, brightness,
+      aperture, declination and galactic latitude. Bars are 95% intervals from resampling clusters. The shaded band marks
+      |ρ| &lt; 0.1. The 23 measured columns collapse to 12 families of near-duplicates, grouped without using age.
+      <b>(b)</b> The strongest surviving relation, one point per cluster. The fitted slope is real, but 93% of the
+      age-rank variance is scatter around it.</figcaption>
+  </figure>
+  <div class="col">
+    <ul>
+      <li>Controlling for nuisances <b>shrinks</b> the strongest raw correlation, variability amplitude, from −0.37 to −0.26.
+        The galaxy offset accounts for about a third of it: LMC clusters are young, and the LMC sample tops out at log age 8.8.</li>
+      <li>Two families appear only after control: noise redness (−0.21) and GP jitter (−0.13). Both <b>fail</b> the
+        within-galaxy shuffle test (FDR p = 1.0 and 0.52), so they depend on the linear nuisance model and are not robust.</li>
+      <li>Within each galaxy, amplitude gives ρ = −0.25 (LMC), −0.30 (MW) and −0.22 (SMC). The sign is consistent, but each
+        value comes from only about 100–120 clusters.</li>
+    </ul>
+  </div>
+
+  <h2>2 · Random forest: no predictive gain beyond the nuisances</h2>
+  <figure>
+    <img src="fig2_random_forest_null.png" alt="Four panels. a: out-of-fold R² per cross-validation fold for nuisance-only, light-curve-only and combined forests; the fold scatter (about ±0.1–0.14) exceeds the difference between models. b: the observed R² gain of 0.058 sits inside the distribution of gains from age-shuffled data. c: young/old AUC is 0.74 for both the nuisance-only and the combined forest, with overlapping bootstrap intervals. d: the observed AUC gain of −0.004 sits at the centre of the shuffled-label null.">
+    <figcaption><b>(a)</b> Out-of-fold R² for log age, one point per fold (5 folds × 5 repeats). The large point is the mean
+      ± 1σ across folds, and the diamond is the single score on the 70 held-out clusters. <b>(b)</b> The R² gain from adding
+      light curves (orange) against the gains from 100 within-galaxy age shuffles (grey). Shuffled data gain +0.019 on
+      average just from the 23 extra columns. <b>(c)</b> The same comparison for young vs old at 10⁸ yr (129 young, 219 old),
+      with 95% bootstrap intervals on the out-of-fold AUC. <b>(d)</b> The AUC gain against its shuffled null.</figcaption>
+  </figure>
+  <div class="col">
+    <ul>
+      <li>The full-minus-nuisance R² gain varies by <span class="num">±0.12</span> from fold to fold, more than twice its mean of
+        <span class="num">+0.046</span>. On the held-out clusters the sign reverses: the nuisance-only model scores higher.</li>
+      <li>For young/old classification, the nuisance-only forest already reaches AUC 0.74 because galaxy predicts the label:
+        73% of MW, 70% of SMC and 47% of LMC clusters are old. The light curves add nothing on top. Their held-out +0.12 is a
+        single 70-cluster draw, and cross-validation does not reproduce it.</li>
+      <li>The same null holds for every variant tried: training on individual sector combinations instead of cluster medians
+        (ΔR² +0.13 vs null +0.06 ± 0.09, p = 0.36), one representative feature per family, and the 10-bin GP power spectrum
+        in place of summary statistics. None beats the nuisance-only model on the held-out clusters.</li>
+    </ul>
+  </div>
+
+  <h2>Caveats</h2>
+  <div class="col">
+    <ul>
+      <li><b>Sample size limits the bound.</b> With 348 clusters, a light-curve gain needs to exceed about 0.075 in R² or in AUC
+        to clear the 95th percentile of the shuffled distributions. Anything smaller cannot be told apart from the null. This is a non-detection at that
+        level, not proof that the gain is zero.</li>
+      <li><b>Per-galaxy forests are mixed.</b> Trained within one galaxy, the light curves add ΔR² ≈ +0.18 in the LMC and in
+        the SMC (about 90 clusters each) but −0.01 in the MW, which has by far the widest age range. These fits had no
+        permutation null and use small samples.</li>
+      <li><b>The mixed-model cross-check is not usable.</b> The row-level mixed model in <code>01_linear_correlations</code>
+        returned degenerate fits (coefficient 0, standard error 0). Do not cite it.</li>
+    </ul>
+    <p class="small">Source: <code>Correlation_Analysis/summary/make_summary.py</code>. It recomputes these numbers from
+      <code>cluster_table_Sep23_all_combos_le3sectors.pkl</code> with the notebooks' features, nuisances, splits and forest
+      settings (600 trees, min_samples_leaf = 3, max_features = √n).</p>
+  </div>
+</div>
