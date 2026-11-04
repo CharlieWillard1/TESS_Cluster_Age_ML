@@ -188,9 +188,58 @@ injection per row, 0.85 at ten) and with sector count (0.69, 0.61, 0.59 for 1, 2
 sectors, at 1.41, 1.53, 1.80 seeds per injection), both as expected for window sidelobes.
 The fit itself already separates them --- duplicate seeds are fitted with essentially no
 amplitude (\S6) --- so the delivered list is clean, but the seeds waste the component
-budget. The fix, not yet applied, is to mask in \emph{absolute} frequency, $\pm k/T_{\rm orbit}$
-with $k \sim 2$, around each accepted peak instead of (or in addition to) the fractional
-window.
+budget.
+
+\textbf{Prewhitening removes them} (\code{prewhiten\_seeds=True}; off by default until the
+real table is refitted; \code{figs/sidelobe\_removal/seeding\_prewhitening.png}). After each
+accepted peak the finder subtracts the least-squares sinusoid at that frequency (refined on a
+fine local grid first) and recomputes the periodogram of the residual before looking for the
+next peak; threshold and continuum stay those of the original periodogram, and the
+fractional mask is kept for quasi-periodic signals, which a sinusoid does not fully remove.
+Sidelobes are a property of the sampling, so they leave with the peak. This was preferred
+over an absolute-frequency mask of $\pm 2/T_{\rm orbit}$, which would blind the finder to a
+second real signal within two orbital frequencies of a loud one. On the synthetic set, same
+kwargs otherwise:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+ & fractional mask only & prewhitened \\
+\midrule
+seeds (= fitted components)               & 1632 & 445 \\
+seeds per in-band injection               & 1.45 & 0.40 \\
+seed purity                               & 0.67 & 0.98 \\
+rows hitting \code{max\_components}=16     & 39 & 0 \\
+\midrule
+\multicolumn{3}{l}{after $\sigma/\mathrm{WN} \ge 0.2$ and cycles $\ge 1.6$:} \\
+\quad purity                              & 0.965 & 0.993 \\
+\quad completeness, all ``detectable'' (611)            & 0.912 & 0.838 \\
+\quad completeness, resolved \& detectable alone (390)  & 0.967 & 0.944 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{The apparent completeness loss is mostly the metric.} ``Detectable'' reads the
+periodogram near the injected frequency, so it also counts power a louder neighbour's
+sidelobes leak there. Fitting all injected frequencies jointly and removing the
+\emph{other} injections' components, only 500 of the 611 are detectable on their own, and
+447 are at least one resolution element ($1/T$) from every louder injection; 390 are both.
+Of the 78 detectable injections the old seeder seeded and prewhitening does not, 32 are
+unresolved from a louder injection and 39 were detectable only through its leakage --- the
+old seeder was credited with them because a sidelobe seed happened to land within the 10\%
+period tolerance. Seven are a real loss: on the 390, seeding goes from 99.2\% to 98.2\%, and
+after the fit and filter completeness goes from 0.967 to 0.944 for purity 0.965 to 0.993
+with a quarter of the components. \code{prewhiten\_mode='joint'} (refit every accepted
+frequency together after each new one, as Period04 does) made no difference --- 529 against
+531 of the 611 seeded --- so the default is the simpler \code{'sequential'}.
+
+\textbf{Lowering the seeder threshold does not buy it back}
+(\code{figs/sidelobe\_removal/seeder\_threshold.png}). At half the Vaughan excess
+(\code{threshold\_mode='red\_noise\_subtracted'}, \code{excess\_frac=0.5}) completeness on the
+390 returns to 0.967, but purity after the amplitude filter falls to 0.864: the extra seeds
+are mostly short-period noise peaks ($P \approx 0.1$--0.2\,d) that the GP fits with a real
+but modest $\Delta\log L$ of 2--6, so the evidence cut of \S\ref{sec:evidence} does not reject
+them either. A quarter-threshold run was stopped.
 
 % ===========================================================================
 \section{Priors}
@@ -334,6 +383,40 @@ decay-time cap that range also contains the \emph{cap itself} for $P > 4$\,d: on
 synthetic set the fraction of components in $Q = 2$--20 went from 16\% to 49\% with no
 change in the injections. Read coherence from \code{gp\_sho\_coherence} (or cycles against
 the cap), not from raw $Q$.
+
+\subsection{Evidence instead of amplitude}
+\label{sec:evidence}
+
+An amplitude floor cannot tell a faint real signal from a duplicate seed: both have small
+$\sigma$. What separates them is whether the data want the component. Every fit now stores
+\code{gp\_sho\_dloglike} and \code{gp\_sho\_dloglike\_seq}
+(\code{gp\_fit.component\_loglike\_drops}): the log-likelihood lost when a component is
+removed with every other parameter held as fitted, one likelihood call each, no refit. The
+\code{\_seq} form uses backward elimination --- repeatedly remove the component with the
+smallest drop and re-evaluate the rest --- because when two seeds share one signal each one's
+single-pass drop is small (the other still covers the signal); elimination removes one and the
+survivor's drop becomes the evidence for the signal. \code{filter\_gp\_components(dloglike\_min=...)}
+cuts on it, alone (\code{snr\_min=None}) or with the amplitude floor
+(\code{figs/sidelobe\_removal/evidence\_filter.png}, \code{filter\_scan.csv}).
+
+On the prewhitened fit the two cuts are equivalent: $\Delta\log L \ge 1$ with cycles $\ge 1.6$
+gives purity 0.995, completeness 0.830 against 0.993, 0.838 for $\sigma/\mathrm{WN} \ge 0.2$.
+On the old seeds the evidence cut reaches purity 1.000 at completeness 0.851
+($\Delta\log L \ge 7$), a point the amplitude cut never reaches. Matched components have a
+median $\Delta\log L$ of 263, spurious ones 0.3.
+
+\textbf{What this set cannot test.} The case for evidence over amplitude is faint coherent
+signals, and the synthetic set has almost none that are detectable: one detectable injection
+has $A/\mathrm{WN} < 0.28$ (where $\sigma/\mathrm{WN} = 0.2$ for a sinusoid), and both cuts keep
+it. Below that amplitude the red-noise continuum, not the white noise, sets detectability at
+the periods injected. Validating the evidence cut where it should matter needs injections at
+$A/\mathrm{WN} \sim 0.05$--0.3 at short periods, where the continuum is low. Until then the
+amplitude cut stays the default and \code{gp\_sho\_dloglike\_seq} is there to inspect.
+
+One caution read off the old seeds: 148 matched components with $\sigma/\mathrm{WN} \ge 0.2$ have
+$\Delta\log L_{\rm seq} < 1$. They are near-duplicates at $P = 6$--9\,d, where one sector cannot
+resolve periods 10\% apart, so the fit splits one signal across two or three components and
+no single one carries the evidence. Prewhitening removes most of these at the seeding stage.
 
 % ===========================================================================
 \section{Fitting}

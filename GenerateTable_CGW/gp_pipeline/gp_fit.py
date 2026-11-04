@@ -1022,6 +1022,83 @@ def summarize_components(theta, n_components, has_red_noise=False,
 # 8. Upfront multi-peak detection with harmonic masking
 # ============================================================
 
+def _select_peak(freq, power, mask, white_noise_threshold, continuum=None):
+    """One step of the greedy peak walk: the index of the next peak, or None.
+
+    Acceptance is always ``power > threshold`` at the chosen bin.  Ordering depends on the
+    threshold form (see ``find_all_significant_peaks``).
+    """
+    if continuum is not None:
+        # Unbiased ordering: largest excess over the CONTINUUM, not over the scaled
+        # threshold.
+        #
+        # The ordering must be restricted to bins that already pass the threshold.
+        # When ordering and acceptance use the SAME quantity (the other branches),
+        # argmax failing the test proves no bin passes, so the loop can terminate on
+        # it.  That proof does not hold here: the bin maximising P - C may fail
+        # P > threshold while a different bin passes.  Selecting among eligible bins
+        # only makes termination depend on the order-independent question "is any bin
+        # significant?", which is what keeps this mode consistent with 'red_noise'.
+        thr = (np.asarray(white_noise_threshold)
+               if not np.isscalar(white_noise_threshold)
+               else np.full(len(power), float(white_noise_threshold)))
+        eligible = mask & (power > thr)
+        if not eligible.any():
+            return None
+        masked_excess = np.where(eligible, power - continuum, -np.inf)
+        idx = int(np.argmax(masked_excess))
+        t_idx = float(thr[idx])
+    elif np.isscalar(white_noise_threshold):
+        # Scalar: highest absolute power is the right candidate
+        masked_power = np.where(mask, power, -np.inf)
+        idx = int(np.argmax(masked_power))
+        t_idx = float(white_noise_threshold)
+    else:
+        # Per-frequency array: find the bin with the largest excess above
+        # its local threshold so low-frequency peaks aren't missed when a
+        # higher-power but sub-threshold high-frequency bin dominates argmax
+        masked_excess = np.where(mask, power - white_noise_threshold, -np.inf)
+        idx = int(np.argmax(masked_excess))
+        t_idx = float(white_noise_threshold[idx])
+
+    if not mask[idx] or power[idx] <= t_idx:
+        return None
+    return idx
+
+
+def _refine_peak_frequency(t, y, yerr, f0, df, n=41):
+    """Best frequency within +-df of the grid peak f0 on a finer local grid."""
+    from astropy.timeseries import LombScargle
+    fine = np.linspace(max(f0 - df, 1e-6), f0 + df, n)
+    pw = LombScargle(t, y, yerr, normalization='psd').power(fine)
+    return float(fine[int(np.argmax(pw))])
+
+
+def prewhiten_sinusoid(t, y, yerr, f):
+    """Subtract the least-squares sinusoid (plus offset) at frequency f from y."""
+    from astropy.timeseries import LombScargle
+    ls = LombScargle(t, y, yerr, normalization='psd')
+    return y - ls.model(t, f)
+
+
+def multisine_model(t, y, yerr, freqs):
+    """Weighted least-squares fit of an offset plus a sinusoid at EACH of ``freqs``, jointly.
+
+    On a gapped window, sinusoids a few resolution elements apart are not orthogonal, so
+    fitting and subtracting them one at a time also removes part of each neighbour.
+    Fitting all of them together (as Period04 does after every new frequency) assigns the
+    shared power correctly.
+    """
+    t = np.asarray(t, float); y = np.asarray(y, float); w = 1.0 / np.asarray(yerr, float)
+    cols = [np.ones_like(t)]
+    for f in freqs:
+        ph = 2.0 * np.pi * float(f) * t
+        cols += [np.sin(ph), np.cos(ph)]
+    A = np.stack(cols, axis=1)
+    coef, *_ = np.linalg.lstsq(A * w[:, None], y * w, rcond=None)
+    return A @ coef
+
+
 def find_all_significant_peaks(
     freq,
     power,
@@ -1029,6 +1106,9 @@ def find_all_significant_peaks(
     harmonic_tolerance=0.10,
     harmonic_masking=True,
     continuum=None,
+    prewhiten=None,
+    refine_frequency=True,
+    prewhiten_mode="sequential",
 ):
     """
     Iteratively find all LSP peaks above `white_noise_threshold`.
@@ -1053,17 +1133,56 @@ def find_all_significant_peaks(
         short periods.  Ordering by ``power - C`` is unbiased: for a signal added
         independently to red noise, E[P - C] = S is the same at every frequency, so a
         sinusoid of fixed physical amplitude competes equally regardless of period.
+    prewhiten : (t, y, yerr) or None
+        When given, the search PREWHITENS: after each accepted peak the least-squares
+        sinusoid at that frequency is subtracted from the light curve and ``power`` is
+        recomputed from the residual (astropy ``LombScargle``, ``normalization='psd'``,
+        same grid) before the next peak is looked for.  The threshold and continuum are
+        NOT recomputed.
+
+        Why: the periodogram of a finite, gapped window puts a comb of sidelobes around
+        every real peak (spacing 1/T_sector and 1/T_orbit for TESS, i.e. 0.04-0.07 /day
+        whatever the period).  Below f ~ 1.5 /day the fractional mask is narrower than one
+        sidelobe spacing, so each sidelobe of a loud signal is accepted as its own peak:
+        on the synthetic set 1.45 seeds per injection, raw purity 0.67, with 71% of the
+        spurious seeds at sidelobe offsets (docs/gp_fitting.tex S4).  Sidelobes are a
+        property of the sampling, not the data, so subtracting the sinusoid removes them
+        with the peak.  Unlike an absolute-frequency mask this costs no resolution: a
+        second real signal one orbital frequency from a loud one is still found.
+
+        The fractional mask is kept because a quasi-periodic (low-Q) signal is not a
+        sinusoid and leaves residual power at its own frequency after prewhitening.
+        Expect prewhitening to be most effective on coherent signals; on broad peaks the
+        mask does the work, as before.
+    prewhiten_mode : {'sequential', 'joint'}
+        'sequential' (default): subtract only the newest sinusoid from the running residual.
+        'joint': after each new peak, refit ALL accepted frequencies together
+        (``multisine_model``, as Period04 does) and recompute the periodogram of data minus
+        that model.  Joint fitting is the textbook remedy for non-orthogonal sinusoids on a
+        gapped window, but on the synthetic set it made no difference (529 vs 531 of 611
+        detectable injections seeded, 439 vs 445 seeds), so the validated default is
+        'sequential'.  The injections prewhitening does not seed are almost all unresolved
+        from a louder neighbour or detectable only through its leakage
+        (figs/sidelobe_removal/seeding_prewhitening.png, panel d).
+    refine_frequency : bool
+        With ``prewhiten``, refine each accepted frequency on a 41-point grid within one
+        grid step before fitting the sinusoid (a sinusoid subtracted at a frequency off by
+        up to half a grid step leaves a beat residual).  The reported ``freq``/``period``
+        of the peak is the refined value.
 
     Returns
     -------
-    peaks : list of dicts [{freq, period, power}, ...]
-        Significant peaks in descending order of the ordering statistic.
+    peaks : list of dicts [{freq, period, power, power_raw}, ...]
+        Significant peaks in descending order of the ordering statistic.  ``power`` is
+        the periodogram value at acceptance (the residual periodogram when prewhitening),
+        ``power_raw`` the value in the input periodogram at the same bin.
     masked_windows : list of (f_lo, f_hi) tuples
         Frequency intervals that were masked out during the search.
         Useful for visualising which regions were suppressed.
     """
     freq = np.asarray(freq)
     power = np.asarray(power)
+    power_raw = power
     if continuum is not None:
         continuum = np.asarray(continuum)
 
@@ -1073,48 +1192,25 @@ def find_all_significant_peaks(
 
     harmonics = [1.0, 2.0, 3.0, 4.0, 0.5, 1.0 / 3.0] if harmonic_masking else [1.0]
 
-    while True:
-        if continuum is not None:
-            # Unbiased ordering: largest excess over the CONTINUUM, not over the scaled
-            # threshold.
-            #
-            # The ordering must be restricted to bins that already pass the threshold.
-            # When ordering and acceptance use the SAME quantity (the other branches),
-            # argmax failing the test proves no bin passes, so the loop can terminate on
-            # it.  That proof does not hold here: the bin maximising P - C may fail
-            # P > threshold while a different bin passes.  Selecting among eligible bins
-            # only makes termination depend on the order-independent question "is any bin
-            # significant?", which is what keeps this mode consistent with 'red_noise'.
-            thr = (np.asarray(white_noise_threshold)
-                   if not np.isscalar(white_noise_threshold)
-                   else np.full(len(power), float(white_noise_threshold)))
-            eligible = mask & (power > thr)
-            if not eligible.any():
-                break
-            masked_excess = np.where(eligible, power - continuum, -np.inf)
-            idx = int(np.argmax(masked_excess))
-            t_idx = float(thr[idx])
-        elif np.isscalar(white_noise_threshold):
-            # Scalar: highest absolute power is the right candidate
-            masked_power = np.where(mask, power, -np.inf)
-            idx = int(np.argmax(masked_power))
-            t_idx = float(white_noise_threshold)
-        else:
-            # Per-frequency array: find the bin with the largest excess above
-            # its local threshold so low-frequency peaks aren't missed when a
-            # higher-power but sub-threshold high-frequency bin dominates argmax
-            masked_excess = np.where(mask, power - white_noise_threshold, -np.inf)
-            idx = int(np.argmax(masked_excess))
-            t_idx = float(white_noise_threshold[idx])
+    if prewhiten is not None:
+        from astropy.timeseries import LombScargle
+        t_pw, y_pw, yerr_pw = (np.asarray(a, dtype=float) for a in prewhiten)
+        y_res = y_pw.copy()
+        df_grid = float(np.median(np.diff(freq))) if len(freq) > 1 else 0.0
 
-        if not mask[idx] or power[idx] <= t_idx:
+    while True:
+        idx = _select_peak(freq, power, mask, white_noise_threshold, continuum)
+        if idx is None:
             break
 
-        best_freq = freq[idx]
+        best_freq = float(freq[idx])
+        if prewhiten is not None and refine_frequency and df_grid > 0:
+            best_freq = _refine_peak_frequency(t_pw, y_res, yerr_pw, best_freq, df_grid)
         peaks.append({
-            "freq": float(best_freq),
+            "freq": best_freq,
             "period": float(1.0 / best_freq),
             "power": float(power[idx]),
+            "power_raw": float(power_raw[idx]),
         })
 
         for h in harmonics:
@@ -1124,7 +1220,95 @@ def find_all_significant_peaks(
             masked_windows.append((float(f_lo), float(f_hi)))
             mask[np.abs(freq / target - 1.0) <= harmonic_tolerance] = False
 
+        if prewhiten is not None:
+            if prewhiten_mode == "joint":
+                y_res = y_pw - multisine_model(t_pw, y_pw, yerr_pw, [q["freq"] for q in peaks])
+            elif prewhiten_mode == "sequential":
+                y_res = prewhiten_sinusoid(t_pw, y_res, yerr_pw, best_freq)
+            else:
+                raise ValueError(f"prewhiten_mode must be 'joint' or 'sequential', got {prewhiten_mode!r}")
+            power = LombScargle(t_pw, y_res, yerr_pw, normalization='psd').power(freq)
+
     return peaks, masked_windows
+
+
+# ============================================================
+# 8b. Per-component evidence: leave-one-out log-likelihood drop
+# ============================================================
+
+def component_loglike_drops(fit, x, y, yerr, sequential=True):
+    """Per-component evidence: log-likelihood lost when a periodic component is removed.
+
+    Two variants, both without refitting (one GP likelihood call per evaluation, every
+    other parameter -- the other components, the red-noise term, jitter -- held as fitted;
+    a component is "removed" by setting its sigma to e^-50):
+
+    * ``dloglike`` (single pass, leave-one-out): ``loglike(full) - loglike(without i)``
+      for each i against the full model.
+    * ``dloglike_seq`` (backward elimination): repeatedly remove the component with the
+      smallest current drop, re-evaluating the remaining components' drops after each
+      removal, and record for each component the drop it had when it was removed.
+      Thresholding ``dloglike_seq >= T`` reproduces backward elimination stopped at T.
+
+    Why two: when two seeds share one signal (a window sidelobe, an unresolved
+    neighbour), each one's single-pass drop is small because the OTHER still covers the
+    signal, so a single-pass threshold can remove both and lose the signal.  Backward
+    elimination removes one, after which the partner's drop jumps to the evidence of the
+    signal itself, and keeps it.
+
+    This is the evidence the amplitude cut in ``gp_table_io.filter_gp_components`` was
+    standing in for.  A duplicate seed is fitted with ~zero amplitude and has ~zero drop
+    either way.  A faint but coherent real signal can have a tiny sigma yet a drop of many
+    units, because the GP gains likelihood from every cycle it predicts -- which an
+    amplitude threshold cannot see.
+
+    Not refitting makes each drop an upper bound on the refitted evidence (the others
+    could re-absorb some of the removed variance); the bound is tight when the removed
+    component overlaps nothing.
+
+    Returns ``(dloglike, dloglike_seq)``, each a list aligned with the components (empty
+    lists for a red-noise-only fit).  ``dloglike_seq`` is None when ``sequential=False``.
+    """
+    n = int(fit["n_components"])
+    if n == 0:
+        return [], ([] if sequential else None)
+    theta = np.array(fit["theta"], dtype=float)
+    x_j, y_j, yerr_j = jnp.asarray(x), jnp.asarray(y), jnp.asarray(yerr)
+    kw = dict(has_red_noise=fit.get("has_red_noise", False),
+              rn_model=fit.get("rn_model") or "sho",
+              rn_basis_freqs=fit.get("rn_basis_freqs"),
+              rn_exposure_days=fit.get("rn_exposure_days"),
+              **q_layout_kwargs(fit))
+
+    def _ll(th):
+        return float(build_multi_sho_gp(jnp.asarray(th), x_j, yerr_j, n, **kw).log_probability(y_j))
+
+    def _without(th, idx):
+        out = th.copy()
+        for i in idx:
+            out[3 * i] = -50.0      # sigma_i = e^-50: the component contributes nothing
+        return out
+
+    ll_full = _ll(theta)
+    drops = [ll_full - _ll(_without(theta, [i])) for i in range(n)]
+    if not sequential:
+        return drops, None
+
+    seq = [np.nan] * n
+    removed = []
+    current = list(range(n))
+    ll_cur = ll_full
+    cur_drops = dict(zip(current, drops))      # first step reuses the single-pass values
+    while current:
+        i_min = min(current, key=lambda i: cur_drops[i])
+        seq[i_min] = cur_drops[i_min]
+        removed.append(i_min)
+        current.remove(i_min)
+        if not current:
+            break
+        ll_cur = _ll(_without(theta, removed))
+        cur_drops = {i: ll_cur - _ll(_without(theta, removed + [i])) for i in current}
+    return drops, seq
 
 
 # ============================================================
@@ -1224,6 +1408,8 @@ def iterative_sho_gp_fit(
     q_prior_threshold=Q_PRIOR_THRESHOLD,
     harmonic_tolerance=0.10,
     harmonic_masking=True,
+    prewhiten_seeds=False,
+    prewhiten_mode="sequential",
     fit_full_only=False,
     bic_improvement_threshold=10.0,
     debug_fitalln=False,
@@ -1313,6 +1499,13 @@ def iterative_sho_gp_fit(
         q_prior_threshold (default pi, one period of decay) is where ``use_q_prior``
         starts to push.  tau_cap_days=None reverts to the pre-2026-11 flat box
         [Q_min, Q_max] in log Q.
+    prewhiten_seeds : bool, default False
+        Prewhiten during the peak search: after each accepted peak subtract the
+        least-squares sinusoid at that frequency and recompute the periodogram of the
+        residual before looking for the next one (``find_all_significant_peaks``).
+        Removes window-function sidelobes, which otherwise seed ~45% extra components
+        (docs/gp_fitting.tex S4).  Threshold and continuum stay those of the original
+        periodogram.  ``prewhiten_mode`` ('sequential' default, or 'joint') is passed through.
     fit_red_noise_component : bool
         Add a red-noise term to the kernel (2 extra free parameters either way).
     rn_model : {'powerlaw', 'sho'}
@@ -1428,6 +1621,8 @@ def iterative_sho_gp_fit(
         harmonic_tolerance=harmonic_tolerance,
         harmonic_masking=harmonic_masking,
         continuum=peak_continuum,
+        prewhiten=(x, y, yerr) if prewhiten_seeds else None,
+        prewhiten_mode=prewhiten_mode,
     )
 
     n = min(len(all_peaks), max_components)
@@ -1685,6 +1880,10 @@ def iterative_sho_gp_fit(
                                           rn_exposure_days=best_fit.get("rn_exposure_days"),
                                           **q_layout_kwargs(best_fit))
     final_features.update(rn_white_noise_features(best_fit, x, yerr, rn_wn_flag_ratio))
+    _dll, _dll_seq = component_loglike_drops(best_fit, x, y, yerr)
+    for i, (d, ds) in enumerate(zip(_dll, _dll_seq)):
+        final_features[f"sho_{i+1}_dloglike"] = float(d)
+        final_features[f"sho_{i+1}_dloglike_seq"] = float(ds)
     final_features.update({
         "n_gp_components": best_fit["n_components"],
         "gp_log_likelihood": best_fit["loglike"],

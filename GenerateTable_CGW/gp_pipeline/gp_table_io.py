@@ -84,6 +84,12 @@ def add_gp_fits(
                                             1 = pinned at the cap (gp_fit.q_from_coherence)
     gp_sho_tau_cap               float64    decay-time cap applied to this row in days
                                             (min(tau_cap_days, baseline); NaN = legacy flat Q box)
+    gp_sho_dloglike              object     per-component leave-one-out log-likelihood drop
+                                            (gp_fit.component_loglike_drops): evidence for each
+                                            component, aligned with gp_periods
+    gp_sho_dloglike_seq          object     same, by backward elimination (the drop each
+                                            component had when it was eliminated); the one
+                                            filter_gp_components cuts on
     gp_initial_lsp_peak_periods  object     LSP seed periods used to initialise fit
     gp_rn_sigma, gp_rn_period, gp_rn_Q
                                  float64    red-noise SHO parameters (rn_model='sho' only)
@@ -135,6 +141,8 @@ def add_gp_fits(
     gp_sho_omegas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_Qs_vals     = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_taus_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_dll_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_dlls_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_coh_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_tau_cap_vals = pd.Series(np.nan, index=idx, dtype=float)
     gp_init_lsp_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
@@ -238,6 +246,8 @@ def add_gp_fits(
                 gp_sho_Qs_vals[label]     = [result.features[f"sho_{i}_Q"]     for i in range(1, m + 1)]
                 gp_sho_taus_vals[label]   = [result.features.get(f"sho_{i}_tau_days", np.nan) for i in range(1, m + 1)]
                 gp_sho_coh_vals[label]    = [result.features.get(f"sho_{i}_coherence", np.nan) for i in range(1, m + 1)]
+                gp_sho_dll_vals[label]    = [result.features.get(f"sho_{i}_dloglike", np.nan) for i in range(1, m + 1)]
+                gp_sho_dlls_vals[label]   = [result.features.get(f"sho_{i}_dloglike_seq", np.nan) for i in range(1, m + 1)]
                 gp_sho_tau_cap_vals[label] = result.features.get("sho_tau_cap_days", np.nan)
                 gp_init_lsp_vals[label]   = result.features["initial_lsp_peak_periods"]
                 gp_rn_sigma_vals[label]   = result.features.get("rn_sigma",       np.nan)
@@ -298,6 +308,8 @@ def add_gp_fits(
     table["gp_sho_Qs"]                   = gp_sho_Qs_vals
     table["gp_sho_taus"]                 = gp_sho_taus_vals
     table["gp_sho_coherence"]            = gp_sho_coh_vals
+    table["gp_sho_dloglike"]             = gp_sho_dll_vals
+    table["gp_sho_dloglike_seq"]         = gp_sho_dlls_vals
     table["gp_sho_tau_cap"]              = gp_sho_tau_cap_vals
     table["gp_initial_lsp_peak_periods"] = gp_init_lsp_vals
     table["gp_rn_sigma"]                 = gp_rn_sigma_vals
@@ -513,6 +525,7 @@ def row_white_noise(row):
 
 
 def filter_gp_components(table, snr_min=0.2, sigma_rel_min=None, Q_min=None, n_cycles_min=1.6,
+                         dloglike_min=None, dloglike_col='gp_sho_dloglike_seq',
                          suffix='_filtered', verbose=True):
     """Prune low-amplitude / incoherent GP components, post hoc.
 
@@ -536,6 +549,16 @@ def filter_gp_components(table, snr_min=0.2, sigma_rel_min=None, Q_min=None, n_c
         sigma / WN >= 0.5             525       0.989      0.859
 
     ``sigma_rel_min`` is still accepted and applied in addition when given.
+
+    ``dloglike_min`` cuts on EVIDENCE instead of amplitude: the log-likelihood the fit loses
+    when the component is removed with everything else held fixed (``gp_sho_dloglike``,
+    gp_fit.component_loglike_drops).  Amplitude and evidence are different axes: a seed
+    that duplicates a real signal is fitted at ~zero amplitude AND ~zero evidence, but a
+    faint coherent signal has small sigma and large evidence, because the GP gains
+    likelihood from every cycle it predicts.  So an evidence cut keeps faint real signals
+    an amplitude cut discards.  Pass ``snr_min=None, dloglike_min=...`` to use evidence
+    alone; both cuts apply when both are given.  See
+    sytheticdata_generate_compare/figs/sidelobe_removal/ for the calibration.
 
     The coherence cut is expressed in CYCLES, ``tau_d / P = Q / pi``, not in Q.  Since
     2026-11 the fit caps Q at pi * tau_cap / P (decay time at most one sector), so at
@@ -571,6 +594,13 @@ def filter_gp_components(table, snr_min=0.2, sigma_rel_min=None, Q_min=None, n_c
         Amplitude floor, sigma / white noise >= snr_min.  Default 0.2.  None disables it.
     sigma_rel_min : float or None
         Optional additional relative floor, sigma >= sigma_rel_min * max(sigma) in the row.
+    dloglike_min : float or None
+        Evidence floor, log-likelihood drop >= dloglike_min.  None disables it.
+        Needs the ``gp_sho_dloglike*`` columns (fits made from 2026-11-04 on).
+    dloglike_col : str
+        Which drop to cut on: ``'gp_sho_dloglike_seq'`` (default, backward elimination --
+        robust to two components sharing one signal) or ``'gp_sho_dloglike'`` (single-pass
+        leave-one-out).
     n_cycles_min : float
         Coherence floor in cycles, Q / pi >= n_cycles_min.  Default 1.6 (= Q >= 5).
     Q_min : float or None
@@ -589,8 +619,12 @@ def filter_gp_components(table, snr_min=0.2, sigma_rel_min=None, Q_min=None, n_c
     q_floor = float(Q_min) if Q_min is not None else float(n_cycles_min) * np.pi
     cut_label = f"Q >= {Q_min}" if Q_min is not None else f"cycles Q/pi >= {n_cycles_min} (Q >= {q_floor:.2f})"
     amp_label = " & ".join(([f"sigma/WN >= {snr_min}"] if snr_min is not None else [])
-                           + ([f"sigma_rel >= {sigma_rel_min}"] if sigma_rel_min is not None else [])) or "no amplitude cut"
-    cols = ['gp_periods', 'gp_sho_sigmas', 'gp_sho_Qs', 'gp_sho_omegas', 'gp_sho_taus', 'gp_sho_coherence']
+                           + ([f"sigma_rel >= {sigma_rel_min}"] if sigma_rel_min is not None else [])
+                           + ([f"dloglike >= {dloglike_min}"] if dloglike_min is not None else [])) or "no amplitude cut"
+    if dloglike_min is not None and dloglike_col not in table.columns:
+        raise KeyError(f"dloglike_min needs the {dloglike_col} column (refit with the current gp_fit)")
+    cols = ['gp_periods', 'gp_sho_sigmas', 'gp_sho_Qs', 'gp_sho_omegas', 'gp_sho_taus', 'gp_sho_coherence',
+            'gp_sho_dloglike', 'gp_sho_dloglike_seq']
     present = [c for c in cols if c in table.columns]
     idx = table.index
     out = {c + suffix: pd.Series([None] * len(table), index=idx, dtype=object) for c in present}
@@ -623,6 +657,13 @@ def filter_gp_components(table, snr_min=0.2, sigma_rel_min=None, Q_min=None, n_c
             keep &= np.isfinite(snr) & (snr >= snr_min)
         if sigma_rel_min is not None:
             keep &= (sig >= sigma_rel_min * smax) if smax > 0 else False
+        if dloglike_min is not None:
+            dll = row.get(dloglike_col)
+            dll = np.atleast_1d(np.asarray(dll, dtype=float)) if dll is not None else np.array([])
+            if len(dll) != len(sig):
+                keep &= False
+            else:
+                keep &= np.isfinite(dll) & (dll >= dloglike_min)
         for c in present:
             v = np.atleast_1d(np.asarray(row.get(c), dtype=float))
             out[c + suffix][label] = list(v[keep]) if len(v) == len(keep) else None
