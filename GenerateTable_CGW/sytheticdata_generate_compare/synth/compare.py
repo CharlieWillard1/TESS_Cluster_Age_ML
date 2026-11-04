@@ -372,6 +372,10 @@ def gp_component_purity(df, tol=0.10):
     Components that match nothing injected are spurious.  Pairing this with the fitted
     Q gives a usable purity filter, since a coherent sinusoid drives Q high while a
     component absorbing broadband power does not.
+
+    Also carries ``cycles`` (= Q / pi, the decay time in periods), ``tau`` and ``coherence``
+    (NaN for tables fitted before the decay-time cap, which have no such columns) and the
+    row's ``tau_cap``, so the same table serves the cycles- and coherence-based views.
     """
     rows = []
     for _, r in df.iterrows():
@@ -379,24 +383,40 @@ def gp_component_purity(df, tol=0.10):
         P = r.get('gp_periods')
         Q = np.atleast_1d(np.asarray(Q, float)) if Q is not None else np.array([])
         P = np.atleast_1d(np.asarray(P, float)) if P is not None else np.array([])
+        n = len(Q)
+        def _opt(col):
+            v = r.get(col)
+            v = np.atleast_1d(np.asarray(v, float)) if v is not None else np.array([])
+            return v if len(v) == n else np.full(n, np.nan)
+        tau, coh = _opt('gp_sho_taus'), _opt('gp_sho_coherence')
+        tau_cap = float(r.get('gp_sho_tau_cap', np.nan)) if r.get('gp_sho_tau_cap') is not None else np.nan
         inj = np.atleast_1d(np.asarray(r.get('periods', []), float))
-        for q, p in zip(Q, P):
-            rows.append(dict(name=r['name'], Q=q, period=p,
+        for q, p, t, s in zip(Q, P, tau, coh):
+            rows.append(dict(name=r['name'], n_sectors=r.get('n_sectors', np.nan),
+                             Q=q, period=p, cycles=q / np.pi, tau=t, coherence=s,
+                             tau_cap=tau_cap,
                              matches_injected=bool(len(inj)) and
                              bool(np.any(np.abs(inj / p - 1.0) < tol))))
     return pd.DataFrame(rows)
 
 
-def purity_curve(qs, cuts=(0, 2, 5, 10, 20, 50, 100, 200, 499)):
-    """Purity and completeness of the GP component list as a function of a Q cut."""
+def purity_curve(qs, cuts=(0, 2, 5, 10, 20, 50, 100, 200, 499), by='Q'):
+    """Purity and completeness of the GP component list as a function of a cut.
+
+    ``by`` is the column cut on: ``'Q'`` (default), ``'cycles'`` (= Q / pi, the decay time in
+    periods -- the cut that means the same thing at every period under the decay-time cap)
+    or ``'coherence'`` (s in [0, 1], the position between the Q floor and the
+    period-dependent ceiling).
+    """
     tot = qs['matches_injected'].sum()
     out = []
     for c in cuts:
-        k = qs['Q'] >= c
-        out.append(dict(Q_cut=c, frac_kept=float(k.mean()),
+        k = qs[by] >= c
+        out.append(dict(cut=c, frac_kept=float(k.mean()),
                         purity=float(qs.loc[k, 'matches_injected'].mean()) if k.any() else np.nan,
                         completeness=float(qs.loc[k, 'matches_injected'].sum() / tot) if tot else np.nan))
-    return pd.DataFrame(out)
+    out = pd.DataFrame(out)
+    return out.rename(columns={'cut': f'{by}_cut'})
 
 
 def plot_q_purity(qs, cuts=(0, 2, 5, 10, 20, 50, 100, 200, 499)):
@@ -418,6 +438,52 @@ def plot_q_purity(qs, cuts=(0, 2, 5, 10, 20, 50, 100, 200, 499)):
     axs[1].set(xscale='symlog', ylim=(0, 1.05), xlabel='Q cut',
                ylabel='fraction', title='Filtering GP components on Q')
     axs[1].legend(fontsize=8); axs[1].grid(alpha=.3)
+    plt.tight_layout()
+    return fig
+
+
+def plot_coherence_purity(qs, cycle_cuts=(0, 0.5, 1, 1.6, 3, 6, 10, 30, 100, 300)):
+    """The decay-time view of component purity (tables fitted with the tau_d cap).
+
+    (a) coherence fraction s for real vs spurious components -- s = 1 is "pinned at the
+        cap", s = 0 is the Q floor;
+    (b) decay time in periods (cycles = Q / pi) for the same two populations;
+    (c) purity / completeness against a cycles cut, which is what
+        ``filter_gp_components(n_cycles_min=...)`` applies.
+    """
+    import matplotlib.pyplot as plt
+    fig, axs = plt.subplots(1, 3, figsize=(18, 4.8))
+    real, spur = qs[qs['matches_injected']], qs[~qs['matches_injected']]
+
+    ax = axs[0]
+    ax.hist(real['coherence'].dropna(), bins=np.linspace(0, 1, 41), alpha=.65, color='seagreen',
+            label=f'matches an injection ({len(real)})')
+    ax.hist(spur['coherence'].dropna(), bins=np.linspace(0, 1, 41), alpha=.65, color='crimson',
+            label=f'spurious ({len(spur)})')
+    ax.set(yscale='log', xlabel='coherence fraction s  (0 = Q floor, 1 = decay-time cap)',
+           ylabel='GP components', title='(a) Where components sit between the Q bounds')
+    ax.legend(fontsize=8)
+
+    ax = axs[1]
+    lo = max(np.nanmin(qs['cycles']), 0.1)
+    bins = np.logspace(np.log10(lo), np.log10(np.nanmax(qs['cycles']) * 1.05), 40)
+    ax.hist(real['cycles'], bins=bins, alpha=.65, color='seagreen', label='matches an injection')
+    ax.hist(spur['cycles'], bins=bins, alpha=.65, color='crimson', label='spurious')
+    ax.axvline(1.0, color='#5f5e5a', ls=':', lw=1)
+    ax.text(1.0, ax.get_ylim()[1] * .8, ' soft prior\n (1 period)', fontsize=8, color='#5f5e5a')
+    ax.set(xscale='log', yscale='log', xlabel='decay time in periods  (Q / π)',
+           ylabel='GP components', title='(b) Decay time in periods')
+    ax.legend(fontsize=8)
+
+    pc = purity_curve(qs, cycle_cuts, by='cycles')
+    ax = axs[2]
+    ax.plot(pc['cycles_cut'], pc['purity'], 'o-', color='seagreen', label='purity')
+    ax.plot(pc['cycles_cut'], pc['completeness'], 's-', color='steelblue', label='completeness')
+    ax.axvline(1.6, color='#5f5e5a', ls='--', lw=1)
+    ax.text(1.65, .05, 'default cut 1.6\n(= old Q ≥ 5)', fontsize=8, color='#5f5e5a')
+    ax.set(xscale='symlog', ylim=(0, 1.05), xlabel='cycles cut  (Q / π ≥)',
+           ylabel='fraction', title='(c) Filtering GP components on cycles')
+    ax.legend(fontsize=8); ax.grid(alpha=.3)
     plt.tight_layout()
     return fig
 
@@ -692,14 +758,20 @@ def plot_slope_recovery(configs):
 
 
 def component_filter_scan(df, cuts=((0, 0), (0.05, 0), (0.10, 0), (0.20, 0), (0, 20), (0, 100),
-                                    (0.10, 20), (0.10, 100), (0.20, 100)), tol=0.10, window=0.02):
-    """Purity and completeness of the GP component list under amplitude / Q cuts.
+                                    (0.10, 20), (0.10, 100), (0.20, 100)), tol=0.10, window=0.02,
+                          by='Q'):
+    """Purity and completeness of the GP component list under amplitude / coherence cuts.
 
     Companion to ``gp_table_io.filter_gp_components``: it measures what a given cut costs.
     Purity is the fraction of surviving components matching an injected period; completeness
     is the fraction of DETECTABLE injections (LSP peak above the row's significance threshold)
-    still matched by a surviving component.  ``cuts`` are (sigma_rel_min, Q_min) pairs.
+    still matched by a surviving component.  ``cuts`` are (sigma_rel_min, coherence_min)
+    pairs, where the second element is a Q cut when ``by='Q'`` or a cycles (Q / pi) cut when
+    ``by='cycles'``; the output column is named ``Q_cut`` or ``cycles_cut`` accordingly.
     """
+    if by not in ('Q', 'cycles'):
+        raise ValueError(f"by must be 'Q' or 'cycles', got {by!r}")
+    q_scale = np.pi if by == 'cycles' else 1.0
     comps, det_map, n_det = [], {}, 0
     for i, r in df.iterrows():
         P = np.atleast_1d(np.asarray(r.get('gp_periods', []), float))
@@ -727,11 +799,284 @@ def component_filter_scan(df, cuts=((0, 0), (0.05, 0), (0.10, 0), (0.20, 0), (0,
     comps = pd.DataFrame(comps)
     rows = []
     for smin, qmin in cuts:
-        keep = comps[(comps['sigma_rel'] >= smin) & (comps['Q'] >= qmin)]
+        keep = comps[(comps['sigma_rel'] >= smin) & (comps['Q'] >= qmin * q_scale)]
         by_row = {k: g['period'].to_numpy() for k, g in keep.groupby('row')}
         found = sum(1 for i, det in det_map.items() for Pi in det
                     if len(by_row.get(i, [])) and np.any(np.abs(by_row[i] / Pi - 1) < tol))
-        rows.append(dict(sigma_rel_cut=smin, Q_cut=qmin, components=len(keep),
-                         purity=keep['real'].mean() if len(keep) else np.nan,
-                         completeness=found / n_det if n_det else np.nan, detectable=n_det))
+        rows.append({'sigma_rel_cut': smin, f'{by}_cut': qmin, 'components': len(keep),
+                     'purity': keep['real'].mean() if len(keep) else np.nan,
+                     'completeness': found / n_det if n_det else np.nan, 'detectable': n_det})
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Where the false positives come from
+# ---------------------------------------------------------------------------
+#
+# ``gp_component_purity`` says HOW MANY fitted components match nothing injected; it
+# does not say WHY, and the answer decides whether a spurious component matters.  A
+# component sitting on top of a real signal but failing the 10% period test is the same
+# signal counted twice; a component whose Q is on the floor is absorbing broadband power
+# rather than claiming a periodicity.  Those are bookkeeping, not false detections.  A
+# high-Q, high-amplitude component at a frequency unrelated to anything injected is the
+# only kind that would corrupt a measurement.
+#
+# Two things make this classification honest rather than decorative:
+#
+# 1. **Frequency, not period.**  The 10% period tolerance used elsewhere is a frequency
+#    window of 0.5/day at P = 0.2 d but 0.01/day at P = 10 d, so it means something
+#    different in every part of the band.  Two frequencies closer than the resolution
+#    1/T_baseline are not separable at all, so "within ``k_res``/T of an injection" is the
+#    statement that a component and an injection are the same signal.
+# 2. **A null.**  With ~9 injections per row spread over two decades, a component placed at
+#    random lands near *something* surprisingly often -- an earlier version of this code
+#    called 25% of all components "near-miss sidelobes" when the chance rate was 25.1%.
+#    ``false_positive_null`` re-runs the identical ladder on randomly placed components, so
+#    every class is reported as an excess over chance instead of a raw count.
+
+FP_ORDER = ['matched', 'unresolved duplicate', 'harmonic of injection',
+            'broadband (Q at floor)', 'low amplitude', 'unrelated frequency',
+            'no injection in row']
+
+# Colour-blind-safe. Green = real, red = the only class that is a genuine false detection.
+FP_COLOURS = {'matched': '#1baf7a', 'unresolved duplicate': '#2a78d6',
+              'harmonic of injection': '#7e57c2', 'broadband (Q at floor)': '#b0a24a',
+              'low amplitude': '#c9c7bf', 'unrelated frequency': '#d1352b',
+              'no injection in row': '#8f8e88'}
+
+
+def _baseline_days(r):
+    t = np.asarray(r.get('LC_t', []), float)
+    return float(np.ptp(t)) if t.size > 1 else np.nan
+
+
+def _classify_component(per, sig_rel, q, inj, T, tol, k_res, harmonics, harmonic_tol,
+                        q_floor, q_floor_tol, sigma_rel_min):
+    """The priority ladder; first match wins, so every component gets exactly one label."""
+    if not len(inj):
+        return 'no injection in row', np.nan, np.nan, np.nan
+    frac = np.abs(per / inj - 1.0)
+    j = int(np.argmin(frac))
+    nearest, offset, ratio = float(inj[j]), float(frac[j]), float(per / inj[j])
+    df_min = float(np.min(np.abs(1.0 / per - 1.0 / inj)))
+
+    if offset < tol:
+        kind = 'matched'
+    elif np.isfinite(T) and T > 0 and df_min < k_res / T:
+        kind = 'unresolved duplicate'
+    elif any(abs(ratio / h - 1.0) < harmonic_tol or abs(ratio * h - 1.0) < harmonic_tol
+             for h in harmonics):
+        kind = 'harmonic of injection'
+    elif np.isfinite(q) and q <= q_floor * (1.0 + q_floor_tol):
+        kind = 'broadband (Q at floor)'
+    elif np.isfinite(sig_rel) and sig_rel < sigma_rel_min:
+        kind = 'low amplitude'
+    else:
+        kind = 'unrelated frequency'
+    return kind, nearest, offset, df_min
+
+
+def false_positive_table(df, tol=0.10, k_res=2.0, harmonics=(2, 3, 4), harmonic_tol=0.05,
+                         q_floor=1.0 / np.sqrt(2.0), q_floor_tol=0.02,
+                         sigma_rel_min=0.10, Q_min=None, n_cycles_min=1.6):
+    """One row per fitted GP component, classified by what it most likely is.
+
+    The coherence half of ``survives_filter`` is ``Q / pi >= n_cycles_min`` (default 1.6,
+    the same as the old ``Q >= 5``), mirroring ``filter_gp_components``; pass ``Q_min`` to
+    cut on Q directly instead.
+
+    Classes, in priority order:
+
+    ``matched``                 within ``tol`` in fractional period -- not a false positive.
+    ``unresolved duplicate``    a different period but the SAME frequency to within
+                                ``k_res``/T_baseline: the peak finder seeded one signal twice
+                                (sidelobe or a neighbouring periodogram bin) and the GP fitted
+                                both.  Real structure, double-counted.
+    ``harmonic of injection``   period ratio within ``harmonic_tol`` of an integer or its
+                                reciprocal.  Also real structure, wrong bookkeeping.
+    ``broadband (Q at floor)``  Q pinned at the hard floor: absorbing continuum power.
+    ``low amplitude``           below ``sigma_rel_min`` of its row's strongest component.
+    ``unrelated frequency``     none of the above -- **the only genuine false detection.**
+    ``no injection in row``     the row had no oscillators at all, so every component is
+                                spurious by construction; these rows measure the false-alarm
+                                rate directly.
+
+    ``survives_filter`` reproduces ``gp_table_io.filter_gp_components``, so the same table
+    answers what the DELIVERED component list contains, not just what the fit emitted.
+    """
+    q_keep = float(Q_min) if Q_min is not None else float(n_cycles_min) * np.pi
+    rows = []
+    for _, r in df.iterrows():
+        P = np.atleast_1d(np.asarray(r.get('gp_periods', []), float))
+        S = np.atleast_1d(np.asarray(r.get('gp_sho_sigmas', []), float))
+        Q = np.atleast_1d(np.asarray(r.get('gp_sho_Qs', []), float))
+        if len(P) == 0 or not (len(P) == len(S) == len(Q)):
+            continue
+        inj = np.atleast_1d(np.asarray(r.get('periods', []), float))
+        inj = inj[np.isfinite(inj)]
+        T = _baseline_days(r)
+        smax = np.nanmax(S) if len(S) and np.isfinite(np.nanmax(S)) else np.nan
+
+        for per, sig, q in zip(P, S, Q):
+            srel = sig / smax if (np.isfinite(smax) and smax > 0) else np.nan
+            kind, nearest, offset, df_min = _classify_component(
+                per, srel, q, inj, T, tol, k_res, harmonics, harmonic_tol,
+                q_floor, q_floor_tol, sigma_rel_min)
+            rows.append(dict(name=r['name'], n_sectors=r.get('n_sectors', np.nan),
+                             baseline_days=T, period=per, sigma=sig, sigma_rel=srel, Q=q,
+                             cycles=q / np.pi,
+                             n_inj=len(inj), nearest_inj=nearest, offset=offset,
+                             delta_f=df_min, res_elements=df_min * T if np.isfinite(T) else np.nan,
+                             kind=kind, matched=(kind == 'matched'),
+                             survives_filter=bool(np.isfinite(srel) and srel >= sigma_rel_min
+                                                  and np.isfinite(q) and q >= q_keep)))
+    out = pd.DataFrame(rows)
+    if len(out):
+        out['kind'] = pd.Categorical(out['kind'], categories=FP_ORDER, ordered=True)
+    return out
+
+
+def false_positive_null(df, n_draws=20, seed=0, p_range=None, **kw):
+    """The same ladder applied to randomly placed components -- the chance baseline.
+
+    Each row keeps its own component count, amplitudes and Qs (so the amplitude- and
+    Q-based classes are calibrated too); only the PERIODS are redrawn log-uniformly over
+    the observed range.  Returns per-class counts scaled to one draw.
+    """
+    rng = np.random.default_rng(seed)
+    tol = kw.get('tol', 0.10)
+    if p_range is None:
+        allp = np.concatenate([np.atleast_1d(np.asarray(r.get('gp_periods', []), float))
+                               for _, r in df.iterrows()] or [np.array([1.0])])
+        allp = allp[np.isfinite(allp) & (allp > 0)]
+        p_range = (float(np.min(allp)), float(np.max(allp)))
+    lo, hi = np.log10(p_range[0]), np.log10(p_range[1])
+
+    counts = {k: 0 for k in FP_ORDER}
+    for _, r in df.iterrows():
+        S = np.atleast_1d(np.asarray(r.get('gp_sho_sigmas', []), float))
+        Q = np.atleast_1d(np.asarray(r.get('gp_sho_Qs', []), float))
+        n = len(S)
+        if n == 0 or len(Q) != n:
+            continue
+        inj = np.atleast_1d(np.asarray(r.get('periods', []), float))
+        inj = inj[np.isfinite(inj)]
+        T = _baseline_days(r)
+        smax = np.nanmax(S) if np.isfinite(np.nanmax(S)) else np.nan
+        for _ in range(n_draws):
+            for per, sig, q in zip(10 ** rng.uniform(lo, hi, n), S, Q):
+                srel = sig / smax if (np.isfinite(smax) and smax > 0) else np.nan
+                kind, *_ = _classify_component(
+                    per, srel, q, inj, T, tol, kw.get('k_res', 2.0),
+                    kw.get('harmonics', (2, 3, 4)), kw.get('harmonic_tol', 0.05),
+                    kw.get('q_floor', 1.0 / np.sqrt(2.0)), kw.get('q_floor_tol', 0.02),
+                    kw.get('sigma_rel_min', 0.10))
+                counts[kind] += 1
+    return pd.Series({k: v / n_draws for k, v in counts.items()}, name='expected_by_chance')
+
+
+def false_positive_summary(fp, null=None):
+    """Counts per class, before and after the standard filter, with the chance baseline."""
+    tot, kept = len(fp), int(fp['survives_filter'].sum())
+    g = fp.groupby('kind', observed=False)
+    out = g.agg(n=('period', 'size'), n_after_filter=('survives_filter', 'sum'),
+                median_sigma_rel=('sigma_rel', 'median'), median_Q=('Q', 'median')).reset_index()
+    out['frac'] = out.n / max(tot, 1)
+    out['frac_after_filter'] = out.n_after_filter / max(kept, 1)
+    out['filter_removes'] = 1 - out.n_after_filter / out.n.replace(0, np.nan)
+    if null is not None:
+        out['expected_by_chance'] = out.kind.map(null).astype(float)
+        out['excess'] = out.n - out.expected_by_chance
+    return out
+
+
+def plot_false_positives(fp, null=None, sigma_rel_min=0.10, Q_min=None, n_cycles_min=1.6,
+                         q_floor=1.0 / np.sqrt(2.0), k_res=2.0):
+    """Four panels: what the spurious components are, and which of them survive the filter.
+
+    ``Q_min`` / ``n_cycles_min`` only draw the cut that ``false_positive_table`` applied;
+    pass the same values to both.
+    """
+    import matplotlib.pyplot as plt
+
+    if Q_min is None:
+        Q_min = float(n_cycles_min) * np.pi
+        cut_label = f'Q/π ≥ {n_cycles_min:g} (Q ≥ {Q_min:.1f})'
+    else:
+        cut_label = f'Q ≥ {Q_min:g}'
+    summ = false_positive_summary(fp, null)
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10.5))
+
+    # (a) frequency offset from the nearest injection, against the chance expectation
+    ax = axs[0, 0]
+    sub = fp[np.isfinite(fp.res_elements)]
+    bins = np.logspace(-2.2, 2.7, 34)
+    ax.hist([sub.loc[sub.kind == k, 'res_elements'] for k in FP_ORDER if (sub.kind == k).any()],
+            bins=bins, stacked=True,
+            color=[FP_COLOURS[k] for k in FP_ORDER if (sub.kind == k).any()],
+            label=[k for k in FP_ORDER if (sub.kind == k).any()])
+    ax.axvline(k_res, color='#5f5e5a', ls='--', lw=1.2)
+    ax.text(k_res * 1.15, ax.get_ylim()[1] * .92, f'{k_res:g} resolution\nelements', fontsize=8,
+            color='#5f5e5a')
+    ax.set(xscale='log', xlabel='|Δf| to nearest injection, in resolution elements (1/T)',
+           ylabel='GP components')
+    ax.set_title('(a) Components pile up ON the injected frequencies', loc='left',
+                 fontweight='bold')
+    ax.legend(fontsize=7.5, loc='upper right')
+
+    # (b) the plane the filter actually cuts in
+    ax = axs[0, 1]
+    for kind in FP_ORDER:
+        s = fp[fp.kind == kind]
+        if len(s):
+            ax.scatter(s.Q.clip(upper=1e3), s.sigma_rel, s=15, alpha=.55, lw=0,
+                       color=FP_COLOURS[kind])
+    ax.axvline(Q_min, color='#5f5e5a', lw=1.2, ls='--')
+    ax.axhline(sigma_rel_min, color='#5f5e5a', lw=1.2, ls='--')
+    ax.axvline(q_floor, color='#b0a24a', lw=1, ls=':')
+    ax.fill_between([Q_min, 1e3], sigma_rel_min, 1.35, color='#1baf7a', alpha=.07, zorder=0)
+    ax.text(Q_min * 1.35, 1.12, 'kept by filter', fontsize=9, color='#1baf7a')
+    ax.set(xscale='log', yscale='log', xlabel='fitted Q (clipped at 1000)',
+           ylabel='σ / max σ in row', ylim=(1e-3, 1.5))
+    ax.set_title(f'(b) The filter cut: σ_rel ≥ {sigma_rel_min:g} and {cut_label}',
+                 loc='left', fontweight='bold')
+
+    # (c) counts per class, with the chance baseline and the effect of the filter
+    ax = axs[1, 0]
+    s = summ[summ.n > 0]
+    ypos = np.arange(len(s))
+    ax.barh(ypos, s.n, color=[FP_COLOURS[k] for k in s.kind], alpha=.45, label='fitted')
+    ax.barh(ypos, s.n_after_filter, color=[FP_COLOURS[k] for k in s.kind],
+            label='survives filter')
+    if null is not None:
+        ax.scatter(s.expected_by_chance, ypos, marker='|', s=260, color='black', lw=1.8,
+                   zorder=5, label='expected by chance')
+    for i, r in enumerate(s.itertuples()):
+        ax.text(r.n * 1.02, i, f'  {int(r.n)} → {int(r.n_after_filter)}', va='center',
+                fontsize=8.5, color='#5f5e5a')
+    ax.set_yticks(ypos, list(s.kind))
+    ax.invert_yaxis()
+    ax.set(xlabel='GP components', xlim=(0, s.n.max() * 1.3))
+    ax.set_title('(c) What they are, and what the filter removes', loc='left',
+                 fontweight='bold')
+    ax.legend(fontsize=8, loc='lower right')
+
+    # (d) what is left in the delivered component list
+    ax = axs[1, 1]
+    kept = fp[fp.survives_filter]
+    pb = np.logspace(np.log10(max(np.nanmin(fp.period), 1e-2)), np.log10(np.nanmax(fp.period)), 28)
+    ax.hist([kept.loc[kept.matched, 'period'], kept.loc[~kept.matched, 'period']],
+            bins=pb, stacked=True, color=['#1baf7a', '#d1352b'],
+            label=[f'matched ({int(kept.matched.sum())})',
+                   f'spurious ({int((~kept.matched).sum())})'])
+    bad = kept[kept.kind == 'unrelated frequency']
+    ax.set(xscale='log', xlabel='component period (d)', ylabel='components after filter')
+    pur = kept.matched.mean() if len(kept) else np.nan
+    ax.set_title(f'(d) Delivered list: purity {pur:.1%}, '
+                 f'{len(bad)} genuinely unrelated', loc='left', fontweight='bold')
+    ax.legend(fontsize=8)
+
+    fig.suptitle('Where the synthetic false positives come from', fontsize=14,
+                 fontweight='bold', x=0.005, ha='left')
+    plt.tight_layout(rect=(0, 0, 1, 0.985))
+    return fig

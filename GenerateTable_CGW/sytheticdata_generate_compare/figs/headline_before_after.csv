@@ -1,0 +1,30 @@
+,"flat Q box [1/sqrt2, 500], soft floor Q=2","tau_d cap (27 d), soft floor Q=pi"
+rows,246.0,246.0
+rows clean (neither flag),187.0,187.0
+rows components capped,25.0,27.0
+rows no red noise detected,34.0,32.0
+rows fitted with no components,57.0,57.0
+alpha GP: bias (clean),0.088,0.067
+alpha GP: median |err| (clean),0.092,0.093
+alpha GP: r (clean),0.82,0.803
+alpha periodogram: bias (clean),0.0,0.006
+alpha periodogram: median |err| (clean),0.169,0.169
+alpha periodogram: r (clean),0.592,0.599
+alpha GP: median |err| (rows with red noise),0.098,0.093
+rn amplitude Spearman (clean),0.824,0.824
+detectable oscillators,611.0,611.0
+detectable recovered,601.0,597.0
+detectable recovery,0.9836,0.9771
+components fitted,1632.0,1632.0
+purity raw,0.6844,0.6844
+components after filter,556.0,537.0
+purity filtered,0.964,0.9832
+completeness filtered,0.8871,0.8871
+components with Q >= 475,459.0,11.0
+components at cap (s > 0.99),,1332.0
+components Q in 2-20,0.1562,0.4884
+median Q matched,158.6,21.1
+median Q spurious,26.4,18.5
+median cycles matched,50.5,6.72
+median cycles spurious,8.41,5.9
+delivered: genuinely unrelated,12.0,7.0
