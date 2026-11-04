@@ -15,6 +15,51 @@ jax.config.update("jax_enable_x64", True)
 
 _RN_Q = 1.0 / np.sqrt(2.0)  # fixed Q for red noise SHO (critical damping, Matérn-3/2 limit)
 
+# ---------------------------------------------------------------------------
+# Bounds and priors on the periodic SHO quality factor Q (docs/gp_fitting.tex S2, S4)
+# ---------------------------------------------------------------------------
+# The SHO kernel for Q > 1/2 is an envelope exp(-omega_0 tau / 2Q) times a cosine
+# (Foreman-Mackey et al. 2017, eq. 23), so its e-folding decay time is
+#
+#     tau_d = 2 Q / omega_0 = Q * P / pi ,
+#
+# which celerite2 exposes directly as the (rho, tau) parameterisation of SHOTerm.
+# Q / pi is the number of coherent cycles before the amplitude e-folds.
+#
+# UPPER bound -- a fixed decay-time cap, not a fixed Q cap.  Once tau_d exceeds the
+# length of the light curve the likelihood is flat in Q: a component coherent for 27 d
+# and one coherent for ever are indistinguishable in 27 d of data, and the optimiser
+# drifts to whatever box edge it was given.  Nicholson & Aigrain (2022) show the
+# recovered evolution timescale of a quasi-periodic GP tracks the truth only up to about
+# half the baseline and scatters freely beyond it.  So the cap is on tau_d, and in Q it
+# is period-dependent:
+#
+#     Q_max(P) = pi * TAU_CAP_DAYS / P .
+#
+# The equivalent frequency-domain statement is that the SHO line (FWHM ~ f0/Q) must
+# not be narrower than the Rayleigh resolution 1/T, which gives Q < T/P -- the same
+# scaling, a factor pi tighter.  TAU_CAP_DAYS is pinned to ONE TESS SECTOR for every
+# row, including multi-sector rows (fit_multi_sho_gp uses min(TAU_CAP_DAYS, baseline)):
+# a stitching offset between sectors can only be absorbed as an 80-day coherent signal
+# if the box allows an 80-day decay time, and the Q feature should mean the same thing
+# whatever the sector count.  Before 2026-11 the cap was a flat Q <= 500, which at
+# P = 0.1 d cut below the baseline and at P = 5 d allowed decay times of 800 d; on the
+# 2026-09-21 real table 38% of components sat on it and 43% had tau_d longer than their
+# own light curve.
+TAU_CAP_DAYS = 27.0
+
+# LOWER bound -- physical.  An SHO's PSD has a peak at non-zero frequency only for
+# Q > 1/sqrt(2); below that it is a continuum, not an oscillator.  Hard bound, = _RN_Q.
+Q_MIN = _RN_Q
+
+# SOFT floor -- where spot modulation lives.  Angus et al. (2018) argue the evolution
+# timescale of a rotating spotted star should exceed one period (l > P), and the spot
+# simulations of Aigrain et al. (2015) / Nicholson & Aigrain (2022) use lifetimes of
+# 1-10 P.  In the SHO that is tau_d > P, i.e. Q > pi.  _q_neg_log_prior pushes
+# quadratically in log Q below this threshold; it is the thing that stops a signal
+# component from broadening into the red-noise continuum.  Was 2.0 (tau_d > 0.64 P).
+Q_PRIOR_THRESHOLD = float(np.pi)
+
 # Red-noise term models (see docs/fixing_RN_fitting.tex):
 #   'sho'      : one fixed-Q SHO, theta = [log_sigma, log_period].  A broken power law
 #                (flat, then f^-4); its effective slope carries no information on alpha.
@@ -55,13 +100,67 @@ def clean_lc(t, flux, flux_err):
 # 2. Multi-SHO GP model
 # ============================================================
 
-def unpack_theta(theta, n_components):
+def sho_q_cap(period, tau_cap, Q_max=None):
+    """Largest Q allowed at this period: the decay time Q P / pi may not exceed ``tau_cap``.
+
+    ``Q_max`` is an optional absolute ceiling on top (None = none).  Works on floats,
+    numpy and jax arrays.
+    """
+    cap = jnp.pi * tau_cap / period
+    if Q_max is not None:
+        cap = jnp.minimum(cap, Q_max)
+    return cap
+
+
+def _q_log_range(period, Q_min, tau_cap, Q_max=None):
+    """(log Q_min, log Q_max(P)) with the top clamped just above the floor so the range
+    never inverts (it would for P > pi tau_cap / Q_min, i.e. 120 d at the defaults)."""
+    log_lo = jnp.log(Q_min)
+    log_hi = jnp.log(jnp.maximum(sho_q_cap(period, tau_cap, Q_max), Q_min * (1.0 + 1e-6)))
+    return log_lo, log_hi
+
+
+def q_from_coherence(s, period, Q_min, tau_cap, Q_max=None):
+    """Q from the coherence fraction ``s`` in [0, 1].
+
+    L-BFGS-B only takes box bounds that are fixed before the fit starts, but both limits
+    on Q move with the period (floor Q_min is fixed, ceiling pi tau_cap / P is not; in
+    decay time it is the other way round).  So theta carries ``s``, where Q sits between
+    its floor and its ceiling in log space::
+
+        log Q = log Q_min + s * (log Q_max(P) - log Q_min) .
+
+    s = 0 is the continuum limit, s = 1 is "coherent for the whole cap", and both are
+    exact hard walls because the box on s is [0, 1].  The derived Q is what the kernel,
+    the soft prior and the reported features all use; nothing downstream sees s.
+    """
+    log_lo, log_hi = _q_log_range(period, Q_min, tau_cap, Q_max)
+    return jnp.exp(log_lo + s * (log_hi - log_lo))
+
+
+def coherence_from_q(Q, period, Q_min, tau_cap, Q_max=None):
+    """Inverse of q_from_coherence (numpy; used to seed s from a Q guess)."""
+    log_lo, log_hi = _q_log_range(np.asarray(period, float), Q_min, tau_cap, Q_max)
+    log_lo, log_hi = float(log_lo), float(log_hi)
+    return (np.log(Q) - log_lo) / (log_hi - log_lo)
+
+
+def unpack_theta(theta, n_components, tau_cap=None, Q_min=Q_MIN, Q_max=None):
     """
     theta structure:
-    [log_sigma_1, log_period_1, log_Q_1,
-     log_sigma_2, log_period_2, log_Q_2,
+    [log_sigma_1, log_period_1, q_1,
+     log_sigma_2, log_period_2, q_2,
      ...
      log_jitter]
+
+    The third slot of each component is the coherence fraction s in [0, 1] when
+    ``tau_cap`` is given (see q_from_coherence), and log Q when it is None.  The None
+    form is the pre-2026-11 layout; it is kept so that pickled fits made with a flat
+    Q box still unpack correctly (they carry no ``tau_cap`` key).
+
+    Each component dict holds sigma, period, omega, Q, and also tau (= Q P / pi, the
+    e-folding decay time of the kernel in days), Q_cap (the ceiling at that period, NaN
+    in the legacy layout) and coherence (s, NaN in the legacy layout).
     """
     theta = jnp.asarray(theta)
     comps = []
@@ -69,11 +168,18 @@ def unpack_theta(theta, n_components):
     for i in range(n_components):
         log_sigma = theta[3*i + 0]
         log_period = theta[3*i + 1]
-        log_Q = theta[3*i + 2]
+        q_raw = theta[3*i + 2]
 
         sigma = jnp.exp(log_sigma)
         period = jnp.exp(log_period)
-        Q = jnp.exp(log_Q)
+        if tau_cap is None:
+            Q = jnp.exp(q_raw)
+            q_cap = jnp.nan
+            s = jnp.nan
+        else:
+            Q = q_from_coherence(q_raw, period, Q_min, tau_cap, Q_max)
+            q_cap = sho_q_cap(period, tau_cap, Q_max)
+            s = q_raw
         omega = 2.0 * jnp.pi / period
 
         comps.append({
@@ -81,6 +187,9 @@ def unpack_theta(theta, n_components):
             "period": period,
             "omega": omega,
             "Q": Q,
+            "tau": Q * period / jnp.pi,
+            "Q_cap": q_cap,
+            "coherence": s,
         })
 
     jitter = jnp.exp(theta[-1])
@@ -291,8 +400,9 @@ def sho_psd(freq, sigma, omega0, Q):
 
 
 def build_multi_sho_gp(theta, x, yerr, n_components, has_red_noise=False,
-                       rn_model="sho", rn_basis_freqs=None, rn_exposure_days=None):
-    comps, jitter = unpack_theta(theta, n_components)
+                       rn_model="sho", rn_basis_freqs=None, rn_exposure_days=None,
+                       tau_cap=None, Q_min=Q_MIN, Q_max=None):
+    comps, jitter = unpack_theta(theta, n_components, tau_cap=tau_cap, Q_min=Q_min, Q_max=Q_max)
 
     kernel = None
 
@@ -324,9 +434,11 @@ def build_multi_sho_gp(theta, x, yerr, n_components, has_red_noise=False,
 
 
 def neg_log_likelihood(theta, x, y, yerr, n_components, has_red_noise=False,
-                       rn_model="sho", rn_basis_freqs=None, rn_exposure_days=None):
+                       rn_model="sho", rn_basis_freqs=None, rn_exposure_days=None,
+                       tau_cap=None, Q_min=Q_MIN, Q_max=None):
     gp = build_multi_sho_gp(theta, x, yerr, n_components, has_red_noise,
-                            rn_model, rn_basis_freqs, rn_exposure_days)
+                            rn_model, rn_basis_freqs, rn_exposure_days,
+                            tau_cap=tau_cap, Q_min=Q_min, Q_max=Q_max)
     return -gp.log_probability(y)
 
 
@@ -342,18 +454,21 @@ def _period_neg_log_prior(theta, period_seeds_j, n_components, sigma_dex):
     return 0.5 * jnp.sum(((log_periods - log_seeds) / sigma_ln) ** 2)
 
 
-def _q_neg_log_prior(theta, n_components, q_prior_weight):
-    """Half-quadratic penalty in log-Q space that activates below Q=2.
+def _q_neg_log_prior(theta, n_components, q_prior_weight, q_threshold=Q_PRIOR_THRESHOLD,
+                     tau_cap=None, Q_min=Q_MIN, Q_max=None):
+    """Half-quadratic penalty in log-Q space that activates below ``q_threshold``.
 
-    No penalty for Q >= 2 (uniform prior). Below Q=2 the penalty grows
-    quadratically in log space so that Q=1.5 is a small nudge, Q=1 is
-    a moderate push, and Q<1 is a strong pull back toward Q=2.
+    No penalty above the threshold (uniform prior).  Below it the penalty grows
+    quadratically in log Q, so with the default threshold of pi (decay time of one
+    period -- see Q_PRIOR_THRESHOLD) Q = 2 is a small nudge, Q = 1 a moderate push and
+    Q < 1 a strong pull back up.  Q is the DERIVED quality factor (unpack_theta), so this
+    works identically in the coherence-fraction and legacy log-Q layouts.
     """
-    log_q_threshold = jnp.log(2.0)
+    comps, _ = unpack_theta(theta, n_components, tau_cap=tau_cap, Q_min=Q_min, Q_max=Q_max)
+    log_q_threshold = jnp.log(q_threshold)
     total = jnp.zeros(())
-    for i in range(n_components):
-        log_Q = theta[3 * i + 2]
-        deficit = jnp.maximum(0.0, log_q_threshold - log_Q)
+    for c in comps:
+        deficit = jnp.maximum(0.0, log_q_threshold - jnp.log(c["Q"]))
         total = total + deficit ** 2
     return q_prior_weight * total
 
@@ -391,7 +506,8 @@ def _rn_alpha_wn_neg_log_prior(theta, n_components, med_yerr_sq, dt, weight, rat
 
 def make_initial_theta(period_guesses, y, yerr, init_Q=5.0,
                        has_red_noise=False, rn_max_period=10.0,
-                       rn_model="sho", rn_band=None, rn_alpha_init=1.0):
+                       rn_model="sho", rn_band=None, rn_alpha_init=1.0,
+                       tau_cap=None, Q_min=Q_MIN, Q_max=None):
     n_components = len(period_guesses)
 
     y_std = np.nanstd(y)
@@ -406,10 +522,18 @@ def make_initial_theta(period_guesses, y, yerr, init_Q=5.0,
     init_sigma = max(init_sigma, 1e-8)
 
     for p in period_guesses:
+        if tau_cap is None:
+            q_seed = np.log(init_Q)
+        else:
+            # Seed the coherence fraction at the Q guess, clipped strictly inside [0, 1]
+            # so the first L-BFGS-B step is not degenerate (init_Q may exceed the cap at
+            # long periods: at P = 10 d the cap is 8.5 for a 27 d tau_cap).
+            q_seed = float(np.clip(coherence_from_q(init_Q, p, Q_min, tau_cap, Q_max),
+                                   0.05, 0.95))
         pieces.extend([
             np.log(init_sigma),
             np.log(p),
-            np.log(init_Q),
+            q_seed,
         ])
 
     if has_red_noise and rn_model == "powerlaw":
@@ -435,15 +559,27 @@ def make_initial_theta(period_guesses, y, yerr, init_Q=5.0,
     return np.array(pieces, dtype=float)
 
 
-def make_bounds(n_components, min_period, max_period, Q_min=_RN_Q, Q_max=100.0,
-                has_red_noise=False, rn_max_period=None, rn_model="sho"):
+def make_bounds(n_components, min_period, max_period, Q_min=Q_MIN, Q_max=None,
+                has_red_noise=False, rn_max_period=None, rn_model="sho", tau_cap=None):
+    """Box bounds for L-BFGS-B.
+
+    With ``tau_cap`` set the third slot of each component is the coherence fraction s and
+    its box is [0, 1]; the period-dependent Q limits are then exact by construction (see
+    q_from_coherence).  With ``tau_cap=None`` (legacy layout) the slot is log Q and the
+    box is [Q_min, Q_max], Q_max defaulting to 100 as before.
+    """
     bounds = []
+
+    if tau_cap is None:
+        q_bounds = (np.log(Q_min), np.log(100.0 if Q_max is None else Q_max))
+    else:
+        q_bounds = (0.0, 1.0)
 
     for _ in range(n_components):
         bounds.extend([
             (np.log(1e-10), np.log(1.0)),              # sigma
             (np.log(min_period), np.log(max_period)),  # period
-            (np.log(Q_min), np.log(Q_max)),            # Q
+            q_bounds,                                  # coherence fraction s (or log Q, legacy)
         ])
 
     if has_red_noise and rn_model == "powerlaw":
@@ -473,9 +609,11 @@ def fit_multi_sho_gp(
     period_guesses,
     min_period,
     max_period,
-    Q_min=_RN_Q,
-    Q_max=100.0,
+    Q_min=Q_MIN,
+    Q_max=None,
     init_Q=10.0,
+    tau_cap_days=TAU_CAP_DAYS,
+    q_prior_threshold=Q_PRIOR_THRESHOLD,
     has_red_noise=False,
     use_lognormal_period_prior=False,
     period_prior_sigma_dex=0.3,
@@ -494,11 +632,41 @@ def fit_multi_sho_gp(
     rn_alpha_wn_prior_ratio=RN_ALPHA_WN_PRIOR_RATIO,
     rn_alpha_wn_prior_width=RN_ALPHA_WN_PRIOR_WIDTH,
 ):
+    """Fit one m-component SHO (+ red noise + jitter) GP by staged L-BFGS-B.
+
+    Q bounds (see the TAU_CAP_DAYS / Q_MIN / Q_PRIOR_THRESHOLD notes at the top of the
+    module):
+
+    tau_cap_days : float or None
+        Hard ceiling on each component's e-folding decay time tau_d = Q P / pi, so the
+        ceiling in Q is pi * tau_cap / P.  The cap actually applied is
+        ``min(tau_cap_days, baseline)`` and is stored in the returned fit as ``tau_cap``;
+        with the default 27 d it is one TESS sector for every row, however many sectors
+        the row stitches together.  None restores the pre-2026-11 flat box in log Q with
+        ``Q_max`` as its top (default 100 then).
+    Q_min : float
+        Hard floor on Q (default 1/sqrt(2), where the SHO PSD stops having a peak).
+    Q_max : float or None
+        Optional absolute ceiling on Q applied in addition to the decay-time cap.
+    q_prior_threshold : float
+        Where the soft Q prior (``use_q_prior``) starts pushing, default pi = one period
+        of decay time.
+    """
     if rn_model not in RN_MODELS:
         raise ValueError(f"rn_model must be one of {RN_MODELS}, got {rn_model!r}")
     n_components = len(period_guesses)
     _baseline = float(np.max(x))
     rn_max_period = min(_baseline, rn_period_cap) if rn_period_cap is not None else _baseline
+
+    # Decay-time cap for the periodic components: one sector, or the row if shorter.
+    tau_cap = None if tau_cap_days is None else float(min(tau_cap_days, _baseline))
+    if tau_cap is not None and np.pi * tau_cap / max_period <= Q_min:
+        import warnings
+        warnings.warn(
+            f"tau_cap={tau_cap:.1f} d gives Q_max(P={max_period:.2f} d) = "
+            f"{np.pi * tau_cap / max_period:.2f} <= Q_min={Q_min:.3f}; the Q range is "
+            "pinned at Q_min for the longest periods.", RuntimeWarning, stacklevel=2)
+    q_kw = dict(tau_cap=tau_cap, Q_min=Q_min, Q_max=Q_max)
 
     # The power-law basis spans the fitted period range, padded (see rn_basis_frequencies).
     rn_band = (1.0 / max_period, 1.0 / min_period)
@@ -514,6 +682,7 @@ def fit_multi_sho_gp(
         # keep the seed strictly inside the bounds so the first L-BFGS-B step is not degenerate
         rn_alpha_init=float(np.clip(rn_alpha_init, RN_ALPHA_BOUNDS[0] + 0.01,
                                     RN_ALPHA_BOUNDS[1] - 0.01)),
+        **q_kw,
     )
     bounds = make_bounds(
         n_components,
@@ -524,6 +693,7 @@ def fit_multi_sho_gp(
         has_red_noise=has_red_noise,
         rn_max_period=rn_max_period,
         rn_model=rn_model,
+        tau_cap=tau_cap,
     )
 
     # Convert data to JAX arrays ONCE, not inside every likelihood call
@@ -546,7 +716,8 @@ def fit_multi_sho_gp(
         penalties.append(lambda th: _period_neg_log_prior(th, period_seeds_j, n_components,
                                                           period_prior_sigma_dex))
     if use_q_prior:
-        penalties.append(lambda th: _q_neg_log_prior(th, n_components, q_prior_weight))
+        penalties.append(lambda th: _q_neg_log_prior(th, n_components, q_prior_weight,
+                                                     q_prior_threshold, **q_kw))
     if _use_rn_alpha_wn_prior:
         penalties.append(lambda th: _rn_alpha_wn_neg_log_prior(
             th, n_components, _med_yerr_sq, _dt, rn_alpha_wn_prior_weight,
@@ -555,7 +726,7 @@ def fit_multi_sho_gp(
     @jax.jit
     def objective(theta):
         total = neg_log_likelihood(theta, x_j, y_j, yerr_j, n_components, has_red_noise,
-                                   rn_model, rn_basis_freqs, rn_exposure_days)
+                                   rn_model, rn_basis_freqs, rn_exposure_days, **q_kw)
         for pen in penalties:
             total = total + pen(theta)
         return total
@@ -634,6 +805,7 @@ def fit_multi_sho_gp(
         rn_model,
         rn_basis_freqs,
         rn_exposure_days,
+        **q_kw,
     )
 
     # BIC uses the raw log-likelihood (prior excluded by convention — we rank
@@ -651,7 +823,22 @@ def fit_multi_sho_gp(
         "rn_basis_freqs": rn_basis_freqs,
         "rn_band": rn_band,
         "rn_exposure_days": rn_exposure_days,
+        # Q layout of theta: tau_cap None = legacy log-Q slot; else coherence fraction.
+        # Everything that unpacks theta later (PSD, plots, unpickling) reads these.
+        "tau_cap": tau_cap,
+        "Q_min": Q_min,
+        "Q_max": Q_max,
     }
+
+
+def q_layout_kwargs(fit):
+    """The unpack_theta / build_multi_sho_gp keywords recorded in a fit dict.
+
+    Fits pickled before 2026-11 carry none of the keys and unpack as the legacy log-Q
+    layout (``tau_cap=None``).
+    """
+    return dict(tau_cap=fit.get("tau_cap"), Q_min=fit.get("Q_min", Q_MIN),
+                Q_max=fit.get("Q_max"))
 
 
 # ============================================================
@@ -780,8 +967,9 @@ def compute_bic(loglike, n_params, n_data):
 
 def summarize_components(theta, n_components, has_red_noise=False,
                          rn_model="sho", rn_basis_freqs=None, rn_band=None,
-                         rn_exposure_days=None):
-    comps, jitter = unpack_theta(jnp.asarray(theta), n_components)
+                         rn_exposure_days=None, tau_cap=None, Q_min=Q_MIN, Q_max=None):
+    comps, jitter = unpack_theta(jnp.asarray(theta), n_components,
+                                 tau_cap=tau_cap, Q_min=Q_min, Q_max=Q_max)
 
     out = {}
 
@@ -790,6 +978,12 @@ def summarize_components(theta, n_components, has_red_noise=False,
         out[f"sho_{i+1}_period_days"] = float(c["period"])
         out[f"sho_{i+1}_omega"] = float(c["omega"])
         out[f"sho_{i+1}_Q"] = float(c["Q"])
+        out[f"sho_{i+1}_tau_days"] = float(c["tau"])         # e-folding decay time Q P / pi
+        out[f"sho_{i+1}_Q_cap"] = float(c["Q_cap"])          # ceiling at this period (NaN: legacy)
+        out[f"sho_{i+1}_coherence"] = float(c["coherence"])  # s in [0, 1]; 1 = at the cap
+
+    if tau_cap is not None:
+        out["sho_tau_cap_days"] = float(tau_cap)
 
     if has_red_noise and rn_model == "powerlaw":
         rn = _unpack_rn_powerlaw(jnp.asarray(theta), n_components)
@@ -828,6 +1022,83 @@ def summarize_components(theta, n_components, has_red_noise=False,
 # 8. Upfront multi-peak detection with harmonic masking
 # ============================================================
 
+def _select_peak(freq, power, mask, white_noise_threshold, continuum=None):
+    """One step of the greedy peak walk: the index of the next peak, or None.
+
+    Acceptance is always ``power > threshold`` at the chosen bin.  Ordering depends on the
+    threshold form (see ``find_all_significant_peaks``).
+    """
+    if continuum is not None:
+        # Unbiased ordering: largest excess over the CONTINUUM, not over the scaled
+        # threshold.
+        #
+        # The ordering must be restricted to bins that already pass the threshold.
+        # When ordering and acceptance use the SAME quantity (the other branches),
+        # argmax failing the test proves no bin passes, so the loop can terminate on
+        # it.  That proof does not hold here: the bin maximising P - C may fail
+        # P > threshold while a different bin passes.  Selecting among eligible bins
+        # only makes termination depend on the order-independent question "is any bin
+        # significant?", which is what keeps this mode consistent with 'red_noise'.
+        thr = (np.asarray(white_noise_threshold)
+               if not np.isscalar(white_noise_threshold)
+               else np.full(len(power), float(white_noise_threshold)))
+        eligible = mask & (power > thr)
+        if not eligible.any():
+            return None
+        masked_excess = np.where(eligible, power - continuum, -np.inf)
+        idx = int(np.argmax(masked_excess))
+        t_idx = float(thr[idx])
+    elif np.isscalar(white_noise_threshold):
+        # Scalar: highest absolute power is the right candidate
+        masked_power = np.where(mask, power, -np.inf)
+        idx = int(np.argmax(masked_power))
+        t_idx = float(white_noise_threshold)
+    else:
+        # Per-frequency array: find the bin with the largest excess above
+        # its local threshold so low-frequency peaks aren't missed when a
+        # higher-power but sub-threshold high-frequency bin dominates argmax
+        masked_excess = np.where(mask, power - white_noise_threshold, -np.inf)
+        idx = int(np.argmax(masked_excess))
+        t_idx = float(white_noise_threshold[idx])
+
+    if not mask[idx] or power[idx] <= t_idx:
+        return None
+    return idx
+
+
+def _refine_peak_frequency(t, y, yerr, f0, df, n=41):
+    """Best frequency within +-df of the grid peak f0 on a finer local grid."""
+    from astropy.timeseries import LombScargle
+    fine = np.linspace(max(f0 - df, 1e-6), f0 + df, n)
+    pw = LombScargle(t, y, yerr, normalization='psd').power(fine)
+    return float(fine[int(np.argmax(pw))])
+
+
+def prewhiten_sinusoid(t, y, yerr, f):
+    """Subtract the least-squares sinusoid (plus offset) at frequency f from y."""
+    from astropy.timeseries import LombScargle
+    ls = LombScargle(t, y, yerr, normalization='psd')
+    return y - ls.model(t, f)
+
+
+def multisine_model(t, y, yerr, freqs):
+    """Weighted least-squares fit of an offset plus a sinusoid at EACH of ``freqs``, jointly.
+
+    On a gapped window, sinusoids a few resolution elements apart are not orthogonal, so
+    fitting and subtracting them one at a time also removes part of each neighbour.
+    Fitting all of them together (as Period04 does after every new frequency) assigns the
+    shared power correctly.
+    """
+    t = np.asarray(t, float); y = np.asarray(y, float); w = 1.0 / np.asarray(yerr, float)
+    cols = [np.ones_like(t)]
+    for f in freqs:
+        ph = 2.0 * np.pi * float(f) * t
+        cols += [np.sin(ph), np.cos(ph)]
+    A = np.stack(cols, axis=1)
+    coef, *_ = np.linalg.lstsq(A * w[:, None], y * w, rcond=None)
+    return A @ coef
+
+
 def find_all_significant_peaks(
     freq,
     power,
@@ -835,6 +1106,9 @@ def find_all_significant_peaks(
     harmonic_tolerance=0.10,
     harmonic_masking=True,
     continuum=None,
+    prewhiten=None,
+    refine_frequency=True,
+    prewhiten_mode="sequential",
 ):
     """
     Iteratively find all LSP peaks above `white_noise_threshold`.
@@ -859,17 +1133,56 @@ def find_all_significant_peaks(
         short periods.  Ordering by ``power - C`` is unbiased: for a signal added
         independently to red noise, E[P - C] = S is the same at every frequency, so a
         sinusoid of fixed physical amplitude competes equally regardless of period.
+    prewhiten : (t, y, yerr) or None
+        When given, the search PREWHITENS: after each accepted peak the least-squares
+        sinusoid at that frequency is subtracted from the light curve and ``power`` is
+        recomputed from the residual (astropy ``LombScargle``, ``normalization='psd'``,
+        same grid) before the next peak is looked for.  The threshold and continuum are
+        NOT recomputed.
+
+        Why: the periodogram of a finite, gapped window puts a comb of sidelobes around
+        every real peak (spacing 1/T_sector and 1/T_orbit for TESS, i.e. 0.04-0.07 /day
+        whatever the period).  Below f ~ 1.5 /day the fractional mask is narrower than one
+        sidelobe spacing, so each sidelobe of a loud signal is accepted as its own peak:
+        on the synthetic set 1.45 seeds per injection, raw purity 0.67, with 71% of the
+        spurious seeds at sidelobe offsets (docs/gp_fitting.tex S4).  Sidelobes are a
+        property of the sampling, not the data, so subtracting the sinusoid removes them
+        with the peak.  Unlike an absolute-frequency mask this costs no resolution: a
+        second real signal one orbital frequency from a loud one is still found.
+
+        The fractional mask is kept because a quasi-periodic (low-Q) signal is not a
+        sinusoid and leaves residual power at its own frequency after prewhitening.
+        Expect prewhitening to be most effective on coherent signals; on broad peaks the
+        mask does the work, as before.
+    prewhiten_mode : {'sequential', 'joint'}
+        'sequential' (default): subtract only the newest sinusoid from the running residual.
+        'joint': after each new peak, refit ALL accepted frequencies together
+        (``multisine_model``, as Period04 does) and recompute the periodogram of data minus
+        that model.  Joint fitting is the textbook remedy for non-orthogonal sinusoids on a
+        gapped window, but on the synthetic set it made no difference (529 vs 531 of 611
+        detectable injections seeded, 439 vs 445 seeds), so the validated default is
+        'sequential'.  The injections prewhitening does not seed are almost all unresolved
+        from a louder neighbour or detectable only through its leakage
+        (figs/sidelobe_removal/seeding_prewhitening.png, panel d).
+    refine_frequency : bool
+        With ``prewhiten``, refine each accepted frequency on a 41-point grid within one
+        grid step before fitting the sinusoid (a sinusoid subtracted at a frequency off by
+        up to half a grid step leaves a beat residual).  The reported ``freq``/``period``
+        of the peak is the refined value.
 
     Returns
     -------
-    peaks : list of dicts [{freq, period, power}, ...]
-        Significant peaks in descending order of the ordering statistic.
+    peaks : list of dicts [{freq, period, power, power_raw}, ...]
+        Significant peaks in descending order of the ordering statistic.  ``power`` is
+        the periodogram value at acceptance (the residual periodogram when prewhitening),
+        ``power_raw`` the value in the input periodogram at the same bin.
     masked_windows : list of (f_lo, f_hi) tuples
         Frequency intervals that were masked out during the search.
         Useful for visualising which regions were suppressed.
     """
     freq = np.asarray(freq)
     power = np.asarray(power)
+    power_raw = power
     if continuum is not None:
         continuum = np.asarray(continuum)
 
@@ -879,48 +1192,25 @@ def find_all_significant_peaks(
 
     harmonics = [1.0, 2.0, 3.0, 4.0, 0.5, 1.0 / 3.0] if harmonic_masking else [1.0]
 
-    while True:
-        if continuum is not None:
-            # Unbiased ordering: largest excess over the CONTINUUM, not over the scaled
-            # threshold.
-            #
-            # The ordering must be restricted to bins that already pass the threshold.
-            # When ordering and acceptance use the SAME quantity (the other branches),
-            # argmax failing the test proves no bin passes, so the loop can terminate on
-            # it.  That proof does not hold here: the bin maximising P - C may fail
-            # P > threshold while a different bin passes.  Selecting among eligible bins
-            # only makes termination depend on the order-independent question "is any bin
-            # significant?", which is what keeps this mode consistent with 'red_noise'.
-            thr = (np.asarray(white_noise_threshold)
-                   if not np.isscalar(white_noise_threshold)
-                   else np.full(len(power), float(white_noise_threshold)))
-            eligible = mask & (power > thr)
-            if not eligible.any():
-                break
-            masked_excess = np.where(eligible, power - continuum, -np.inf)
-            idx = int(np.argmax(masked_excess))
-            t_idx = float(thr[idx])
-        elif np.isscalar(white_noise_threshold):
-            # Scalar: highest absolute power is the right candidate
-            masked_power = np.where(mask, power, -np.inf)
-            idx = int(np.argmax(masked_power))
-            t_idx = float(white_noise_threshold)
-        else:
-            # Per-frequency array: find the bin with the largest excess above
-            # its local threshold so low-frequency peaks aren't missed when a
-            # higher-power but sub-threshold high-frequency bin dominates argmax
-            masked_excess = np.where(mask, power - white_noise_threshold, -np.inf)
-            idx = int(np.argmax(masked_excess))
-            t_idx = float(white_noise_threshold[idx])
+    if prewhiten is not None:
+        from astropy.timeseries import LombScargle
+        t_pw, y_pw, yerr_pw = (np.asarray(a, dtype=float) for a in prewhiten)
+        y_res = y_pw.copy()
+        df_grid = float(np.median(np.diff(freq))) if len(freq) > 1 else 0.0
 
-        if not mask[idx] or power[idx] <= t_idx:
+    while True:
+        idx = _select_peak(freq, power, mask, white_noise_threshold, continuum)
+        if idx is None:
             break
 
-        best_freq = freq[idx]
+        best_freq = float(freq[idx])
+        if prewhiten is not None and refine_frequency and df_grid > 0:
+            best_freq = _refine_peak_frequency(t_pw, y_res, yerr_pw, best_freq, df_grid)
         peaks.append({
-            "freq": float(best_freq),
+            "freq": best_freq,
             "period": float(1.0 / best_freq),
             "power": float(power[idx]),
+            "power_raw": float(power_raw[idx]),
         })
 
         for h in harmonics:
@@ -930,7 +1220,95 @@ def find_all_significant_peaks(
             masked_windows.append((float(f_lo), float(f_hi)))
             mask[np.abs(freq / target - 1.0) <= harmonic_tolerance] = False
 
+        if prewhiten is not None:
+            if prewhiten_mode == "joint":
+                y_res = y_pw - multisine_model(t_pw, y_pw, yerr_pw, [q["freq"] for q in peaks])
+            elif prewhiten_mode == "sequential":
+                y_res = prewhiten_sinusoid(t_pw, y_res, yerr_pw, best_freq)
+            else:
+                raise ValueError(f"prewhiten_mode must be 'joint' or 'sequential', got {prewhiten_mode!r}")
+            power = LombScargle(t_pw, y_res, yerr_pw, normalization='psd').power(freq)
+
     return peaks, masked_windows
+
+
+# ============================================================
+# 8b. Per-component evidence: leave-one-out log-likelihood drop
+# ============================================================
+
+def component_loglike_drops(fit, x, y, yerr, sequential=True):
+    """Per-component evidence: log-likelihood lost when a periodic component is removed.
+
+    Two variants, both without refitting (one GP likelihood call per evaluation, every
+    other parameter -- the other components, the red-noise term, jitter -- held as fitted;
+    a component is "removed" by setting its sigma to e^-50):
+
+    * ``dloglike`` (single pass, leave-one-out): ``loglike(full) - loglike(without i)``
+      for each i against the full model.
+    * ``dloglike_seq`` (backward elimination): repeatedly remove the component with the
+      smallest current drop, re-evaluating the remaining components' drops after each
+      removal, and record for each component the drop it had when it was removed.
+      Thresholding ``dloglike_seq >= T`` reproduces backward elimination stopped at T.
+
+    Why two: when two seeds share one signal (a window sidelobe, an unresolved
+    neighbour), each one's single-pass drop is small because the OTHER still covers the
+    signal, so a single-pass threshold can remove both and lose the signal.  Backward
+    elimination removes one, after which the partner's drop jumps to the evidence of the
+    signal itself, and keeps it.
+
+    This is the evidence the amplitude cut in ``gp_table_io.filter_gp_components`` was
+    standing in for.  A duplicate seed is fitted with ~zero amplitude and has ~zero drop
+    either way.  A faint but coherent real signal can have a tiny sigma yet a drop of many
+    units, because the GP gains likelihood from every cycle it predicts -- which an
+    amplitude threshold cannot see.
+
+    Not refitting makes each drop an upper bound on the refitted evidence (the others
+    could re-absorb some of the removed variance); the bound is tight when the removed
+    component overlaps nothing.
+
+    Returns ``(dloglike, dloglike_seq)``, each a list aligned with the components (empty
+    lists for a red-noise-only fit).  ``dloglike_seq`` is None when ``sequential=False``.
+    """
+    n = int(fit["n_components"])
+    if n == 0:
+        return [], ([] if sequential else None)
+    theta = np.array(fit["theta"], dtype=float)
+    x_j, y_j, yerr_j = jnp.asarray(x), jnp.asarray(y), jnp.asarray(yerr)
+    kw = dict(has_red_noise=fit.get("has_red_noise", False),
+              rn_model=fit.get("rn_model") or "sho",
+              rn_basis_freqs=fit.get("rn_basis_freqs"),
+              rn_exposure_days=fit.get("rn_exposure_days"),
+              **q_layout_kwargs(fit))
+
+    def _ll(th):
+        return float(build_multi_sho_gp(jnp.asarray(th), x_j, yerr_j, n, **kw).log_probability(y_j))
+
+    def _without(th, idx):
+        out = th.copy()
+        for i in idx:
+            out[3 * i] = -50.0      # sigma_i = e^-50: the component contributes nothing
+        return out
+
+    ll_full = _ll(theta)
+    drops = [ll_full - _ll(_without(theta, [i])) for i in range(n)]
+    if not sequential:
+        return drops, None
+
+    seq = [np.nan] * n
+    removed = []
+    current = list(range(n))
+    ll_cur = ll_full
+    cur_drops = dict(zip(current, drops))      # first step reuses the single-pass values
+    while current:
+        i_min = min(current, key=lambda i: cur_drops[i])
+        seq[i_min] = cur_drops[i_min]
+        removed.append(i_min)
+        current.remove(i_min)
+        if not current:
+            break
+        ll_cur = _ll(_without(theta, removed))
+        cur_drops = {i: ll_cur - _ll(_without(theta, removed + [i])) for i in current}
+    return drops, seq
 
 
 # ============================================================
@@ -952,7 +1330,8 @@ def _save_checkpoint(checkpoint_dir, m, t, x, y, yerr, fits,
                                           rn_model=best_fit.get("rn_model") or "sho",
                                           rn_basis_freqs=best_fit.get("rn_basis_freqs"),
                                           rn_band=best_fit.get("rn_band"),
-                                          rn_exposure_days=best_fit.get("rn_exposure_days"))
+                                          rn_exposure_days=best_fit.get("rn_exposure_days"),
+                                          **q_layout_kwargs(best_fit))
     final_features.update(rn_white_noise_features(best_fit, x, yerr))
     final_features.update({
         "n_gp_components": best_fit["n_components"],
@@ -1022,11 +1401,15 @@ def iterative_sho_gp_fit(
     max_components=6,
     min_period=1/24,
     max_period=10.0,
-    Q_min=_RN_Q,
-    Q_max=100.0,
+    Q_min=Q_MIN,
+    Q_max=None,
     init_Q=10.0,
+    tau_cap_days=TAU_CAP_DAYS,
+    q_prior_threshold=Q_PRIOR_THRESHOLD,
     harmonic_tolerance=0.10,
     harmonic_masking=True,
+    prewhiten_seeds=False,
+    prewhiten_mode="sequential",
     fit_full_only=False,
     bic_improvement_threshold=10.0,
     debug_fitalln=False,
@@ -1107,6 +1490,22 @@ def iterative_sho_gp_fit(
         and 0.0 is qualitatively different: the search then never self-terminates and
         runs to max_components on every row, including pure noise.
         Required when threshold_mode='red_noise'.
+    Q_min, tau_cap_days, Q_max, q_prior_threshold : float
+        Bounds on each periodic SHO's quality factor (module notes on TAU_CAP_DAYS,
+        Q_MIN, Q_PRIOR_THRESHOLD).  Q_min = 1/sqrt(2) is the hard floor.  tau_cap_days
+        (default 27, one TESS sector) is a hard ceiling on the decay time Q P / pi, i.e.
+        Q <= pi * min(tau_cap_days, baseline) / P -- period-dependent, the same for every
+        row whatever its sector count.  Q_max is an optional extra absolute ceiling.
+        q_prior_threshold (default pi, one period of decay) is where ``use_q_prior``
+        starts to push.  tau_cap_days=None reverts to the pre-2026-11 flat box
+        [Q_min, Q_max] in log Q.
+    prewhiten_seeds : bool, default False
+        Prewhiten during the peak search: after each accepted peak subtract the
+        least-squares sinusoid at that frequency and recompute the periodogram of the
+        residual before looking for the next one (``find_all_significant_peaks``).
+        Removes window-function sidelobes, which otherwise seed ~45% extra components
+        (docs/gp_fitting.tex S4).  Threshold and continuum stay those of the original
+        periodogram.  ``prewhiten_mode`` ('sequential' default, or 'joint') is passed through.
     fit_red_noise_component : bool
         Add a red-noise term to the kernel (2 extra free parameters either way).
     rn_model : {'powerlaw', 'sho'}
@@ -1222,6 +1621,8 @@ def iterative_sho_gp_fit(
         harmonic_tolerance=harmonic_tolerance,
         harmonic_masking=harmonic_masking,
         continuum=peak_continuum,
+        prewhiten=(x, y, yerr) if prewhiten_seeds else None,
+        prewhiten_mode=prewhiten_mode,
     )
 
     n = min(len(all_peaks), max_components)
@@ -1274,6 +1675,8 @@ def iterative_sho_gp_fit(
             Q_min=Q_min,
             Q_max=Q_max,
             init_Q=1.0,
+            tau_cap_days=tau_cap_days,
+            q_prior_threshold=q_prior_threshold,
             has_red_noise=fit_red_noise_component,
             use_lognormal_period_prior=use_lognormal_period_prior,
             period_prior_sigma_dex=period_prior_sigma_dex,
@@ -1297,7 +1700,7 @@ def iterative_sho_gp_fit(
 
         if verbose >= 2:
             if _fb_components:
-                fb_comps, _ = unpack_theta(fb_fit["theta"], 1)
+                fb_comps, _ = unpack_theta(fb_fit["theta"], 1, **q_layout_kwargs(fb_fit))
                 print(f"  Fallback fit: period={float(fb_comps[0]['period']):.3f} d, "
                       f"BIC={fb_fit['bic']:.1f}  ({time.perf_counter() - t0_fb:.1f} s)")
             else:
@@ -1310,7 +1713,8 @@ def iterative_sho_gp_fit(
                                            rn_model=fb_fit.get("rn_model") or "sho",
                                            rn_basis_freqs=fb_fit.get("rn_basis_freqs"),
                                            rn_band=fb_fit.get("rn_band"),
-                                           rn_exposure_days=fb_fit.get("rn_exposure_days"))
+                                           rn_exposure_days=fb_fit.get("rn_exposure_days"),
+                                           **q_layout_kwargs(fb_fit))
         fb_features.update(rn_white_noise_features(fb_fit, x, yerr, rn_wn_flag_ratio))
         fb_features.update({
             "n_gp_components":          len(_fb_components),
@@ -1378,6 +1782,8 @@ def iterative_sho_gp_fit(
             Q_min=Q_min,
             Q_max=Q_max,
             init_Q=init_Q,
+            tau_cap_days=tau_cap_days,
+            q_prior_threshold=q_prior_threshold,
             has_red_noise=fit_red_noise_component,
             use_lognormal_period_prior=use_lognormal_period_prior,
             period_prior_sigma_dex=period_prior_sigma_dex,
@@ -1411,7 +1817,7 @@ def iterative_sho_gp_fit(
             )
 
         if verbose >= 2:
-            comps_m, _ = unpack_theta(fit["theta"], m)
+            comps_m, _ = unpack_theta(fit["theta"], m, **q_layout_kwargs(fit))
             period_list = [f"{float(c['period']):.3f}" for c in comps_m]
             print(
                 f"  {m} component(s): periods={period_list} d, "
@@ -1471,8 +1877,13 @@ def iterative_sho_gp_fit(
                                           rn_model=best_fit.get("rn_model") or "sho",
                                           rn_basis_freqs=best_fit.get("rn_basis_freqs"),
                                           rn_band=best_fit.get("rn_band"),
-                                          rn_exposure_days=best_fit.get("rn_exposure_days"))
+                                          rn_exposure_days=best_fit.get("rn_exposure_days"),
+                                          **q_layout_kwargs(best_fit))
     final_features.update(rn_white_noise_features(best_fit, x, yerr, rn_wn_flag_ratio))
+    _dll, _dll_seq = component_loglike_drops(best_fit, x, y, yerr)
+    for i, (d, ds) in enumerate(zip(_dll, _dll_seq)):
+        final_features[f"sho_{i+1}_dloglike"] = float(d)
+        final_features[f"sho_{i+1}_dloglike_seq"] = float(ds)
     final_features.update({
         "n_gp_components": best_fit["n_components"],
         "gp_log_likelihood": best_fit["loglike"],

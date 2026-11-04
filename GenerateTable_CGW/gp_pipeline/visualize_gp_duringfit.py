@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 
-from .gp_fit import build_multi_sho_gp, predict_gp_at_training_times
+from .gp_fit import build_multi_sho_gp, predict_gp_at_training_times, q_layout_kwargs
 
 
 def _get_full_gp_mean(fit, x, y):
@@ -10,14 +10,19 @@ def _get_full_gp_mean(fit, x, y):
     return mu
 
 
-def _get_component_contribution(theta, component_idx, x, y, yerr):
+def _get_component_contribution(theta, component_idx, x, y, yerr, q_kw=None):
     """
     Isolate component j's posterior mean from a joint M-component fit.
 
     Uses sequential conditioning: build (M-1)-component GP for the other
     components, subtract their posterior mean from y, then condition
     component j on the remainder.
+
+    ``q_kw`` is ``q_layout_kwargs(fit)`` -- the Q layout of theta.  Slicing theta per
+    component keeps each (period, coherence) pair together, so the derived Q is unchanged
+    as long as the sub-GPs are built with the same tau_cap / Q_min / Q_max.
     """
+    q_kw = q_kw or {}
     theta = np.asarray(theta)
     n_components = (len(theta) - 1) // 3
     j = component_idx - 1  # 0-indexed
@@ -40,7 +45,7 @@ def _get_component_contribution(theta, component_idx, x, y, yerr):
         y_j = np.asarray(y)
     else:
         gp_others = build_multi_sho_gp(
-            jnp.asarray(theta_others), jnp.asarray(x), jnp.asarray(yerr), n_others
+            jnp.asarray(theta_others), jnp.asarray(x), jnp.asarray(yerr), n_others, **q_kw
         )
         mu_others = np.asarray(
             gp_others.condition(jnp.asarray(y), jnp.asarray(x)).gp.mean
@@ -48,7 +53,7 @@ def _get_component_contribution(theta, component_idx, x, y, yerr):
         y_j = np.asarray(y) - mu_others
 
     gp_j = build_multi_sho_gp(
-        jnp.asarray(theta_j), jnp.asarray(x), jnp.asarray(yerr), 1
+        jnp.asarray(theta_j), jnp.asarray(x), jnp.asarray(yerr), 1, **q_kw
     )
     mu_j = np.asarray(gp_j.condition(jnp.asarray(y_j), jnp.asarray(x)).gp.mean)
     return mu_j
@@ -218,7 +223,7 @@ def plot_after_fit(x, y, yerr, all_accepted_fits, component_idx, max_days=30):
         mu_prev = _get_full_gp_mean(prev_fit, x, y)
         y_resid = np.asarray(y) - mu_prev
 
-        mu_j = _get_component_contribution(theta_final, j, x, y, yerr)
+        mu_j = _get_component_contribution(theta_final, j, x, y, yerr, q_layout_kwargs(final_fit))
 
         ax = axes[j - 1]
         ax.errorbar(
@@ -270,7 +275,7 @@ def plot_fit_summary(x, y, yerr, fits, component_idx, bic, max_days=30):
         prev_fit = fits[j - 2]
         mu_prev = _get_full_gp_mean(prev_fit, x, y)
         y_resid_j = np.asarray(y) - mu_prev
-        mu_j = _get_component_contribution(theta_final, j, x, y, yerr)
+        mu_j = _get_component_contribution(theta_final, j, x, y, yerr, q_layout_kwargs(final_fit))
 
         axes[j - 1].errorbar(
             x[mask], y_resid_j[mask], yerr=np.asarray(yerr)[mask],
