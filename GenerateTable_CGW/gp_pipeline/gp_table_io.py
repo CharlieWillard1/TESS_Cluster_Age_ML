@@ -74,6 +74,22 @@ def add_gp_fits(
     gp_sho_sigmas                object     list of fitted sigma per component (length m)
     gp_sho_omegas                object     list of fitted omega per component (length m)
     gp_sho_Qs                    object     list of fitted Q per component (length m)
+    gp_sho_taus                  object     list of decay times Q P / pi in days (length m);
+                                            capped at gp_sho_tau_cap, so a value at the cap
+                                            means "coherent for the whole window", not a
+                                            measurement
+    gp_sho_coherence             object     list of coherence fractions s in [0, 1] (length m):
+                                            where Q sits between its floor 1/sqrt(2) and its
+                                            period-dependent ceiling pi * tau_cap / P, in log.
+                                            1 = pinned at the cap (gp_fit.q_from_coherence)
+    gp_sho_tau_cap               float64    decay-time cap applied to this row in days
+                                            (min(tau_cap_days, baseline); NaN = legacy flat Q box)
+    gp_sho_dloglike              object     per-component leave-one-out log-likelihood drop
+                                            (gp_fit.component_loglike_drops): evidence for each
+                                            component, aligned with gp_periods
+    gp_sho_dloglike_seq          object     same, by backward elimination (the drop each
+                                            component had when it was eliminated); the one
+                                            filter_gp_components cuts on
     gp_initial_lsp_peak_periods  object     LSP seed periods used to initialise fit
     gp_rn_sigma, gp_rn_period, gp_rn_Q
                                  float64    red-noise SHO parameters (rn_model='sho' only)
@@ -124,6 +140,11 @@ def add_gp_fits(
     gp_sho_sigmas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_omegas_vals = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_sho_Qs_vals     = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_taus_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_dll_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_dlls_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_coh_vals    = pd.Series([None] * n_rows, index=idx, dtype=object)
+    gp_sho_tau_cap_vals = pd.Series(np.nan, index=idx, dtype=float)
     gp_init_lsp_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_rn_basis_vals   = pd.Series([None] * n_rows, index=idx, dtype=object)
     gp_rn_exposure_vals = pd.Series(np.nan, index=idx, dtype=float)
@@ -223,6 +244,11 @@ def add_gp_fits(
                 gp_sho_sigmas_vals[label] = [result.features[f"sho_{i}_sigma"] for i in range(1, m + 1)]
                 gp_sho_omegas_vals[label] = [result.features[f"sho_{i}_omega"] for i in range(1, m + 1)]
                 gp_sho_Qs_vals[label]     = [result.features[f"sho_{i}_Q"]     for i in range(1, m + 1)]
+                gp_sho_taus_vals[label]   = [result.features.get(f"sho_{i}_tau_days", np.nan) for i in range(1, m + 1)]
+                gp_sho_coh_vals[label]    = [result.features.get(f"sho_{i}_coherence", np.nan) for i in range(1, m + 1)]
+                gp_sho_dll_vals[label]    = [result.features.get(f"sho_{i}_dloglike", np.nan) for i in range(1, m + 1)]
+                gp_sho_dlls_vals[label]   = [result.features.get(f"sho_{i}_dloglike_seq", np.nan) for i in range(1, m + 1)]
+                gp_sho_tau_cap_vals[label] = result.features.get("sho_tau_cap_days", np.nan)
                 gp_init_lsp_vals[label]   = result.features["initial_lsp_peak_periods"]
                 gp_rn_sigma_vals[label]   = result.features.get("rn_sigma",       np.nan)
                 gp_rn_period_vals[label]  = result.features.get("rn_period_days", np.nan)
@@ -280,6 +306,11 @@ def add_gp_fits(
     table["gp_sho_sigmas"]               = gp_sho_sigmas_vals
     table["gp_sho_omegas"]               = gp_sho_omegas_vals
     table["gp_sho_Qs"]                   = gp_sho_Qs_vals
+    table["gp_sho_taus"]                 = gp_sho_taus_vals
+    table["gp_sho_coherence"]            = gp_sho_coh_vals
+    table["gp_sho_dloglike"]             = gp_sho_dll_vals
+    table["gp_sho_dloglike_seq"]         = gp_sho_dlls_vals
+    table["gp_sho_tau_cap"]              = gp_sho_tau_cap_vals
     table["gp_initial_lsp_peak_periods"] = gp_init_lsp_vals
     table["gp_rn_sigma"]                 = gp_rn_sigma_vals
     table["gp_rn_period"]                = gp_rn_period_vals
@@ -484,8 +515,57 @@ def recompute_gp_psd_columns(table, freq_lim=(0.1, 12.0), n_bins=10, verbose=Tru
     return table
 
 
-def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered', verbose=True):
+def row_white_noise(row):
+    """Per-point white-noise level of a row: photometric error and fitted jitter in quadrature."""
+    err = row.get('LC_flux_err')
+    err = float(np.nanmedian(np.asarray(err, dtype=float))) if err is not None else np.nan
+    jit = row.get('gp_jitter', np.nan)
+    jit = float(jit) if jit is not None and np.isfinite(float(jit)) else 0.0
+    return float(np.sqrt(err ** 2 + jit ** 2))
+
+
+def filter_gp_components(table, snr_min=0.2, sigma_rel_min=None, Q_min=None, n_cycles_min=1.6,
+                         dloglike_min=None, dloglike_col='gp_sho_dloglike_seq',
+                         suffix='_filtered', verbose=True):
     """Prune low-amplitude / incoherent GP components, post hoc.
+
+    The amplitude cut is ABSOLUTE: a component is kept when its fitted SHO amplitude sigma
+    is at least ``snr_min`` times the row's white-noise level (median photometric error and
+    fitted jitter in quadrature, ``row_white_noise``).  Until 2026-11 the cut was relative,
+    sigma >= 10% of the loudest component in the row.  A relative cut is blind to whether
+    the faint component is itself significant: on the synthetic set it removed 54 of 597
+    recovered detectable injections, all faint signals in rows that also held a loud one
+    (median injected amplitude 1.5x the per-point error, kept ones 7x).  Against the white
+    noise the two populations separate cleanly -- matched components have a median
+    sigma / WN of 0.38, spurious ones 0.003 -- and the cut no longer depends on what else
+    is in the row.  Measured on the capped synthetic fit (611 detectable injections, with
+    the cycles >= 1.6 cut in both cases):
+
+        amplitude cut             components   purity   completeness
+        sigma_rel >= 10% (old)        537       0.983      0.887
+        sigma / WN >= 0.1             682       0.955      0.921
+        sigma / WN >= 0.2  (default)  625       0.971      0.912
+        sigma / WN >= 0.3             588       0.980      0.900
+        sigma / WN >= 0.5             525       0.989      0.859
+
+    ``sigma_rel_min`` is still accepted and applied in addition when given.
+
+    ``dloglike_min`` cuts on EVIDENCE instead of amplitude: the log-likelihood the fit loses
+    when the component is removed with everything else held fixed (``gp_sho_dloglike``,
+    gp_fit.component_loglike_drops).  Amplitude and evidence are different axes: a seed
+    that duplicates a real signal is fitted at ~zero amplitude AND ~zero evidence, but a
+    faint coherent signal has small sigma and large evidence, because the GP gains
+    likelihood from every cycle it predicts.  So an evidence cut keeps faint real signals
+    an amplitude cut discards.  Pass ``snr_min=None, dloglike_min=...`` to use evidence
+    alone; both cuts apply when both are given.  See
+    sytheticdata_generate_compare/figs/sidelobe_removal/ for the calibration.
+
+    The coherence cut is expressed in CYCLES, ``tau_d / P = Q / pi``, not in Q.  Since
+    2026-11 the fit caps Q at pi * tau_cap / P (decay time at most one sector), so at
+    P = 10 d the ceiling is Q = 8.5 and a flat ``Q >= 5`` would sit almost on the cap while
+    at P = 0.1 d it would be 1% of it.  A cycles cut means the same thing at every period.
+    The default ``n_cycles_min=1.6`` is exactly the old ``Q >= 5`` (5 / pi = 1.59).  Pass
+    ``Q_min`` instead to cut on Q directly (then ``n_cycles_min`` is ignored).
 
     The fit is deliberately generous (``max_components=16``): a peak finder run without
     harmonic masking reports sidelobes and harmonics of a strong signal as separate peaks, so
@@ -495,49 +575,62 @@ def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered
     -- so duplicates waste budget rather than corrupting the fit.  That makes pruning a
     post-processing choice instead of something baked into the fit.
 
-    Keeps components with ``sigma >= sigma_rel_min * max(sigma)`` in their own row AND
-    ``Q >= Q_min``.  Measured on the synthetic set (611 detectable injections, max_comp=16):
-
-        cut                       components   purity   completeness
-        none                          1689      0.665       0.974
-        sigma >= 5%                    754      0.862       0.926
-        sigma >= 10%                   652      0.862       0.894
-        Q >= 100                       667      0.895       0.841
-        sigma >= 10% and Q >= 20       549      0.947       0.863
-        sigma >= 10% and Q >= 100      454      0.954       0.802
-
-    That table is measured on PURE SINUSOID injections, which are driven to the Q cap, and it
-    over-sells the Q cut: real components sit in Q = 2-20 far more often (24% of real
-    components vs 17% synthetic), because spot modulation is quasi-periodic.  On the real
-    table Q_min=20 discarded clearly real signals -- e.g. NGC2136, an obvious 4.4 d modulation
-    fitted at Q ~ 14.  Hence the default Q_min=5: it removes the broad continuum-like
-    components while keeping finite-coherence signals.  Raise it only if purity matters more
-    than completeness, and check what it cuts.
+    The relative-cut numbers that used to be quoted here (sigma >= 10% and Q >= 20: purity
+    0.947, completeness 0.863, etc.) were measured on PURE SINUSOID injections under the old
+    flat Q cap and are superseded by the table above.  The synthetic injections are driven
+    to the Q cap, which over-sells any coherence cut: real components sit in Q = 2-20 far
+    more often (24% of real components vs 17% synthetic), because spot modulation is
+    quasi-periodic.  On the real table Q_min=20 discarded clearly real signals -- e.g.
+    NGC2136, an obvious 4.4 d modulation fitted at Q ~ 14.  Hence the default of 1.6 cycles
+    (Q >= 5): it removes the broad continuum-like components while keeping finite-coherence
+    signals.  Raise it only if purity matters more than completeness, and check what it cuts.
 
     Parameters
     ----------
     table : pd.DataFrame
-        Needs ``gp_periods``, ``gp_sho_sigmas``, ``gp_sho_Qs`` (and ``gp_sho_omegas`` if present).
-    sigma_rel_min : float
-        Amplitude floor, as a fraction of the row's strongest component.
-    Q_min : float
-        Quality-factor floor.
+        Needs ``gp_periods``, ``gp_sho_sigmas``, ``gp_sho_Qs``, ``LC_flux_err`` (and
+        ``gp_jitter`` / ``gp_sho_omegas`` if present).
+    snr_min : float or None
+        Amplitude floor, sigma / white noise >= snr_min.  Default 0.2.  None disables it.
+    sigma_rel_min : float or None
+        Optional additional relative floor, sigma >= sigma_rel_min * max(sigma) in the row.
+    dloglike_min : float or None
+        Evidence floor, log-likelihood drop >= dloglike_min.  None disables it.
+        Needs the ``gp_sho_dloglike*`` columns (fits made from 2026-11-04 on).
+    dloglike_col : str
+        Which drop to cut on: ``'gp_sho_dloglike_seq'`` (default, backward elimination --
+        robust to two components sharing one signal) or ``'gp_sho_dloglike'`` (single-pass
+        leave-one-out).
+    n_cycles_min : float
+        Coherence floor in cycles, Q / pi >= n_cycles_min.  Default 1.6 (= Q >= 5).
+    Q_min : float or None
+        Quality-factor floor; overrides ``n_cycles_min`` when given.
     suffix : str
         Added to the new column names.
 
     New columns
     -----------
-    gp_periods{suffix}, gp_sho_sigmas{suffix}, gp_sho_Qs{suffix}, gp_sho_omegas{suffix}
+    gp_sho_snr                sigma / white noise per component, aligned with ``gp_periods``
+    gp_periods{suffix}, gp_sho_sigmas{suffix}, gp_sho_Qs{suffix}, gp_sho_omegas{suffix}, ...
     gp_n_components{suffix}   number of components kept
     gp_component_kept         list of bools aligned with ``gp_periods`` -- which components survived,
                               so a plot can draw kept and cut components differently
     """
-    cols = ['gp_periods', 'gp_sho_sigmas', 'gp_sho_Qs', 'gp_sho_omegas']
+    q_floor = float(Q_min) if Q_min is not None else float(n_cycles_min) * np.pi
+    cut_label = f"Q >= {Q_min}" if Q_min is not None else f"cycles Q/pi >= {n_cycles_min} (Q >= {q_floor:.2f})"
+    amp_label = " & ".join(([f"sigma/WN >= {snr_min}"] if snr_min is not None else [])
+                           + ([f"sigma_rel >= {sigma_rel_min}"] if sigma_rel_min is not None else [])
+                           + ([f"dloglike >= {dloglike_min}"] if dloglike_min is not None else [])) or "no amplitude cut"
+    if dloglike_min is not None and dloglike_col not in table.columns:
+        raise KeyError(f"dloglike_min needs the {dloglike_col} column (refit with the current gp_fit)")
+    cols = ['gp_periods', 'gp_sho_sigmas', 'gp_sho_Qs', 'gp_sho_omegas', 'gp_sho_taus', 'gp_sho_coherence',
+            'gp_sho_dloglike', 'gp_sho_dloglike_seq']
     present = [c for c in cols if c in table.columns]
     idx = table.index
     out = {c + suffix: pd.Series([None] * len(table), index=idx, dtype=object) for c in present}
     n_kept = pd.Series(np.nan, index=idx, dtype=float)
     kept_mask = pd.Series([None] * len(table), index=idx, dtype=object)
+    snr_vals = pd.Series([None] * len(table), index=idx, dtype=object)
 
     for label, row in table.iterrows():
         sig = row.get('gp_sho_sigmas')
@@ -554,22 +647,38 @@ def filter_gp_components(table, sigma_rel_min=0.10, Q_min=5.0, suffix='_filtered
                 out[c + suffix][label] = []
             n_kept[label] = 0
             kept_mask[label] = []
+            snr_vals[label] = []
             continue
+        wn = row_white_noise(row)
+        snr = sig / wn if np.isfinite(wn) and wn > 0 else np.full(len(sig), np.nan)
         smax = np.nanmax(sig)
-        keep = np.isfinite(sig) & (sig >= sigma_rel_min * smax) & (Q >= Q_min) if smax > 0 else np.zeros(len(sig), bool)
+        keep = np.isfinite(sig) & (Q >= q_floor)
+        if snr_min is not None:
+            keep &= np.isfinite(snr) & (snr >= snr_min)
+        if sigma_rel_min is not None:
+            keep &= (sig >= sigma_rel_min * smax) if smax > 0 else False
+        if dloglike_min is not None:
+            dll = row.get(dloglike_col)
+            dll = np.atleast_1d(np.asarray(dll, dtype=float)) if dll is not None else np.array([])
+            if len(dll) != len(sig):
+                keep &= False
+            else:
+                keep &= np.isfinite(dll) & (dll >= dloglike_min)
         for c in present:
             v = np.atleast_1d(np.asarray(row.get(c), dtype=float))
             out[c + suffix][label] = list(v[keep]) if len(v) == len(keep) else None
         n_kept[label] = int(keep.sum())
         kept_mask[label] = [bool(k) for k in keep]      # aligned with gp_periods, for plotting
+        snr_vals[label] = [float(s) for s in snr]
 
+    table['gp_sho_snr'] = snr_vals
     for c, v in out.items():
         table[c] = v
     table['gp_n_components' + suffix] = n_kept
     table['gp_component_kept'] = kept_mask
     if verbose:
         tot = pd.to_numeric(table.get('gp_n_components'), errors='coerce').sum()
-        print(f"[filter_gp_components] sigma_rel >= {sigma_rel_min}, Q >= {Q_min}: "
+        print(f"[filter_gp_components] {amp_label}, {cut_label}: "
               f"kept {int(n_kept.sum())} of {int(tot)} components "
               f"({n_kept.sum() / max(tot, 1):.0%}) across {int(n_kept.notna().sum())} rows")
     return table

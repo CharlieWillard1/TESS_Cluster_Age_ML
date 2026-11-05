@@ -194,11 +194,11 @@ def _cluster_color_map(table_rows):
 
 def _analytic_psd(fit, freq_min, freq_max, n_freq):
     """Analytic SHO kernel PSD for a single fit dict."""
-    from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd
+    from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd, q_layout_kwargs
     import jax.numpy as jnp
     freq  = np.linspace(freq_min, freq_max, n_freq)
     omega = 2.0 * np.pi * freq
-    comps, _ = unpack_theta(jnp.asarray(fit["theta"]), fit["n_components"])
+    comps, _ = unpack_theta(jnp.asarray(fit["theta"]), fit["n_components"], **q_layout_kwargs(fit))
     power = np.zeros(n_freq)
     for comp in comps:
         sigma  = float(comp["sigma"])

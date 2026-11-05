@@ -152,12 +152,13 @@ class GPFitResult:
         -------
         dict with keys: freq (1/day), power (analytic PSD)
         """
-        from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd  # deferred — avoids circular import at module load
+        from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd, q_layout_kwargs  # deferred — avoids circular import at module load
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
 
-        comps, _ = unpack_theta(self.final_fit["theta"], self.n_components)
+        comps, _ = unpack_theta(self.final_fit["theta"], self.n_components,
+                                **q_layout_kwargs(self.final_fit))
 
         power = np.zeros(n_freq)
         for comp in comps:
@@ -181,7 +182,7 @@ class GPFitResult:
         Pass the result to visualize_gp_afterfit.plot_kspace_compare_allfits
         to overlay them all in a single figure.
         """
-        from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd  # deferred
+        from .gp_fit import unpack_theta, rn_psd_from_fit, sho_psd, q_layout_kwargs  # deferred
 
         freq  = np.linspace(freq_min, freq_max, n_freq)
         omega = 2.0 * np.pi * freq
@@ -189,7 +190,7 @@ class GPFitResult:
         entries = []
         for fit in self.all_fits:
             m = fit["n_components"]
-            comps, _ = unpack_theta(fit["theta"], m)
+            comps, _ = unpack_theta(fit["theta"], m, **q_layout_kwargs(fit))
 
             power = np.zeros(n_freq)
             for comp in comps:
@@ -239,7 +240,7 @@ class GPFitResult:
         return state
 
     def __setstate__(self, state):
-        from .gp_fit import build_multi_sho_gp
+        from .gp_fit import build_multi_sho_gp, q_layout_kwargs
         import jax.numpy as jnp
         self.__dict__.update(state)
         def _rebuild(fit):
@@ -252,6 +253,7 @@ class GPFitResult:
                 fit.get("rn_model") or "sho",       # pickles predating rn_model are SHO
                 fit.get("rn_basis_freqs"),
                 fit.get("rn_exposure_days"),
+                **q_layout_kwargs(fit),             # pickles predating tau_cap are log-Q
             )
             return {**fit, "gp": gp}
         self.final_fit = _rebuild(self.final_fit)
